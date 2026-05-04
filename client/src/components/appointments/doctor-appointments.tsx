@@ -18,6 +18,32 @@ import { useToast } from "@/hooks/use-toast";
 import { isDoctorLike } from "@/lib/role-utils";
 import { useLocation } from "wouter";
 import { getActiveSubdomain } from "@/lib/subdomain-utils";
+import {
+  getAppointmentCardTimeKind,
+  appointmentCardTimeBackgroundClass,
+  appointmentOngoingBadgeClassName,
+  appointmentOngoingBadgePositionClassName,
+  sortAppointmentsByCardTimeKind,
+  useAppointmentTimeTick,
+} from "@/lib/appointment-card-time-style";
+import {
+  buildPatientOverlapDialogDescription,
+  findPatientScheduleOverlap,
+} from "@/lib/patient-appointment-overlap";
+
+function formatAppointmentStatusLabelDoc(status: unknown): string {
+  const s = String(status ?? "")
+    .toLowerCase()
+    .trim()
+    .replace(/\s+/g, "_");
+  if (!s) return "Unknown";
+  if (s === "no_show") return "No show";
+  return s
+    .split(/[\s_]+/)
+    .filter(Boolean)
+    .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
+    .join(" ");
+}
 
 const statusColors = {
   scheduled: "#4A7DFF",
@@ -25,6 +51,19 @@ const statusColors = {
   cancelled: "#162B61",
   no_show: "#9B9EAF"
 };
+
+function staffAppointmentStatusBadgeStyle(status: string | undefined): React.CSSProperties {
+  const norm = String(status || "scheduled")
+    .toLowerCase()
+    .trim()
+    .replace(/\s+/g, "_");
+  const bg =
+    statusColors[norm as keyof typeof statusColors] ?? statusColors.scheduled;
+  return {
+    backgroundColor: bg,
+    color: norm === "completed" ? "#000000" : "#ffffff",
+  };
+}
 
 export default function DoctorAppointments({ onNewAppointment }: { onNewAppointment?: () => void }) {
   const [selectedDate, setSelectedDate] = useState(new Date());
@@ -40,6 +79,8 @@ export default function DoctorAppointments({ onNewAppointment }: { onNewAppointm
   
   // Cancel confirmation modal state
   const [appointmentToCancel, setAppointmentToCancel] = useState<number | null>(null);
+  const [showPatientOverlapConflict, setShowPatientOverlapConflict] = useState(false);
+  const [patientOverlapConflictRecord, setPatientOverlapConflictRecord] = useState<any | null>(null);
   
   // Success modal state
   const [showSuccessModal, setShowSuccessModal] = useState(false);
@@ -90,6 +131,19 @@ export default function DoctorAppointments({ onNewAppointment }: { onNewAppointm
   });
   const usersData: any[] = Array.isArray(usersQuery.data) ? usersQuery.data : [];
   const usersLoading = usersQuery.isLoading;
+
+  const patientOverlapSelectedProviderDisplayName = useMemo(() => {
+    const pid = editingAppointment?.providerId ?? editingAppointment?.provider_id;
+    if (pid == null) return "the selected provider";
+    const u = usersData?.find((x: any) => String(x.id) === String(pid));
+    if (!u) return "the selected provider";
+    const n = `${u.firstName || ""} ${u.lastName || ""}`.trim();
+    return n || "the selected provider";
+  }, [
+    editingAppointment?.providerId,
+    editingAppointment?.provider_id,
+    usersData,
+  ]);
 
   const nurseUserRecord = React.useMemo(() => {
     if (!user || user.role !== "nurse" || !usersData || !Array.isArray(usersData)) {
@@ -507,6 +561,26 @@ export default function DoctorAppointments({ onNewAppointment }: { onNewAppointm
       return;
     }
 
+    const editStart = parseScheduledAtAsLocal(editingAppointment.scheduledAt);
+    const editDur =
+      editingAppointment.duration != null && Number(editingAppointment.duration) > 0
+        ? Number(editingAppointment.duration)
+        : 30;
+    const editEnd = new Date(editStart.getTime() + editDur * 60 * 1000);
+    const overlapEdit = findPatientScheduleOverlap(
+      String(editingAppointment.patientId),
+      editStart,
+      editEnd,
+      appointments,
+      parseScheduledAtAsLocal,
+      { excludeAppointmentId: editingAppointment.id },
+    );
+    if (overlapEdit.conflict) {
+      setPatientOverlapConflictRecord(overlapEdit.conflict);
+      setShowPatientOverlapConflict(true);
+      return;
+    }
+
     // Prepare update data - only include fields that should be updated
     const updateData: any = {
       title: editingAppointment.title || "",
@@ -608,19 +682,25 @@ export default function DoctorAppointments({ onNewAppointment }: { onNewAppointm
   }, [appointments, user, patientsData]);
 
   // Helper functions - MUST be defined before useMemo that uses them
-  const getPatientName = React.useCallback((patientId: number) => {
-    // patientId is actually a user ID - find patient record by user_id
-    if (patientsData && Array.isArray(patientsData)) {
-      const patient = patientsData.find((p: any) => p.userId === patientId);
-      
-      if (patient) {
-        const name = `${patient.firstName || ''} ${patient.lastName || ''}`.trim();
-        if (name) return name;
-      }
+  const getPatientName = React.useCallback((patientId: number | string | null | undefined) => {
+    if (patientId == null || patientId === "") return "Patient not found";
+    if (!patientsData || !Array.isArray(patientsData)) return "Patient not found";
+
+    const patient = patientsData.find((p: any) => {
+      if (p.id === patientId || String(p.id) === String(patientId)) return true;
+      if (p.userId != null && (p.userId === patientId || String(p.userId) === String(patientId)))
+        return true;
+      if (p.patientId != null && String(p.patientId) === String(patientId)) return true;
+      return false;
+    });
+
+    if (patient) {
+      const name = `${patient.firstName || ""} ${patient.lastName || ""}`.trim();
+      if (name) return name;
     }
-    
-    return 'Patient not found';
-  }, [patientsData, usersData]);
+
+    return "Patient not found";
+  }, [patientsData]);
 
   const getDoctorNameWithSpecialization = React.useCallback((doctorId: number) => {
     if (!usersData || !Array.isArray(usersData)) return `Doctor ${doctorId}`;
@@ -723,28 +803,6 @@ export default function DoctorAppointments({ onNewAppointment }: { onNewAppointm
       });
   };
 
-  const formatTime = (timeValue: string | Date) => {
-    try {
-      let hours: number, minutes: number;
-      
-      if (timeValue instanceof Date) {
-        // If it's a Date object, use getHours() and getMinutes() to get local time
-        hours = timeValue.getHours();
-        minutes = timeValue.getMinutes();
-      } else {
-        // If it's a string, extract time directly from ISO string without timezone conversion
-        const time = timeValue.split('T')[1]?.substring(0, 5) || '00:00';
-        [hours, minutes] = time.split(':').map(Number);
-      }
-      
-      const period = hours >= 12 ? 'PM' : 'AM';
-      const displayHours = hours % 12 || 12;
-      return `${displayHours}:${minutes.toString().padStart(2, '0')} ${period}`;
-    } catch {
-      return "Invalid time";
-    }
-  };
-
   const formatAppointmentDate = (dateValue: string | Date) => {
     try {
       let localDate: Date;
@@ -833,6 +891,30 @@ export default function DoctorAppointments({ onNewAppointment }: { onNewAppointm
     }
     return parsed;
   };
+
+  /** e.g. "12:45 PM – 1:15 PM · 30 minutes" from scheduledAt + duration (default 30 min). */
+  const formatAppointmentTimeRange = (appointment: {
+    scheduledAt?: string | Date;
+    duration?: number | string | null;
+  }) => {
+    try {
+      if (!appointment?.scheduledAt) return "Invalid time";
+      const start = parseScheduledAtAsLocal(appointment.scheduledAt);
+      if (Number.isNaN(start.getTime())) return "Invalid time";
+      const dur =
+        appointment.duration != null && Number(appointment.duration) > 0
+          ? Number(appointment.duration)
+          : 30;
+      const end = new Date(start.getTime() + dur * 60 * 1000);
+      const durLabel = dur === 1 ? "1 minute" : `${dur} minutes`;
+      return `${format(start, "h:mm a")} – ${format(end, "h:mm a")} · ${durLabel}`;
+    } catch {
+      return "Invalid time";
+    }
+  };
+
+  const appointmentTimeTick = useAppointmentTimeTick();
+  const nowForCardStyle = useMemo(() => new Date(), [appointmentTimeTick]);
 
   // Parse shift time to minutes (e.g., "09:30" -> 570)
   const parseShiftTimeToMinutes = (time?: string): number => {
@@ -1296,18 +1378,44 @@ export default function DoctorAppointments({ onNewAppointment }: { onNewAppointm
                   </CardTitle>
                 </CardHeader>
                 <CardContent className="pt-0 px-2 pb-2 space-y-1">
-                  {dayAppointments.slice(0, 4).map((appointment: any) => (
-                    <div
-                      key={appointment.id}
-                      className="p-2 rounded text-xs border-l-4 bg-white dark:bg-slate-800 border-gray-200 dark:border-gray-700"
-                      style={{ borderLeftColor: statusColors[appointment.status as keyof typeof statusColors] }}
-                      data-testid={`appointment-${appointment.id}`}
-                    >
-                      <div className="font-medium truncate text-gray-900 dark:text-gray-100">{formatTime(appointment.scheduledAt)}</div>
-                      <div className="text-gray-600 dark:text-gray-300 truncate">{getPatientName(appointment.patientId)}</div>
-                      <div className="text-gray-500 dark:text-gray-400 truncate">{appointment.type}</div>
-                    </div>
-                  ))}
+                  {sortAppointmentsByCardTimeKind(
+                    dayAppointments,
+                    nowForCardStyle,
+                    parseScheduledAtAsLocal,
+                  )
+                    .slice(0, 4)
+                    .map((appointment: any) => {
+                      const cardTimeKind = getAppointmentCardTimeKind(
+                        appointment,
+                        nowForCardStyle,
+                        parseScheduledAtAsLocal,
+                      );
+                      return (
+                        <div
+                          key={appointment.id}
+                          className={`relative overflow-visible p-2 rounded text-xs border-l-4 ${appointmentCardTimeBackgroundClass(
+                            cardTimeKind,
+                          )}`}
+                          style={{ borderLeftColor: statusColors[appointment.status as keyof typeof statusColors] }}
+                          data-testid={`appointment-${appointment.id}`}
+                        >
+                          {cardTimeKind === "ongoing" && (
+                            <Badge
+                              className={`${appointmentOngoingBadgeClassName} ${appointmentOngoingBadgePositionClassName} text-[10px] px-1.5 py-0 h-5 leading-none`}
+                            >
+                              Ongoing
+                            </Badge>
+                          )}
+                          <div className="font-medium truncate text-gray-900 dark:text-gray-100 pr-12">
+                            {formatAppointmentTimeRange(appointment)}
+                          </div>
+                          <div className="text-gray-600 dark:text-gray-300 truncate">
+                            {getPatientName(appointment.patientId)}
+                          </div>
+                          <div className="text-gray-500 dark:text-gray-400 truncate">{appointment.type}</div>
+                        </div>
+                      );
+                    })}
                   {dayAppointments.length > 4 && (
                     <div className="text-xs text-gray-500 dark:text-gray-400 text-center py-1">
                       +{dayAppointments.length - 4} more
@@ -1351,20 +1459,40 @@ export default function DoctorAppointments({ onNewAppointment }: { onNewAppointm
           </CardHeader>
           <CardContent>
             <div className="space-y-3">
-              {getAppointmentsForDate(selectedDate).map((appointment: any) => {
+              {sortAppointmentsByCardTimeKind(
+                getAppointmentsForDate(selectedDate),
+                nowForCardStyle,
+                parseScheduledAtAsLocal,
+              ).map((appointment: any) => {
                 const patient = patientsData?.find((p: any) => p.id === appointment.patientId);
                 const serviceLabel = getAppointmentServiceLabel(appointment);
                 
                 const appointmentTypeBadge = getAppointmentTypeBadgeInfo(appointment);
+                const cardTimeKind = getAppointmentCardTimeKind(
+                  appointment,
+                  nowForCardStyle,
+                  parseScheduledAtAsLocal,
+                );
                 return (
-                  <Card key={appointment.id} className="border-l-4 bg-white dark:bg-slate-800 border-gray-200 dark:border-gray-700" style={{ borderLeftColor: statusColors[appointment.status as keyof typeof statusColors] }}>
+                  <Card
+                    key={appointment.id}
+                    className={`relative overflow-visible border-l-4 ${appointmentCardTimeBackgroundClass(cardTimeKind)}`}
+                    style={{ borderLeftColor: statusColors[appointment.status as keyof typeof statusColors] }}
+                  >
+                    {cardTimeKind === "ongoing" && (
+                      <Badge
+                        className={`${appointmentOngoingBadgeClassName} ${appointmentOngoingBadgePositionClassName}`}
+                      >
+                        Ongoing
+                      </Badge>
+                    )}
                     <CardContent className="p-4">
                       <div className="flex items-center justify-between">
                         <div className="flex items-center space-x-4">
                           <div>
                             <div className="flex items-center space-x-2">
                               <Clock className="h-4 w-4 text-gray-400 dark:text-gray-500" />
-                              <span className="font-medium text-gray-900 dark:text-gray-100">{formatTime(appointment.scheduledAt)}</span>
+                              <span className="font-medium text-gray-900 dark:text-gray-100">{formatAppointmentTimeRange(appointment)}</span>
                             </div>
                             <div className="flex items-center space-x-2 mt-1">
                               <User className="h-4 w-4 text-gray-400 dark:text-gray-500" />
@@ -1398,7 +1526,7 @@ export default function DoctorAppointments({ onNewAppointment }: { onNewAppointm
                           <div className="font-medium text-gray-900 dark:text-gray-100">{appointment.title}</div>
                           <div className="flex flex-wrap justify-end gap-2 mt-2">
                             <Badge 
-                              style={{ backgroundColor: statusColors[appointment.status as keyof typeof statusColors], color: "white" }}
+                              style={staffAppointmentStatusBadgeStyle(appointment.status)}
                             >
                               {appointment.status.toUpperCase()}
                             </Badge>
@@ -1444,7 +1572,11 @@ export default function DoctorAppointments({ onNewAppointment }: { onNewAppointm
           </CardHeader>
           <CardContent>
             <div className="space-y-3">
-              {getAppointmentsForDate(selectedDate).map((appointment: any) => {
+              {sortAppointmentsByCardTimeKind(
+                getAppointmentsForDate(selectedDate),
+                nowForCardStyle,
+                parseScheduledAtAsLocal,
+              ).map((appointment: any) => {
                 const doctor = usersData?.find((u: any) => u.id === appointment.providerId);
                 // Try multiple matching strategies to find the patient
                 const patient = patientsData?.find((p: any) => 
@@ -1471,15 +1603,27 @@ export default function DoctorAppointments({ onNewAppointment }: { onNewAppointm
                     )
                   : [];
                 const patientSpecialRequirements = getPatientSpecialRequirements(patient);
-                
+                const cardTimeKind = getAppointmentCardTimeKind(
+                  appointment,
+                  nowForCardStyle,
+                  parseScheduledAtAsLocal,
+                );
+
                 return (
                   <Card 
                     key={appointment.id} 
-                    className="border-l-4 bg-white dark:bg-slate-800 border-gray-200 dark:border-gray-700 cursor-pointer" 
+                    className={`relative overflow-visible border-l-4 cursor-pointer ${appointmentCardTimeBackgroundClass(cardTimeKind)}`}
                     style={{ borderLeftColor: statusColors[appointment.status as keyof typeof statusColors] }}
                     data-testid={`selected-date-appointment-${appointment.id}`}
                     onClick={() => setDetailsAppointment(appointment)}
                   >
+                    {cardTimeKind === "ongoing" && (
+                      <Badge
+                        className={`${appointmentOngoingBadgeClassName} ${appointmentOngoingBadgePositionClassName}`}
+                      >
+                        Ongoing
+                      </Badge>
+                    )}
                     <CardContent className="p-4">
                       {/* Header with Title and Actions */}
                       <div className="flex items-start justify-between mb-4">
@@ -1534,8 +1678,7 @@ export default function DoctorAppointments({ onNewAppointment }: { onNewAppointm
                             </Button>
                           )}
                           <Badge 
-                            style={{ backgroundColor: statusColors[appointment.status as keyof typeof statusColors] }}
-                            className="text-white"
+                            style={staffAppointmentStatusBadgeStyle(appointment.status)}
                           >
                             {appointment.status.toUpperCase()}
                           </Badge>
@@ -1552,7 +1695,7 @@ export default function DoctorAppointments({ onNewAppointment }: { onNewAppointm
                           </div>
                           <div className="flex items-center gap-2 text-sm text-gray-700 dark:text-gray-300">
                             <Clock className="h-4 w-4 text-gray-400" />
-                            <span className="font-semibold">{formatTime(appointment.scheduledAt)}</span>
+                            <span className="font-semibold">{formatAppointmentTimeRange(appointment)}</span>
                           </div>
                           <div className="flex items-center gap-2 text-sm text-gray-700 dark:text-gray-300">
                             <User className="h-4 w-4 text-gray-400" />
@@ -1778,8 +1921,7 @@ export default function DoctorAppointments({ onNewAppointment }: { onNewAppointm
                 })()}
               </h3>
               <Badge 
-                style={{ backgroundColor: statusColors[nextAppointment.status as keyof typeof statusColors] }}
-                className="text-white"
+                style={staffAppointmentStatusBadgeStyle(nextAppointment.status)}
               >
                 {nextAppointment.status.toUpperCase()}
               </Badge>
@@ -1832,7 +1974,7 @@ export default function DoctorAppointments({ onNewAppointment }: { onNewAppointm
               <div className="space-y-2">
                 <div className="flex items-center gap-2 text-sm text-gray-700 dark:text-gray-300">
                   <Clock className="h-4 w-4 text-blue-600" />
-                  <span className="font-semibold">{formatTime(nextAppointment.scheduledAt)}</span>
+                  <span className="font-semibold">{formatAppointmentTimeRange(nextAppointment)}</span>
                 </div>
                 <div className="flex items-center gap-2 text-sm text-gray-700 dark:text-gray-300">
                   <Stethoscope className="h-4 w-4 text-blue-600" />
@@ -1887,7 +2029,11 @@ export default function DoctorAppointments({ onNewAppointment }: { onNewAppointm
         </CardHeader>
         <CardContent>
           <div className="space-y-3">
-          {filteredAppointments.map((appointment: any) => {
+          {sortAppointmentsByCardTimeKind(
+            filteredAppointments,
+            nowForCardStyle,
+            parseScheduledAtAsLocal,
+          ).map((appointment: any) => {
               const doctor = usersData?.find((u: any) => u.id === appointment.providerId);
               // Try multiple matching strategies to find the patient
               const patient = patientsData?.find((p: any) => 
@@ -1914,14 +2060,26 @@ export default function DoctorAppointments({ onNewAppointment }: { onNewAppointm
               const patientSpecialRequirements = getPatientSpecialRequirements(patient);
               
             const appointmentServiceInfo = getAppointmentServiceInfo(appointment);
+            const cardTimeKind = getAppointmentCardTimeKind(
+              appointment,
+              nowForCardStyle,
+              parseScheduledAtAsLocal,
+            );
             return (
                 <Card 
                   key={appointment.id} 
-                  className="border-l-4 cursor-pointer" 
+                  className={`relative overflow-visible border-l-4 cursor-pointer ${appointmentCardTimeBackgroundClass(cardTimeKind)}`}
                   style={{ borderLeftColor: statusColors[appointment.status as keyof typeof statusColors] }}
                   data-testid={`filtered-appointment-${appointment.id}`}
                   onClick={() => setDetailsAppointment(appointment)}
                 >
+                  {cardTimeKind === "ongoing" && (
+                    <Badge
+                      className={`${appointmentOngoingBadgeClassName} ${appointmentOngoingBadgePositionClassName}`}
+                    >
+                      Ongoing
+                    </Badge>
+                  )}
                   <CardContent className="p-4">
                     {/* Header with Title and Actions */}
                     <div className="flex items-start justify-between mb-4">
@@ -1975,8 +2133,7 @@ export default function DoctorAppointments({ onNewAppointment }: { onNewAppointm
                           </Button>
                         )}
                         <Badge 
-                          style={{ backgroundColor: statusColors[appointment.status as keyof typeof statusColors] }}
-                          className="text-white"
+                          style={staffAppointmentStatusBadgeStyle(appointment.status)}
                         >
                           {appointment.status.toUpperCase()}
                         </Badge>
@@ -2023,7 +2180,7 @@ export default function DoctorAppointments({ onNewAppointment }: { onNewAppointm
                       <div className="space-y-2">
                         <div className="flex items-center gap-2 text-sm text-gray-700 dark:text-gray-300">
                           <Clock className="h-4 w-4 text-gray-400" />
-                          <span>{formatTime(appointment.scheduledAt)}</span>
+                          <span>{formatAppointmentTimeRange(appointment)}</span>
                         </div>
                         <div className="flex items-center gap-2 text-sm text-gray-700 dark:text-gray-300">
                           <User className="h-4 w-4 text-gray-400" />
@@ -2142,7 +2299,7 @@ export default function DoctorAppointments({ onNewAppointment }: { onNewAppointm
                         </p>
                         <p className="text-sm font-semibold text-gray-900 dark:text-white">
                           {formatAppointmentDate(editingAppointment.scheduledAt)}{" "}
-                          {formatTime(editingAppointment.scheduledAt)}
+                          {formatAppointmentTimeRange(editingAppointment)}
                         </p>
                       </div>
 
@@ -2861,7 +3018,7 @@ export default function DoctorAppointments({ onNewAppointment }: { onNewAppointm
                 <div className="border rounded-xl p-4 space-y-2 bg-white dark:bg-slate-800">
                   <div className="flex items-center justify-between text-xs uppercase tracking-wide text-gray-500 dark:text-gray-400">
                     <span>{(detailsAppointment.status || "scheduled").toUpperCase()}</span>
-                    <span>{formatTime(detailsAppointment.scheduledAt)}</span>
+                    <span>{formatAppointmentTimeRange(detailsAppointment)}</span>
                   </div>
                   <p className="text-xl font-semibold text-gray-900 dark:text-gray-100">
                     {patientEmail ? `${patientName} (${patientEmail})` : patientName}
@@ -2869,9 +3026,6 @@ export default function DoctorAppointments({ onNewAppointment }: { onNewAppointm
                   {serviceInfo && (
                     <p className="text-sm text-gray-600 dark:text-gray-300">Service: {serviceInfo.name}</p>
                   )}
-                  <p className="text-sm text-gray-600 dark:text-gray-300">
-                    {detailsAppointment.duration || 30} minutes
-                  </p>
 
                   <div className="pt-2">
                     <p className="text-xs text-gray-500 dark:text-gray-400">Provider</p>
@@ -2933,6 +3087,112 @@ export default function DoctorAppointments({ onNewAppointment }: { onNewAppointm
               {user?.role === 'nurse' ? 'Cancel Appointment' : 'Delete'}
             </Button>
           </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog
+        open={showPatientOverlapConflict}
+        onOpenChange={(open) => {
+          setShowPatientOverlapConflict(open);
+          if (!open) setPatientOverlapConflictRecord(null);
+        }}
+      >
+        <DialogContent className="max-h-[min(90vh,90dvh)] max-w-[min(32rem,calc(100vw-2rem))] w-full overflow-y-auto overflow-x-hidden dark:border-gray-700 dark:bg-slate-800">
+          <DialogHeader>
+            <DialogTitle className="text-xl font-bold text-red-600 dark:text-red-400">
+              Scheduling conflict
+            </DialogTitle>
+            <DialogDescription asChild>
+              <p className="text-left text-sm text-gray-700 dark:text-gray-300 pt-1 leading-relaxed">
+                {buildPatientOverlapDialogDescription(
+                  patientOverlapSelectedProviderDisplayName,
+                  {
+                    selectedProviderId:
+                      editingAppointment?.providerId ??
+                      editingAppointment?.provider_id,
+                    conflictProviderId:
+                      patientOverlapConflictRecord?.providerId ??
+                      patientOverlapConflictRecord?.provider_id,
+                  },
+                )}
+              </p>
+            </DialogDescription>
+          </DialogHeader>
+          {patientOverlapConflictRecord && (
+            <div className="rounded-md border border-amber-200 bg-amber-50/80 p-4 text-sm text-amber-950 dark:border-amber-900/50 dark:bg-amber-950/30 dark:text-amber-100">
+              <p className="mb-2 font-semibold text-amber-900 dark:text-amber-200">Conflicting appointment</p>
+              <ul className="list-none space-y-1.5">
+                {(() => {
+                  const c = patientOverlapConflictRecord;
+                  const pid = c.providerId ?? c.provider_id;
+                  const prov = usersData?.find((u: any) => Number(u.id) === Number(pid));
+                  const provName = prov
+                    ? `${prov.firstName || ""} ${prov.lastName || ""}`.trim() || "Unknown"
+                    : "Unknown provider";
+                  const roleLabel = c.assignedRole
+                    ? String(c.assignedRole).charAt(0).toUpperCase() + String(c.assignedRole).slice(1)
+                    : prov?.role
+                      ? String(prov.role)
+                      : null;
+                  const atLocal = parseScheduledAtAsLocal(c.scheduledAt);
+                  const dur = c.duration != null && Number(c.duration) > 0 ? Number(c.duration) : 30;
+                  const endAt = new Date(atLocal.getTime() + dur * 60 * 1000);
+                  const st = formatAppointmentStatusLabelDoc(c.status);
+                  const aptId = c.appointmentId ?? c.appointment_id;
+                  return (
+                    <>
+                      <li>
+                        <span className="font-medium text-amber-950 dark:text-amber-200">Provider: </span>
+                        {provName}
+                        {roleLabel ? ` (${roleLabel})` : ""}
+                      </li>
+                      <li>
+                        <span className="font-medium text-amber-950 dark:text-amber-200">Date: </span>
+                        {format(atLocal, "EEEE, MMM d, yyyy")}
+                      </li>
+                      <li>
+                        <span className="font-medium text-amber-950 dark:text-amber-200">Time: </span>
+                        {format(atLocal, "h:mm a")} – {format(endAt, "h:mm a")} ({dur} min)
+                      </li>
+                      <li>
+                        <span className="font-medium text-amber-950 dark:text-amber-200">Status: </span>
+                        {st}
+                      </li>
+                      {aptId ? (
+                        <li>
+                          <span className="font-medium text-amber-950 dark:text-amber-200">Appointment ID: </span>
+                          {aptId}
+                        </li>
+                      ) : null}
+                      {c.title ? (
+                        <li>
+                          <span className="font-medium text-amber-950 dark:text-amber-200">Title: </span>
+                          {c.title}
+                        </li>
+                      ) : null}
+                      {(c.appointmentType || c.appointment_type) && (
+                        <li>
+                          <span className="font-medium text-amber-950 dark:text-amber-200">Type: </span>
+                          {String(c.appointmentType || c.appointment_type)}
+                        </li>
+                      )}
+                    </>
+                  );
+                })()}
+              </ul>
+            </div>
+          )}
+          <div className="flex justify-end pt-2">
+            <Button
+              onClick={() => {
+                setShowPatientOverlapConflict(false);
+                setPatientOverlapConflictRecord(null);
+              }}
+              data-testid="button-doctor-overlap-conflict-ok"
+            >
+              OK
+            </Button>
+          </div>
         </DialogContent>
       </Dialog>
 

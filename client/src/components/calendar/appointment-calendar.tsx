@@ -30,6 +30,31 @@ const formatAppointmentTimeUTC = (iso?: string) => {
   const minuteString = minutes.toString().padStart(2, "0");
   return `${twelveHour}:${minuteString} ${period}`;
 };
+
+/** Only active bookings block same-service duplicate; completed/cancelled allow a new one. */
+const SERVICE_DUPLICATE_BLOCKING_STATUSES = new Set(["scheduled", "confirmed"]);
+
+function normalizeAppointmentStatusForDup(status: unknown): string {
+  return String(status ?? "")
+    .toLowerCase()
+    .trim();
+}
+
+function isServiceDuplicateBlockingStatus(status: unknown): boolean {
+  return SERVICE_DUPLICATE_BLOCKING_STATUSES.has(normalizeAppointmentStatusForDup(status));
+}
+
+function formatAppointmentStatusLabel(status: unknown): string {
+  const s = normalizeAppointmentStatusForDup(status);
+  if (!s) return "Unknown";
+  if (s === "no_show") return "No show";
+  return s
+    .split(/[\s_]+/)
+    .filter(Boolean)
+    .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
+    .join(" ");
+}
+
 import { useToast } from "@/hooks/use-toast";
 import { useQuery } from "@tanstack/react-query";
 import { apiRequest, getTenantSubdomain } from "@/lib/queryClient";
@@ -45,9 +70,86 @@ import { useAuth } from "@/hooks/use-auth";
 import { useRolePermissions } from "@/hooks/use-role-permissions";
 import { useTenant } from "@/hooks/use-tenant";
 import { cn } from "@/lib/utils";
+import {
+  getAppointmentCardTimeKind,
+  appointmentCardTimeBackgroundClass,
+  appointmentOngoingBadgeClassName,
+  appointmentOngoingBadgePositionClassName,
+  sortAppointmentsByCardTimeKind,
+  useAppointmentTimeTick,
+} from "@/lib/appointment-card-time-style";
+import {
+  buildPatientOverlapDialogDescription,
+  findPatientScheduleOverlap,
+  buildLocalIntervalFromDateAndTimeSlot,
+} from "@/lib/patient-appointment-overlap";
 import { useLocation } from "wouter";
 import { getActiveSubdomain } from "@/lib/subdomain-utils";
 import { isDoctorLike } from "@/lib/role-utils";
+
+/** Parse scheduledAt without UTC shift (matches DB naive timestamps used across this calendar). */
+function parseScheduledAtAsLocal(value: string | Date): Date {
+  if (value instanceof Date) {
+    return value;
+  }
+  if (typeof value !== "string") {
+    return new Date(value as any);
+  }
+
+  if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/.test(value)) {
+    const [datePart, timePart] = value.split(" ");
+    const [y, m, d] = datePart.split("-").map((n) => parseInt(n, 10));
+    const [hhStr, mmStr, ssStr] = timePart.split(":");
+    const hh = parseInt(hhStr || "0", 10);
+    const mm = parseInt(mmStr || "0", 10);
+    const ss = parseInt((ssStr || "0").split(".")[0], 10);
+    if (![y, m, d, hh, mm, ss].some((n) => Number.isNaN(n))) {
+      return new Date(y, (m || 1) - 1, d || 1, hh, mm, ss, 0);
+    }
+  }
+
+  const isoLike = value.includes("T") && (value.endsWith("Z") || /[+-]\d{2}:\d{2}$/.test(value));
+  if (isoLike) {
+    const [datePart, timePartRaw] = value.split("T");
+    const [y, m, d] = datePart.split("-").map((n) => parseInt(n, 10));
+    const timePart = (timePartRaw || "").replace("Z", "").replace(/[+-]\d{2}:\d{2}$/, "");
+    const [hhStr, mmStr, ssStr] = timePart.split(":");
+    const hh = parseInt(hhStr || "0", 10);
+    const mm = parseInt(mmStr || "0", 10);
+    const ss = parseInt((ssStr || "0").split(".")[0], 10);
+    if (![y, m, d, hh, mm, ss].some((n) => Number.isNaN(n))) {
+      return new Date(y, m - 1, d, hh, mm, ss, 0);
+    }
+  }
+
+  const match = value.match(/^(\d{4})-(\d{2})-(\d{2})[T\s](\d{2}):(\d{2})(?::(\d{2}))?(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})?$/i);
+  if (match) {
+    const [, yStr, mStr, dStr, hhStr, mmStr, ssStr] = match;
+    const y = parseInt(yStr, 10);
+    const m = parseInt(mStr, 10);
+    const d = parseInt(dStr, 10);
+    const hh = parseInt(hhStr, 10);
+    const mm = parseInt(mmStr, 10);
+    const ss = parseInt(ssStr || "0", 10);
+    if (![y, m, d, hh, mm, ss].some((n) => Number.isNaN(n))) {
+      return new Date(y, m - 1, d, hh, mm, ss, 0);
+    }
+  }
+
+  const parsed = new Date(value);
+  if (!Number.isNaN(parsed.getTime())) {
+    return new Date(
+      parsed.getFullYear(),
+      parsed.getMonth(),
+      parsed.getDate(),
+      parsed.getHours(),
+      parsed.getMinutes(),
+      parsed.getSeconds(),
+      0
+    );
+  }
+  return parsed;
+}
 
 const statusColors = {
   scheduled: "text-white",
@@ -269,6 +371,9 @@ export default function AppointmentCalendar({ onNewAppointment }: { onNewAppoint
   const [showDuplicateWarning, setShowDuplicateWarning] = useState(false);
   const [duplicateAppointmentDetails, setDuplicateAppointmentDetails] = useState<string>("");
   const [duplicateAppointment, setDuplicateAppointment] = useState<any>(null);
+  const [showPatientOverlapConflict, setShowPatientOverlapConflict] = useState(false);
+  const [patientOverlapConflictRecord, setPatientOverlapConflictRecord] = useState<any | null>(null);
+  const [duplicateResolveStatus, setDuplicateResolveStatus] = useState<string>("completed");
   const [newAppointmentDate, setNewAppointmentDate] = useState<Date | undefined>(undefined);
   const [newSelectedTimeSlot, setNewSelectedTimeSlot] = useState<string>("");
   const [selectedRole, setSelectedRole] = useState<string>("");
@@ -910,6 +1015,36 @@ const parseShiftTimeToMinutes = (time?: string): number => {
     },
   });
 
+  const resolveDuplicateStatusMutation = useMutation({
+    mutationFn: async ({ id, status }: { id: number; status: string }) => {
+      const response = await apiRequest("PATCH", `/api/appointments/${id}`, { status });
+      return response.json();
+    },
+    onSuccess: async (_data, variables) => {
+      await queryClient.invalidateQueries({ queryKey: ["/api/appointments"] });
+      await queryClient.refetchQueries({ queryKey: ["/api/appointments"] });
+      const st = normalizeAppointmentStatusForDup(variables.status);
+      if (st === "completed" || st === "cancelled") {
+        setShowDuplicateWarning(false);
+        setDuplicateAppointment(null);
+        setDuplicateAppointmentDetails("");
+        setShowConfirmationDialog(true);
+        toast({
+          title: "Status updated",
+          description: "Review and confirm the new appointment below.",
+        });
+      }
+    },
+    onError: (error: any) => {
+      console.error("resolveDuplicateStatusMutation error:", error);
+      toast({
+        title: "Update failed",
+        description: error?.message || "Could not update appointment status.",
+        variant: "destructive",
+      });
+    },
+  });
+
   // Cancel appointment mutation
   const cancelAppointmentMutation = useMutation({
     mutationFn: async (appointmentId: number) => {
@@ -1378,6 +1513,79 @@ Medical License: [License Number]
     return map;
   }, [consultationServices]);
 
+  /** Provider line for duplicate copy (Dr./Nurse prefix by role). */
+  const formatDuplicateProviderDisplayName = useCallback((providerId: number | string | null | undefined) => {
+    if (providerId == null || providerId === "") return "the selected provider";
+    const u = usersData?.find((x: any) => Number(x.id) === Number(providerId));
+    if (!u) return "the selected provider";
+    const name = `${u.firstName || ""} ${u.lastName || ""}`.trim() || "Provider";
+    const r = String(u.role || "").toLowerCase();
+    if (r === "nurse") return `Nurse ${name}`;
+    if (r === "doctor" || isDoctorLike(u.role)) return `Dr. ${name}`;
+    return name;
+  }, [usersData]);
+
+  /** Treatment/consultation label for duplicate card + sentences. */
+  const getDuplicateAppointmentServiceLabel = useCallback(
+    (apt: any) => {
+      if (!apt) return "N/A";
+      const k = String(apt.appointmentType || apt.appointment_type || "").toLowerCase();
+      if (k === "treatment") {
+        const tid = apt.treatmentId ?? apt.treatment_id;
+        const name = treatmentsList.find((t: any) => Number(t.id) === Number(tid))?.name;
+        return name || "treatment";
+      }
+      if (k === "consultation") {
+        const cid = apt.consultationId ?? apt.consultation_id;
+        const name = consultationServices.find((s: any) => Number(s.id) === Number(cid))?.serviceName;
+        return name || "consultation";
+      }
+      return "N/A";
+    },
+    [treatmentsList, consultationServices]
+  );
+
+  const findDuplicateServiceAppointment = useCallback(
+    (patientIdStr: string, appointmentsList?: any[]) => {
+      const list = appointmentsList ?? appointmentsData;
+      if (!list || !newAppointmentDate || !selectedProviderId || !appointmentType) return null;
+      const selectedDateStr = format(newAppointmentDate, "yyyy-MM-dd");
+      const normType = appointmentType as "treatment" | "consultation";
+      const tid = normType === "treatment" ? appointmentSelectedTreatment?.id ?? null : null;
+      const cid = normType === "consultation" ? appointmentSelectedConsultation?.id ?? null : null;
+
+      if (normType === "treatment" && tid == null) return null;
+      if (normType === "consultation" && cid == null) return null;
+
+      return (
+        list.find((apt: any) => {
+          if (!isServiceDuplicateBlockingStatus(apt.status)) return false;
+          const aptDateStr = format(parseScheduledAtAsLocal(apt.scheduledAt), "yyyy-MM-dd");
+          const aptPatient = apt.patientId ?? apt.patient_id;
+          const aptProvider = apt.providerId ?? apt.provider_id;
+          if (String(aptPatient) !== patientIdStr) return false;
+          if (String(aptProvider) !== selectedProviderId) return false;
+          if (aptDateStr !== selectedDateStr) return false;
+          const aptKind = String(apt.appointmentType || apt.appointment_type || "").toLowerCase();
+          if (normType === "treatment") {
+            const aptTid = apt.treatmentId ?? apt.treatment_id;
+            return aptKind === "treatment" && Number(aptTid) === Number(tid);
+          }
+          const aptCid = apt.consultationId ?? apt.consultation_id;
+          return aptKind === "consultation" && Number(aptCid) === Number(cid);
+        }) ?? null
+      );
+    },
+    [
+      appointmentsData,
+      newAppointmentDate,
+      selectedProviderId,
+      appointmentType,
+      appointmentSelectedTreatment,
+      appointmentSelectedConsultation,
+    ]
+  );
+
   useEffect(() => {
     if (!editingAppointment) return;
     if (
@@ -1775,6 +1983,22 @@ Medical License: [License Number]
     return user.role === selectedRole;
   }) || [];
 
+  const patientOverlapSelectedProviderIdForMessage = useMemo(() => {
+    if (editingAppointment) {
+      return editingAppointment.providerId ?? editingAppointment.provider_id;
+    }
+    return selectedProviderId;
+  }, [editingAppointment, selectedProviderId]);
+
+  const patientOverlapSelectedProviderDisplayName = useMemo(() => {
+    const pid = patientOverlapSelectedProviderIdForMessage;
+    if (pid == null || pid === "") return "the selected provider";
+    const u = usersData?.find((x: any) => String(x.id) === String(pid));
+    if (!u) return "the selected provider";
+    const n = `${u.firstName || ""} ${u.lastName || ""}`.trim();
+    return n || "the selected provider";
+  }, [patientOverlapSelectedProviderIdForMessage, usersData]);
+
   // Map roles to dropdown options format from roles table, excluding 'patient', 'admin', and 'Administrator'
   const availableRoles = rolesData
     .filter((role: any) => {
@@ -1789,78 +2013,6 @@ Medical License: [License Number]
       }
       return 0;
     });
-
-  // Parse scheduledAt values WITHOUT applying JS timezone conversion.
-  // Handles multiple formats: PostgreSQL timestamp, ISO with timezone, ISO without timezone
-  const parseScheduledAtAsLocal = (value: string | Date): Date => {
-    if (value instanceof Date) {
-      return value;
-    }
-    if (typeof value !== "string") {
-      return new Date(value as any);
-    }
-
-    // Handle PostgreSQL timestamp format: "2026-03-24 15:00:00" (space-separated, no timezone)
-    if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/.test(value)) {
-      const [datePart, timePart] = value.split(' ');
-      const [y, m, d] = datePart.split("-").map((n) => parseInt(n, 10));
-      const [hhStr, mmStr, ssStr] = timePart.split(":");
-      const hh = parseInt(hhStr || "0", 10);
-      const mm = parseInt(mmStr || "0", 10);
-      const ss = parseInt((ssStr || "0").split(".")[0], 10);
-      if (![y, m, d, hh, mm, ss].some((n) => Number.isNaN(n))) {
-        return new Date(y, (m || 1) - 1, d || 1, hh, mm, ss, 0);
-      }
-    }
-
-    // Handle ISO format with timezone: "2026-03-26T00:00:00.000Z" or "2026-03-26T15:00:00.000Z"
-    // Extract components and treat them as local time (no UTC conversion)
-    const isoLike = value.includes("T") && (value.endsWith("Z") || /[+-]\d{2}:\d{2}$/.test(value));
-    if (isoLike) {
-      const [datePart, timePartRaw] = value.split("T");
-      const [y, m, d] = datePart.split("-").map((n) => parseInt(n, 10));
-      // Remove timezone indicators (Z or +/-HH:mm)
-      const timePart = (timePartRaw || "").replace("Z", "").replace(/[+-]\d{2}:\d{2}$/, "");
-      const [hhStr, mmStr, ssStr] = timePart.split(":");
-      const hh = parseInt(hhStr || "0", 10);
-      const mm = parseInt(mmStr || "0", 10);
-      const ss = parseInt((ssStr || "0").split(".")[0], 10);
-      if (![y, m, d, hh, mm, ss].some((n) => Number.isNaN(n))) {
-        return new Date(y, m - 1, d, hh, mm, ss, 0);
-      }
-    }
-
-    // Handle ISO-like string without timezone: "2026-03-24T00:00:00"
-    const match = value.match(/^(\d{4})-(\d{2})-(\d{2})[T\s](\d{2}):(\d{2})(?::(\d{2}))?(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})?$/i);
-    if (match) {
-      const [, yStr, mStr, dStr, hhStr, mmStr, ssStr] = match;
-      const y = parseInt(yStr, 10);
-      const m = parseInt(mStr, 10);
-      const d = parseInt(dStr, 10);
-      const hh = parseInt(hhStr, 10);
-      const mm = parseInt(mmStr, 10);
-      const ss = parseInt(ssStr || "0", 10);
-      if (![y, m, d, hh, mm, ss].some((n) => Number.isNaN(n))) {
-        return new Date(y, m - 1, d, hh, mm, ss, 0);
-      }
-    }
-
-    // Fallback: if string parsing fails, try standard Date constructor
-    const parsed = new Date(value);
-    if (!Number.isNaN(parsed.getTime())) {
-      // Extract local components to avoid timezone issues
-      return new Date(
-        parsed.getFullYear(),
-        parsed.getMonth(),
-        parsed.getDate(),
-        parsed.getHours(), // Use getHours() not getUTCHours()
-        parsed.getMinutes(), // Use getMinutes() not getUTCMinutes()
-        parsed.getSeconds(),
-        0
-      );
-    }
-    return parsed;
-  };
 
   // Format date as local ISO string (no timezone conversion; no Z/+offset)
   // Format: "YYYY-MM-DDTHH:mm:ss" (no timezone indicator, backend should treat as-is)
@@ -2220,13 +2372,36 @@ Medical License: [License Number]
     });
   };
 
+  /** Month grid dots: treatments always use pricing `colorCode`; only consultations use fixed blue. */
+  const CONSULTATION_DOT_COLOR = "#4A7DFF";
+  const TREATMENT_DOT_FALLBACK = "#D1D5DB";
+
   const getAppointmentDotColor = (appointment: any) => {
-    if (appointment?.appointmentType === "treatment" && appointment?.treatmentId) {
-      const treatment = treatmentsMap.get(appointment.treatmentId);
-      if (treatment?.color) return treatment.color;
+    const aptType = String(appointment?.appointmentType || appointment?.appointment_type || "").toLowerCase();
+    const tid = appointment?.treatmentId ?? appointment?.treatment_id;
+    const cid = appointment?.consultationId ?? appointment?.consultation_id;
+
+    if (aptType === "consultation") {
+      return CONSULTATION_DOT_COLOR;
     }
 
-    return statusBgColors[appointment?.status as keyof typeof statusBgColors] || statusBgColors.scheduled;
+    if (aptType === "treatment" && tid != null && !Number.isNaN(Number(tid))) {
+      return treatmentsMap.get(Number(tid))?.color ?? TREATMENT_DOT_FALLBACK;
+    }
+
+    if (tid != null && !Number.isNaN(Number(tid))) {
+      return treatmentsMap.get(Number(tid))?.color ?? TREATMENT_DOT_FALLBACK;
+    }
+
+    if (cid != null && !Number.isNaN(Number(cid))) {
+      return CONSULTATION_DOT_COLOR;
+    }
+
+    const st = appointment?.status as keyof typeof statusBgColors;
+    if (st && statusBgColors[st] && st !== "scheduled") {
+      return statusBgColors[st];
+    }
+    return TREATMENT_DOT_FALLBACK;
   };
 
   const getAppointmentServiceInfo = (appointment: any) => {
@@ -2254,6 +2429,18 @@ Medical License: [License Number]
     return matchesAppointmentId;
   });
 
+  const appointmentTimeTick = useAppointmentTimeTick();
+  const nowForCardStyle = useMemo(() => new Date(), [appointmentTimeTick]);
+  const sortedSelectedDateAppointments = useMemo(
+    () =>
+      sortAppointmentsByCardTimeKind(
+        selectedDateAppointments,
+        nowForCardStyle,
+        parseScheduledAtAsLocal,
+      ),
+    [selectedDateAppointments, nowForCardStyle],
+  );
+
   if (isLoading) {
     return (
       <Card>
@@ -2274,6 +2461,27 @@ Medical License: [License Number]
       const date = new Date(cleanTimeString);
       return format(date, "h:mm a");
     } catch (error) {
+      return "Invalid time";
+    }
+  };
+
+  /** Admin: e.g. "12:45 PM – 1:15 PM · 30 minutes" from scheduledAt + duration (default 30 min). */
+  const formatAppointmentTimeRange = (appointment: {
+    scheduledAt?: string | Date;
+    duration?: number | string | null;
+  }) => {
+    try {
+      if (!appointment?.scheduledAt) return "Invalid time";
+      const start = parseScheduledAtAsLocal(appointment.scheduledAt);
+      if (Number.isNaN(start.getTime())) return "Invalid time";
+      const dur =
+        appointment.duration != null && Number(appointment.duration) > 0
+          ? Number(appointment.duration)
+          : 30;
+      const end = new Date(start.getTime() + dur * 60 * 1000);
+      const durLabel = dur === 1 ? "1 minute" : `${dur} minutes`;
+      return `${format(start, "h:mm a")} – ${format(end, "h:mm a")} · ${durLabel}`;
+    } catch {
       return "Invalid time";
     }
   };
@@ -2383,7 +2591,11 @@ Medical License: [License Number]
                           setSelectedAppointment(appointment);
                           setShowAppointmentDetails(true);
                         }}
-                        title={`${formatTime(appointment.scheduledAt)} - ${appointment.patientName}`}
+                        title={`${
+                          user?.role === "admin"
+                            ? formatAppointmentTimeRange(appointment)
+                            : formatTime(appointment.scheduledAt)
+                        } - ${appointment.patientName}`}
                       />
                     ))}
                     {dayAppointments.length > 3 && (
@@ -2487,14 +2699,33 @@ Medical License: [License Number]
             <p className="text-gray-500 dark:text-gray-400 text-center py-8">No appointments scheduled for this date.</p>
           ) : (
             <div className="space-y-3">
-              {selectedDateAppointments.map((appointment: any) => {
+              {sortedSelectedDateAppointments.map((appointment: any) => {
                 const serviceInfo = getAppointmentServiceInfo(appointment);
+                const cardTimeKind = getAppointmentCardTimeKind(
+                  appointment,
+                  nowForCardStyle,
+                  parseScheduledAtAsLocal,
+                );
                 return (
                   <div
                     key={appointment.id}
-                    className="relative flex items-center justify-between p-4 pt-8 border dark:border-gray-700 rounded-lg hover:bg-gray-50 dark:hover:bg-gray-800"
+                    className={cn(
+                      "relative flex items-center justify-between overflow-visible p-4 pt-8 border rounded-lg",
+                      appointmentCardTimeBackgroundClass(cardTimeKind),
+                      "ring-inset hover:ring-1 hover:ring-gray-200 dark:hover:ring-gray-600",
+                    )}
                     onMouseDown={(e) => e.preventDefault()}
                   >
+                    {cardTimeKind === "ongoing" && (
+                      <Badge
+                        className={cn(
+                          appointmentOngoingBadgeClassName,
+                          appointmentOngoingBadgePositionClassName,
+                        )}
+                      >
+                        Ongoing
+                      </Badge>
+                    )}
                     {user?.role === 'admin' && appointment.appointmentId && (
                       <Badge
                         className="absolute top-1.5 left-2 text-xs bg-blue-100 text-blue-800 dark:bg-blue-900 dark:text-blue-200"
@@ -2512,8 +2743,16 @@ Medical License: [License Number]
                       <div className="flex flex-col">
                         <Badge
                           style={{
-                            backgroundColor: statusBgColors[appointment.status as keyof typeof statusBgColors] || statusBgColors.scheduled,
-                            color: statusColors[appointment.status as keyof typeof statusColors] || statusColors.scheduled
+                            backgroundColor:
+                              statusBgColors[appointment.status as keyof typeof statusBgColors] ||
+                              statusBgColors.scheduled,
+                            color:
+                              String(appointment.status || "")
+                                .toLowerCase()
+                                .trim()
+                                .replace(/\s+/g, "_") === "completed"
+                                ? "#000000"
+                                : "#ffffff",
                           }}
                         >
                           {appointment.status.replace('_', ' ').toUpperCase()}
@@ -2522,7 +2761,11 @@ Medical License: [License Number]
                       <div>
                         <div className="flex items-center space-x-2">
                           <Clock className="h-4 w-4 text-gray-400" />
-                          <span className="font-medium text-gray-900 dark:text-gray-100">{formatTime(appointment.scheduledAt)}</span>
+                          <span className="font-medium text-gray-900 dark:text-gray-100">
+                            {user?.role === "admin"
+                              ? formatAppointmentTimeRange(appointment)
+                              : formatTime(appointment.scheduledAt)}
+                          </span>
                         </div>
                         <div className="flex items-center space-x-2 mt-1">
                           <User className="h-4 w-4 text-gray-400" />
@@ -2539,12 +2782,14 @@ Medical License: [License Number]
                           Service: {serviceInfo.label}
                         </p>
                       )}
-                        <div className="flex items-center space-x-2 mt-1">
-                          <Clock className="h-4 w-4 text-gray-400" />
-                          <span className="text-sm text-gray-600 dark:text-gray-300">
-                            {appointment.duration || 30} minutes
-                          </span>
-                        </div>
+                        {user?.role !== "admin" && (
+                          <div className="flex items-center space-x-2 mt-1">
+                            <Clock className="h-4 w-4 text-gray-400" />
+                            <span className="text-sm text-gray-600 dark:text-gray-300">
+                              {appointment.duration || 30} minutes
+                            </span>
+                          </div>
+                        )}
                         {user?.role === "admin" && (
                           <div className="w-full mt-2 flex flex-wrap gap-2">
                             {(() => {
@@ -2697,11 +2942,13 @@ Medical License: [License Number]
                   <div className="flex items-center justify-between text-xs uppercase tracking-wide text-gray-500 dark:text-gray-400">
                     <span>{selectedAppointment.status?.toUpperCase() || "Scheduled"}</span>
                     <span>
-                      {selectedAppointment.startTime ||
-                        selectedAppointment.time ||
-                        selectedAppointment.timeSlot ||
-                        formatAppointmentTimeUTC(selectedAppointment.scheduledAt) ||
-                        "Time not set"}
+                      {user?.role === "admin" && selectedAppointment.scheduledAt
+                        ? formatAppointmentTimeRange(selectedAppointment)
+                        : selectedAppointment.startTime ||
+                          selectedAppointment.time ||
+                          selectedAppointment.timeSlot ||
+                          formatAppointmentTimeUTC(selectedAppointment.scheduledAt) ||
+                          "Time not set"}
                     </span>
                   </div>
                   <div className="mt-2">
@@ -2724,9 +2971,11 @@ Medical License: [License Number]
                       <p className="text-xs text-gray-500 dark:text-gray-400">
                         Service: {selectedAppointment.service || selectedAppointment.appointmentType || "N/A"}
                       </p>
-                    <p className="text-xs text-gray-500 dark:text-gray-400">
-                      {selectedAppointment.duration || 30} minutes
-                    </p>
+                    {user?.role !== "admin" && (
+                      <p className="text-xs text-gray-500 dark:text-gray-400">
+                        {selectedAppointment.duration || 30} minutes
+                      </p>
+                    )}
                   </div>
                   <div className="mt-2">
                     <p className="text-xs text-gray-500 dark:text-gray-400">Provider</p>
@@ -4100,132 +4349,86 @@ Medical License: [License Number]
                     if (hasError) {
                       return;
                     }
-                    
-                    // Check for duplicate appointments (same patient, same doctor, same date) - Patient role specific
-                    if (user?.role === 'patient' && appointmentsData && newAppointmentDate && selectedProviderId) {
-                      const selectedDateStr = format(newAppointmentDate, 'yyyy-MM-dd');
-                      
-                      // For patient users, find their patient record ID
-                      let patientDbId = newAppointmentData.patientId;
-                      if (!patientDbId && patientsData && user?.id) {
-                        const patientRecord = patientsData.find((p: any) => 
-                          p.userId === user.id || 
-                          p.email?.toLowerCase() === user.email?.toLowerCase()
+
+                    await refetch();
+
+                    // Same patient cannot overlap scheduled/confirmed windows with any provider
+                    const freshAppointments = queryClient.getQueryData<any[]>(["/api/appointments"]);
+                    const appointmentsForOverlap = Array.isArray(freshAppointments)
+                      ? freshAppointments
+                      : Array.isArray(appointmentsData)
+                        ? appointmentsData
+                        : [];
+
+                    if (
+                      newAppointmentData.patientId &&
+                      newAppointmentDate &&
+                      newSelectedTimeSlot &&
+                      Array.isArray(appointmentsForOverlap)
+                    ) {
+                      const interval = buildLocalIntervalFromDateAndTimeSlot(
+                        newAppointmentDate,
+                        newSelectedTimeSlot,
+                        selectedDuration,
+                      );
+                      if (interval) {
+                        const { conflict } = findPatientScheduleOverlap(
+                          String(newAppointmentData.patientId),
+                          interval.start,
+                          interval.end,
+                          appointmentsForOverlap,
+                          parseScheduledAtAsLocal,
+                          {},
                         );
-                        if (patientRecord) {
-                          patientDbId = patientRecord.id.toString();
-                        }
-                      }
-                      
-                      if (patientDbId) {
-                        const foundDuplicateAppointment = appointmentsData.find((apt: any) => {
-                          const aptDateStr = format(new Date(apt.scheduledAt), 'yyyy-MM-dd');
-                          return (
-                            apt.patientId.toString() === patientDbId &&
-                            apt.providerId.toString() === selectedProviderId &&
-                            aptDateStr === selectedDateStr &&
-                            apt.status !== 'cancelled'
-                          );
-                        });
-                        
-                        if (foundDuplicateAppointment) {
-                          setDuplicateAppointmentDetails(`Appointment already exists. Please edit it instead of creating new appointment.`);
-                          setDuplicateAppointment(foundDuplicateAppointment);
-                          setShowDuplicateWarning(true);
+                        if (conflict) {
+                          setPatientOverlapConflictRecord(conflict);
+                          setShowPatientOverlapConflict(true);
                           return;
                         }
                       }
                     }
                     
-                    // Check for duplicate appointments (same patient, same doctor, same date) - For non-patient roles
-                    if (user?.role !== 'patient' && appointmentsData && newAppointmentDate) {
-                      const selectedDateStr = format(newAppointmentDate, 'yyyy-MM-dd');
-                      const foundDuplicateAppointment = appointmentsData.find((apt: any) => {
-                        const aptDateStr = format(new Date(apt.scheduledAt), 'yyyy-MM-dd');
-                        return (
-                          apt.patientId.toString() === newAppointmentData.patientId &&
-                          apt.providerId.toString() === selectedProviderId &&
-                          aptDateStr === selectedDateStr &&
-                          apt.status !== 'cancelled'
+                    // Same doctor + patient + date + same treatment/consultation — only blocks if existing row is Scheduled or Confirmed
+                    if (user?.role === "patient" && appointmentsData && newAppointmentDate && selectedProviderId) {
+                      let patientDbId = newAppointmentData.patientId;
+                      if (!patientDbId && patientsData && user?.id) {
+                        const patientRecord = patientsData.find(
+                          (p: any) =>
+                            p.userId === user.id ||
+                            p.email?.toLowerCase() === user.email?.toLowerCase()
                         );
-                      });
-                      
-                      if (foundDuplicateAppointment) {
-                        const doctorName = usersData?.find((u: any) => u.id.toString() === selectedProviderId);
-                        const doctorFullName = doctorName ? `${doctorName.firstName} ${doctorName.lastName}` : 'the selected doctor';
-                        const formattedDate = format(newAppointmentDate, 'PPP');
-                        const selectedPatient = patientsData?.find((p: any) => p.id.toString() === newAppointmentData.patientId);
-                        const patientFullName = selectedPatient ? `${selectedPatient.firstName} ${selectedPatient.lastName}` : 'Patient';
-                        setDuplicateAppointmentDetails(`Patient ${patientFullName} already has an appointment with ${doctorFullName} on ${formattedDate}. Please select another time slot.`);
-                        setDuplicateAppointment(null);
-                        setShowDuplicateWarning(true);
-                        return;
+                        if (patientRecord) {
+                          patientDbId = patientRecord.id.toString();
+                        }
+                      }
+
+                      if (patientDbId) {
+                        const foundDup = findDuplicateServiceAppointment(
+                          String(patientDbId),
+                          appointmentsForOverlap,
+                        );
+                        if (foundDup) {
+                          setDuplicateAppointmentDetails("");
+                          setDuplicateAppointment(foundDup);
+                          setShowDuplicateWarning(true);
+                          return;
+                        }
                       }
                     }
-                    
-                    // Admin-only: Check for time slot conflicts (same patient, same time slot)
-                    if (user?.role === 'admin' && appointmentsData && newAppointmentDate && newSelectedTimeSlot) {
-                      console.log('[Conflict Check] Starting conflict detection...');
-                      console.log('[Conflict Check] Patient ID:', newAppointmentData.patientId);
-                      console.log('[Conflict Check] Selected time slot:', newSelectedTimeSlot);
-                      console.log('[Conflict Check] Appointments data count:', appointmentsData.length);
-                      
-                      const selectedDateStr = format(newAppointmentDate, 'yyyy-MM-dd');
-                      
-                      // Convert 12-hour time format to 24-hour format for comparison
-                      const convertTo24Hour = (time12h: string): string => {
-                        const [time, modifier] = time12h.split(' ');
-                        let [hours, minutes] = time.split(':');
-                        
-                        if (hours === '12') {
-                          hours = '00';
+
+                    if (user?.role !== "patient" && appointmentsForOverlap && newAppointmentDate) {
+                      const foundDup = findDuplicateServiceAppointment(
+                        String(newAppointmentData.patientId),
+                        appointmentsForOverlap,
+                      );
+                      if (foundDup) {
+                        setDuplicateAppointmentDetails("");
+                        setDuplicateAppointment(foundDup);
+                        if (user?.role === "admin" || isDoctorLike(user?.role)) {
+                          setDuplicateResolveStatus("completed");
                         }
-                        
-                        if (modifier === 'PM') {
-                          hours = String(parseInt(hours, 10) + 12);
-                        }
-                        
-                        return `${hours.padStart(2, '0')}:${minutes}`;
-                      };
-                      
-                      const selectedTime24h = newSelectedTimeSlot.includes('AM') || newSelectedTimeSlot.includes('PM') 
-                        ? convertTo24Hour(newSelectedTimeSlot)
-                        : newSelectedTimeSlot;
-                      
-                      console.log('[Conflict Check] Converted selected time to 24h:', selectedTime24h);
-                      
-                      const conflictingAppointment = appointmentsData.find((apt: any) => {
-                        if (apt.patientId.toString() !== newAppointmentData.patientId || apt.status === 'cancelled') {
-                          return false;
-                        }
-                        
-                        const aptDateStr = format(new Date(apt.scheduledAt), 'yyyy-MM-dd');
-                        if (aptDateStr !== selectedDateStr) {
-                          return false;
-                        }
-                        
-                        // Extract time from appointment's scheduledAt
-                        const aptTimeString = apt.scheduledAt.substring(11, 16); // Extract "HH:MM"
-                        
-                        console.log('[Conflict Check] Comparing times - Appointment:', aptTimeString, 'vs Selected:', selectedTime24h);
-                        
-                        return aptTimeString === selectedTime24h;
-                      });
-                      
-                      if (conflictingAppointment) {
-                        console.log('[Conflict Check] CONFLICT FOUND:', conflictingAppointment);
-                        const conflictDoctorName = usersData?.find((u: any) => u.id.toString() === conflictingAppointment.providerId.toString());
-                        const doctorFullName = conflictDoctorName ? `${conflictDoctorName.firstName} ${conflictDoctorName.lastName}` : 'Unknown Doctor';
-                        const formattedDate = format(new Date(conflictingAppointment.scheduledAt), 'PPP');
-                        const formattedTime = format(new Date(conflictingAppointment.scheduledAt), 'p');
-                        const duration = conflictingAppointment.duration || 30;
-                        const selectedPatient = patientsData?.find((p: any) => p.id.toString() === newAppointmentData.patientId);
-                        const patientFullName = selectedPatient ? `${selectedPatient.firstName} ${selectedPatient.lastName}` : 'Patient';
-                        setDuplicateAppointmentDetails(`Patient ${patientFullName} already has an appointment with ${doctorFullName} on ${formattedDate}, at ${formattedTime} for ${duration} minutes. Please select another time slot.`);
                         setShowDuplicateWarning(true);
                         return;
-                      } else {
-                        console.log('[Conflict Check] No conflict found');
                       }
                     }
                     
@@ -4357,6 +4560,14 @@ Medical License: [License Number]
                     return;
                   }
 
+                  await refetch();
+                  const freshForConfirm = queryClient.getQueryData<any[]>(["/api/appointments"]);
+                  const appointmentsForConfirm = Array.isArray(freshForConfirm)
+                    ? freshForConfirm
+                    : Array.isArray(appointmentsData)
+                      ? appointmentsData
+                      : [];
+
                   // Create new datetime without timezone conversion
                   const selectedDate = format(newAppointmentDate!, "yyyy-MM-dd");
                   const [time, period] = newSelectedTimeSlot.split(" ");
@@ -4392,6 +4603,22 @@ Medical License: [License Number]
                       `Only ${durationCheck.availableMinutes} minutes are available at ${newSelectedTimeSlot}. Please choose a ${durationCheck.availableMinutes} minute duration.`
                     );
                     setShowValidationError(true);
+                    return;
+                  }
+
+                  const newStartConfirm = parseScheduledAtAsLocal(newScheduledAt);
+                  const newEndConfirm = new Date(newStartConfirm.getTime() + selectedDuration * 60 * 1000);
+                  const overlapConfirm = findPatientScheduleOverlap(
+                    String(newAppointmentData.patientId),
+                    newStartConfirm,
+                    newEndConfirm,
+                    appointmentsForConfirm,
+                    parseScheduledAtAsLocal,
+                    {},
+                  );
+                  if (overlapConfirm.conflict) {
+                    setPatientOverlapConflictRecord(overlapConfirm.conflict);
+                    setShowPatientOverlapConflict(true);
                     return;
                   }
 
@@ -4466,10 +4693,40 @@ Medical License: [License Number]
                     },
                     onError: (error: any) => {
                       console.error('[APPOINTMENT-CALENDAR] Failed to create appointment:', error);
-                      // Keep dialog open so user can see the error and try again
+                      const raw = String(error?.message || "");
+                      const m = raw.match(/^409:\s*([\s\S]+)$/);
+                      if (m) {
+                        try {
+                          const payload = JSON.parse(m[1]);
+                          if (payload.code === "DUPLICATE_APPOINTMENT_SERVICE" && payload.message) {
+                            const ex = payload.existingAppointment;
+                            setDuplicateAppointment(
+                              ex
+                                ? {
+                                    ...ex,
+                                    id: ex.id ?? ex.appointment_id,
+                                    status: ex.dup_status ?? ex.status,
+                                    scheduledAt: ex.scheduled_at ?? ex.scheduledAt,
+                                  }
+                                : null
+                            );
+                            setDuplicateAppointmentDetails(ex ? "" : payload.message);
+                            if (user?.role === "admin" || isDoctorLike(user?.role)) {
+                              setDuplicateResolveStatus("completed");
+                            }
+                            setShowDuplicateWarning(true);
+                            setShowConfirmationDialog(false);
+                            return;
+                          }
+                        } catch {
+                          /* fall through */
+                        }
+                      }
                       toast({
                         title: "Creation Failed",
-                        description: error?.message || "Failed to create the appointment. Please check the console for details.",
+                        description:
+                          raw.replace(/^409:\s*/, "").slice(0, 500) ||
+                          "Failed to create the appointment. Please check the console for details.",
                         variant: "destructive",
                       });
                     }
@@ -4543,8 +4800,12 @@ Medical License: [License Number]
                 </div>
                 <div className="flex justify-between items-center text-sm">
                   <span className="text-gray-600 dark:text-gray-400 font-medium">Date & Time:</span>
-                  <span className="text-gray-900 dark:text-gray-100">
-                    {createdAppointmentDetails.scheduledAt ? format(new Date(createdAppointmentDetails.scheduledAt), 'MM/dd/yyyy, h:mm a') : 'N/A'}
+                  <span className="text-gray-900 dark:text-gray-100 text-right">
+                    {createdAppointmentDetails.scheduledAt
+                      ? user?.role === "admin"
+                        ? `${format(parseScheduledAtAsLocal(createdAppointmentDetails.scheduledAt), "MM/dd/yyyy")} · ${formatAppointmentTimeRange(createdAppointmentDetails)}`
+                        : format(new Date(createdAppointmentDetails.scheduledAt), "MM/dd/yyyy, h:mm a")
+                      : "N/A"}
                   </span>
                 </div>
                 <div className="flex justify-between items-center text-sm">
@@ -4611,27 +4872,226 @@ Medical License: [License Number]
       </Dialog>
 
       {/* Duplicate Appointment Warning Dialog */}
-      <Dialog open={showDuplicateWarning} onOpenChange={setShowDuplicateWarning}>
-        <DialogContent className="max-w-md dark:border-gray-700 dark:bg-slate-800">
+      <Dialog
+        open={showDuplicateWarning}
+        onOpenChange={(open) => {
+          setShowDuplicateWarning(open);
+          if (!open) {
+            setDuplicateAppointment(null);
+            setDuplicateAppointmentDetails("");
+          }
+        }}
+      >
+        <DialogContent className="max-h-[min(90vh,90dvh)] max-w-[min(32rem,calc(100vw-2rem))] w-full overflow-y-auto overflow-x-hidden dark:border-gray-700 dark:bg-slate-800">
           <DialogHeader>
-            <DialogTitle className="text-xl font-bold text-red-600 dark:text-red-400">Duplicate Appointment</DialogTitle>
+            <DialogTitle className="text-xl font-bold text-red-600 dark:text-red-400">
+              Duplicate Appointment
+            </DialogTitle>
+            {duplicateAppointment ? (
+              <DialogDescription asChild>
+                <div className="text-left text-sm text-gray-700 dark:text-gray-300 pt-1 space-y-3 leading-relaxed">
+                  {(() => {
+                    const d = duplicateAppointment;
+                    const pid = d.patientId ?? d.patient_id;
+                    const patient = patientsData?.find(
+                      (p: any) =>
+                        String(p.id) === String(pid) ||
+                        String(p.userId) === String(pid) ||
+                        String(p.patientId) === String(pid),
+                    );
+                    const patientName = patient
+                      ? `${patient.firstName || ""} ${patient.lastName || ""}`.trim()
+                      : "This patient";
+                    const provId = d.providerId ?? d.provider_id;
+                    const providerLine = formatDuplicateProviderDisplayName(provId);
+                    const atLocal = parseScheduledAtAsLocal(d.scheduledAt);
+                    const formattedDate = format(atLocal, "PPP");
+                    const formattedTime = format(atLocal, "p");
+                    const kind = String(d.appointmentType || d.appointment_type || "").toLowerCase();
+                    const svc = getDuplicateAppointmentServiceLabel(d);
+                    const kindPhrase =
+                      kind === "treatment" ? `for treatment ${svc}` : `for consultation ${svc}`;
+                    const statusLabel = formatAppointmentStatusLabel(d.status ?? d.dup_status);
+                    return (
+                      <>
+                        <p>
+                          You have already created an appointment with{" "}
+                          <span className="font-medium">{providerLine}</span>, patient{" "}
+                          <span className="font-medium">{patientName}</span>, on{" "}
+                          <span className="font-medium">{formattedDate}</span> at{" "}
+                          <span className="font-medium">{formattedTime}</span>, status{" "}
+                          <span className="font-medium">{statusLabel}</span>, {kindPhrase}.
+                        </p>
+                        <p>
+                          Patient <span className="font-medium">{patientName}</span> already has an appointment with{" "}
+                          <span className="font-medium">{providerLine}</span> on {formattedDate} at {formattedTime},
+                          status <span className="font-medium">{statusLabel}</span>, {kindPhrase}.
+                        </p>
+                        <p className="text-gray-600 dark:text-gray-400">
+                          Please select another treatment, another date, or update the existing appointment.
+                        </p>
+                      </>
+                    );
+                  })()}
+                </div>
+              </DialogDescription>
+            ) : duplicateAppointmentDetails ? (
+              <DialogDescription asChild>
+                <div className="text-left text-sm text-gray-700 dark:text-gray-300 pt-1 space-y-3">
+                  {duplicateAppointmentDetails.split(/\n\n+/).map((block, idx) => (
+                    <p key={idx}>{block.trim()}</p>
+                  ))}
+                </div>
+              </DialogDescription>
+            ) : user?.role === "patient" ? (
+              <DialogDescription className="text-left text-sm text-gray-700 dark:text-gray-300 pt-1">
+                Appointment already exists. Please edit it instead of creating new appointment.
+              </DialogDescription>
+            ) : (
+              <DialogDescription className="text-left text-sm text-gray-700 dark:text-gray-300 pt-1">
+                This appointment matches an existing booking for the same treatment or consultation on this date.
+              </DialogDescription>
+            )}
           </DialogHeader>
-          
-          <div className="py-4">
-            <p className="text-gray-700 dark:text-gray-300">
-              {user?.role === 'patient' 
-                ? duplicateAppointmentDetails || "Appointment already exists. Please edit it instead of creating new appointment."
-                : `You have already created an appointment with the same doctor on this date. (${duplicateAppointmentDetails}) You can choose a different time or update the existing appointment.`
-              }
-            </p>
-          </div>
 
-          <div className="flex justify-end gap-2">
-            {user?.role === 'patient' && duplicateAppointment && (
+          {duplicateAppointment && (
+            <div className="rounded-md border border-amber-200 bg-amber-50/80 p-4 text-sm text-amber-950 dark:border-amber-900/50 dark:bg-amber-950/30 dark:text-amber-100">
+              <p className="mb-2 font-semibold text-amber-900 dark:text-amber-200">Existing appointment</p>
+              <ul className="list-none space-y-1.5">
+                {(() => {
+                  const c = duplicateAppointment;
+                  const patientRowPid = c.patientId ?? c.patient_id;
+                  const patientRow = patientsData?.find(
+                    (p: any) =>
+                      String(p.id) === String(patientRowPid) ||
+                      String(p.userId) === String(patientRowPid) ||
+                      String(p.patientId) === String(patientRowPid),
+                  );
+                  const patientRowName = patientRow
+                    ? `${patientRow.firstName || ""} ${patientRow.lastName || ""}`.trim()
+                    : "Unknown patient";
+                  const pid = c.providerId ?? c.provider_id;
+                  const prov = usersData?.find((u: any) => Number(u.id) === Number(pid));
+                  const provDisplay = formatDuplicateProviderDisplayName(pid);
+                  const roleLabel = c.assignedRole
+                    ? String(c.assignedRole).charAt(0).toUpperCase() + String(c.assignedRole).slice(1)
+                    : prov?.role
+                      ? String(prov.role)
+                      : null;
+                  const atLocal = parseScheduledAtAsLocal(c.scheduledAt);
+                  const dur = c.duration != null && Number(c.duration) > 0 ? Number(c.duration) : 30;
+                  const endAt = new Date(atLocal.getTime() + dur * 60 * 1000);
+                  const st = formatAppointmentStatusLabel(c.status ?? c.dup_status);
+                  const aptId = c.appointmentId ?? c.appointment_id;
+                  const aptKind = String(c.appointmentType || c.appointment_type || "").toLowerCase();
+                  const svcLabel = getDuplicateAppointmentServiceLabel(c);
+                  const typeLine =
+                    aptKind === "treatment"
+                      ? `treatment — ${svcLabel}`
+                      : aptKind === "consultation"
+                        ? `consultation — ${svcLabel}`
+                        : aptKind || "N/A";
+                  return (
+                    <>
+                      <li>
+                        <span className="font-medium text-amber-950 dark:text-amber-200">Patient: </span>
+                        {patientRowName}
+                      </li>
+                      <li>
+                        <span className="font-medium text-amber-950 dark:text-amber-200">Provider: </span>
+                        {provDisplay}
+                        {roleLabel ? ` (${roleLabel})` : ""}
+                      </li>
+                      <li>
+                        <span className="font-medium text-amber-950 dark:text-amber-200">Date: </span>
+                        {format(atLocal, "EEEE, MMM d, yyyy")}
+                      </li>
+                      <li>
+                        <span className="font-medium text-amber-950 dark:text-amber-200">Time: </span>
+                        {format(atLocal, "h:mm a")} – {format(endAt, "h:mm a")} ({dur} min)
+                      </li>
+                      <li>
+                        <span className="font-medium text-amber-950 dark:text-amber-200">Status: </span>
+                        {st}
+                      </li>
+                      {aptId ? (
+                        <li>
+                          <span className="font-medium text-amber-950 dark:text-amber-200">Appointment ID: </span>
+                          {aptId}
+                        </li>
+                      ) : null}
+                      {c.title ? (
+                        <li>
+                          <span className="font-medium text-amber-950 dark:text-amber-200">Title: </span>
+                          {c.title}
+                        </li>
+                      ) : null}
+                      <li>
+                        <span className="font-medium text-amber-950 dark:text-amber-200">Type: </span>
+                        {typeLine}
+                      </li>
+                    </>
+                  );
+                })()}
+              </ul>
+            </div>
+          )}
+
+          {(user?.role === "admin" || isDoctorLike(user?.role)) &&
+            duplicateAppointment &&
+            Number.isFinite(Number(duplicateAppointment.id)) &&
+            isServiceDuplicateBlockingStatus(
+              duplicateAppointment.status ?? duplicateAppointment.dup_status,
+            ) && (
+              <div className="mt-2 space-y-3 rounded-md border border-amber-200 bg-amber-50 p-4 dark:border-amber-900/50 dark:bg-amber-950/30">
+                <Label className="text-sm font-medium leading-snug text-amber-950 dark:text-amber-100">
+                  Please change the existing appointment&apos;s status to <strong>Completed</strong> or{" "}
+                  <strong>Cancelled</strong>. After updating, you can review and confirm the new appointment in the
+                  summary popup.
+                </Label>
+                <Select value={duplicateResolveStatus} onValueChange={setDuplicateResolveStatus}>
+                  <SelectTrigger className="bg-white dark:bg-slate-900">
+                    <SelectValue placeholder="Select status" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="scheduled">Scheduled</SelectItem>
+                    <SelectItem value="confirmed">Confirmed</SelectItem>
+                    <SelectItem value="completed">Completed</SelectItem>
+                    <SelectItem value="cancelled">Cancelled</SelectItem>
+                  </SelectContent>
+                </Select>
+                <Button
+                  type="button"
+                  className="w-full"
+                  disabled={
+                    resolveDuplicateStatusMutation.isPending ||
+                    !["completed", "cancelled"].includes(
+                      normalizeAppointmentStatusForDup(duplicateResolveStatus),
+                    )
+                  }
+                  onClick={() => {
+                    const id = Number(duplicateAppointment.id);
+                    if (!Number.isFinite(id)) return;
+                    resolveDuplicateStatusMutation.mutate({
+                      id,
+                      status: duplicateResolveStatus,
+                    });
+                  }}
+                >
+                  {resolveDuplicateStatusMutation.isPending
+                    ? "Updating..."
+                    : "Update status & open appointment summary"}
+                </Button>
+              </div>
+            )}
+
+          <div className="flex justify-end gap-2 pt-2">
+            {user?.role === "patient" && duplicateAppointment && (
               <Button
                 variant="default"
                 onClick={() => {
                   setShowDuplicateWarning(false);
+                  setDuplicateAppointmentDetails("");
                   handleEditAppointment(duplicateAppointment);
                 }}
                 data-testid="button-edit-duplicate-appointment"
@@ -4643,9 +5103,121 @@ Medical License: [License Number]
               onClick={() => {
                 setShowDuplicateWarning(false);
                 setDuplicateAppointment(null);
+                setDuplicateAppointmentDetails("");
               }}
               data-testid="button-duplicate-warning-ok"
-              variant={user?.role === 'patient' ? "outline" : "default"}
+              variant={user?.role === "patient" ? "outline" : "default"}
+            >
+              OK
+            </Button>
+          </div>
+        </DialogContent>
+      </Dialog>
+
+      {/* Patient schedule overlap (double-booking) — same time window, any provider */}
+      <Dialog
+        open={showPatientOverlapConflict}
+        onOpenChange={(open) => {
+          setShowPatientOverlapConflict(open);
+          if (!open) setPatientOverlapConflictRecord(null);
+        }}
+      >
+        <DialogContent className="max-h-[min(90vh,90dvh)] max-w-[min(32rem,calc(100vw-2rem))] w-full overflow-y-auto overflow-x-hidden dark:border-gray-700 dark:bg-slate-800">
+          <DialogHeader>
+            <DialogTitle className="text-xl font-bold text-red-600 dark:text-red-400">
+              Scheduling conflict
+            </DialogTitle>
+            <DialogDescription asChild>
+              <p className="text-left text-sm text-gray-700 dark:text-gray-300 pt-1 leading-relaxed">
+                {buildPatientOverlapDialogDescription(
+                  patientOverlapSelectedProviderDisplayName,
+                  {
+                    selectedProviderId: patientOverlapSelectedProviderIdForMessage || undefined,
+                    conflictProviderId:
+                      patientOverlapConflictRecord?.providerId ??
+                      patientOverlapConflictRecord?.provider_id,
+                  },
+                )}
+              </p>
+            </DialogDescription>
+          </DialogHeader>
+          {patientOverlapConflictRecord && (
+            <div className="rounded-md border border-amber-200 bg-amber-50/80 p-4 text-sm text-amber-950 dark:border-amber-900/50 dark:bg-amber-950/30 dark:text-amber-100">
+              <p className="mb-2 font-semibold text-amber-900 dark:text-amber-200">Conflicting appointment</p>
+              <ul className="space-y-1.5 list-none">
+                {(() => {
+                  const c = patientOverlapConflictRecord;
+                  const pid = c.providerId ?? c.provider_id;
+                  const prov = usersData?.find((u: any) => Number(u.id) === Number(pid));
+                  const provName = prov
+                    ? `${prov.firstName || ""} ${prov.lastName || ""}`.trim() || "Unknown"
+                    : "Unknown provider";
+                  const roleLabel = c.assignedRole
+                    ? String(c.assignedRole).charAt(0).toUpperCase() + String(c.assignedRole).slice(1)
+                    : prov?.role
+                      ? String(prov.role)
+                      : null;
+                  const atLocal = parseScheduledAtAsLocal(c.scheduledAt);
+                  const dur = c.duration != null && Number(c.duration) > 0 ? Number(c.duration) : 30;
+                  const endAt = new Date(atLocal.getTime() + dur * 60 * 1000);
+                  const st = formatAppointmentStatusLabel(c.status);
+                  const aptId = c.appointmentId ?? c.appointment_id;
+                  const svcLabel = getDuplicateAppointmentServiceLabel(c);
+                  const aptKind = String(c.appointmentType || c.appointment_type || "").toLowerCase();
+                  const typeLine =
+                    aptKind === "treatment"
+                      ? `treatment — ${svcLabel}`
+                      : aptKind === "consultation"
+                        ? `consultation — ${svcLabel}`
+                        : String(c.appointmentType || c.appointment_type || "N/A");
+                  return (
+                    <>
+                      <li>
+                        <span className="font-medium text-amber-950 dark:text-amber-200">Provider: </span>
+                        {provName}
+                        {roleLabel ? ` (${roleLabel})` : ""}
+                      </li>
+                      <li>
+                        <span className="font-medium text-amber-950 dark:text-amber-200">Date: </span>
+                        {format(atLocal, "EEEE, MMM d, yyyy")}
+                      </li>
+                      <li>
+                        <span className="font-medium text-amber-950 dark:text-amber-200">Time: </span>
+                        {format(atLocal, "h:mm a")} – {format(endAt, "h:mm a")} ({dur} min)
+                      </li>
+                      <li>
+                        <span className="font-medium text-amber-950 dark:text-amber-200">Status: </span>
+                        {st}
+                      </li>
+                      {aptId ? (
+                        <li>
+                          <span className="font-medium text-amber-950 dark:text-amber-200">Appointment ID: </span>
+                          {aptId}
+                        </li>
+                      ) : null}
+                      {c.title ? (
+                        <li>
+                          <span className="font-medium text-amber-950 dark:text-amber-200">Title: </span>
+                          {c.title}
+                        </li>
+                      ) : null}
+                      <li>
+                        <span className="font-medium text-amber-950 dark:text-amber-200">Type: </span>
+                        {typeLine}
+                      </li>
+                    </>
+                  );
+                })()}
+              </ul>
+            </div>
+          )}
+          <div className="flex justify-end pt-2">
+            <Button
+              onClick={() => {
+                setShowPatientOverlapConflict(false);
+                setPatientOverlapConflictRecord(null);
+              }}
+              data-testid="button-patient-overlap-conflict-ok"
             >
               OK
             </Button>
@@ -5122,7 +5694,7 @@ Medical License: [License Number]
                     Cancel
                   </Button>
                   <Button
-                    onClick={() => {
+                    onClick={async () => {
                       if (!editAppointmentType) {
                         setEditAppointmentTypeError("Select an appointment type.");
                         return;
@@ -5145,6 +5717,8 @@ Medical License: [License Number]
                         });
                         return;
                       }
+
+                      await refetch();
                       
                       // *** CHANGE 3: Check for appointment conflicts before saving ***
                       const isSlotAvailable = isTimeSlotAvailable(editAppointmentDate, editSelectedTimeSlot);
@@ -5201,6 +5775,32 @@ Medical License: [License Number]
                         normalizedEditAppointmentType === "consultation"
                           ? editAppointmentSelectedConsultation?.id || null
                           : null;
+
+                      const editStartAt = parseScheduledAtAsLocal(scheduledAtString);
+                      const editDurMin =
+                        editingAppointment.duration != null && Number(editingAppointment.duration) > 0
+                          ? Number(editingAppointment.duration)
+                          : 30;
+                      const editEndAt = new Date(editStartAt.getTime() + editDurMin * 60 * 1000);
+                      const freshEdit = queryClient.getQueryData<any[]>(["/api/appointments"]);
+                      const appointmentsForEditOverlap = Array.isArray(freshEdit)
+                        ? freshEdit
+                        : Array.isArray(appointmentsData)
+                          ? appointmentsData
+                          : [];
+                      const overlapEdit = findPatientScheduleOverlap(
+                        String(editingAppointment.patientId),
+                        editStartAt,
+                        editEndAt,
+                        appointmentsForEditOverlap,
+                        parseScheduledAtAsLocal,
+                        { excludeAppointmentId: editingAppointment.id },
+                      );
+                      if (overlapEdit.conflict) {
+                        setPatientOverlapConflictRecord(overlapEdit.conflict);
+                        setShowPatientOverlapConflict(true);
+                        return;
+                      }
 
                       editAppointmentMutation.mutate({
                         id: editingAppointment.id,

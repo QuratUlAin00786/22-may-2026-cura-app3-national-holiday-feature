@@ -7315,6 +7315,126 @@ This treatment plan should be reviewed and adjusted based on individual patient 
 
       console.log("Creating appointment with final data:", appointmentToCreate);
 
+      // Duplicate service on same calendar day: same doctor + patient + date + same treatment_id OR same consultation_id
+      const organizationId = req.tenant!.id;
+      const tidForDup =
+        appointmentTypeValue === "treatment" && appointmentData.treatmentId != null && appointmentData.treatmentId !== undefined
+          ? Number(appointmentData.treatmentId)
+          : null;
+      const cidForDup =
+        appointmentTypeValue === "consultation" && appointmentData.consultationId != null && appointmentData.consultationId !== undefined
+          ? Number(appointmentData.consultationId)
+          : null;
+      const scheduledRaw = appointmentToCreate.scheduledAt;
+      const dateOnlyMatch = scheduledRaw ? String(scheduledRaw).match(/^(\d{4}-\d{2}-\d{2})/) : null;
+      const appointmentDateOnly = dateOnlyMatch
+        ? dateOnlyMatch[1]
+        : scheduledRaw
+          ? String(scheduledRaw).split("T")[0].split(" ")[0]
+          : null;
+
+      if (appointmentDateOnly && appointmentTypeValue === "treatment" && tidForDup != null && !Number.isNaN(tidForDup)) {
+        const dup = await pool.query(
+          `SELECT a.id,
+                  a.status AS dup_status,
+                  a.scheduled_at,
+                  trim(to_char(a.scheduled_at::timestamp, 'FMMonth FMDDth, YYYY')) AS dup_date_label,
+                  trim(to_char(a.scheduled_at::timestamp, 'FMHH12:MI AM')) AS dup_time_label,
+                  pat.first_name AS patient_first_name,
+                  pat.last_name AS patient_last_name,
+                  u.first_name AS doctor_first_name,
+                  u.last_name AS doctor_last_name,
+                  t.name AS service_name
+           FROM appointments a
+           INNER JOIN patients pat ON pat.id = a.patient_id
+           INNER JOIN users u ON u.id = a.provider_id
+           LEFT JOIN treatments t ON t.id = a.treatment_id AND t.organization_id = a.organization_id
+           WHERE a.organization_id = $1
+             AND a.patient_id = $2
+             AND a.provider_id = $3
+             AND LOWER(TRIM(COALESCE(a.status::text, ''))) IN ('scheduled', 'confirmed')
+             AND DATE(a.scheduled_at::timestamp) = $4::date
+             AND a.appointment_type = 'treatment'
+             AND a.treatment_id = $5
+           LIMIT 1`,
+          [organizationId, numericPatientId, appointmentData.providerId, appointmentDateOnly, tidForDup]
+        );
+        if (dup.rows.length > 0) {
+          const row = dup.rows[0] as any;
+          const patientName = `${row.patient_first_name || ""} ${row.patient_last_name || ""}`.trim() || "Patient";
+          const doctorOnlyName = `${row.doctor_first_name || ""} ${row.doctor_last_name || ""}`.trim() || "the doctor";
+          const dateLabel = String(row.dup_date_label || "").trim() || String(row.scheduled_at || "");
+          const timeLabel = String(row.dup_time_label || "").trim();
+          const treatmentName = row.service_name || "this treatment";
+          const stRaw = String(row.dup_status || "").trim();
+          const stLabel = stRaw ? stRaw.charAt(0).toUpperCase() + stRaw.slice(1).replace(/_/g, " ") : "Unknown";
+          const whenClause =
+            timeLabel && String(timeLabel).trim()
+              ? `on ${dateLabel} at ${timeLabel}`
+              : `on ${dateLabel}`;
+          const message =
+            `You have already created an appointment with Dr. ${doctorOnlyName}, patient ${patientName}, ${whenClause}, status ${stLabel}, for treatment ${treatmentName}.\n\n` +
+            `Please select another treatment or change status, another date, or update the existing appointment.`;
+          return res.status(409).json({
+            error: "Duplicate appointment",
+            code: "DUPLICATE_APPOINTMENT_SERVICE",
+            message,
+            duplicateType: "treatment",
+            existingAppointment: row,
+          });
+        }
+      } else if (appointmentDateOnly && appointmentTypeValue === "consultation" && cidForDup != null && !Number.isNaN(cidForDup)) {
+        const dup = await pool.query(
+          `SELECT a.id,
+                  a.status AS dup_status,
+                  a.scheduled_at,
+                  trim(to_char(a.scheduled_at::timestamp, 'FMMonth FMDDth, YYYY')) AS dup_date_label,
+                  trim(to_char(a.scheduled_at::timestamp, 'FMHH12:MI AM')) AS dup_time_label,
+                  pat.first_name AS patient_first_name,
+                  pat.last_name AS patient_last_name,
+                  u.first_name AS doctor_first_name,
+                  u.last_name AS doctor_last_name,
+                  df.service_name AS service_name
+           FROM appointments a
+           INNER JOIN patients pat ON pat.id = a.patient_id
+           INNER JOIN users u ON u.id = a.provider_id
+           LEFT JOIN doctors_fee df ON df.id = a.consultation_id AND df.organization_id = a.organization_id
+           WHERE a.organization_id = $1
+             AND a.patient_id = $2
+             AND a.provider_id = $3
+             AND LOWER(TRIM(COALESCE(a.status::text, ''))) IN ('scheduled', 'confirmed')
+             AND DATE(a.scheduled_at::timestamp) = $4::date
+             AND a.appointment_type = 'consultation'
+             AND a.consultation_id = $5
+           LIMIT 1`,
+          [organizationId, numericPatientId, appointmentData.providerId, appointmentDateOnly, cidForDup]
+        );
+        if (dup.rows.length > 0) {
+          const row = dup.rows[0] as any;
+          const patientName = `${row.patient_first_name || ""} ${row.patient_last_name || ""}`.trim() || "Patient";
+          const doctorOnlyName = `${row.doctor_first_name || ""} ${row.doctor_last_name || ""}`.trim() || "the doctor";
+          const dateLabel = String(row.dup_date_label || "").trim() || String(row.scheduled_at || "");
+          const timeLabel = String(row.dup_time_label || "").trim();
+          const consultationName = row.service_name || "this consultation";
+          const stRaw = String(row.dup_status || "").trim();
+          const stLabel = stRaw ? stRaw.charAt(0).toUpperCase() + stRaw.slice(1).replace(/_/g, " ") : "Unknown";
+          const whenClauseCons =
+            timeLabel && String(timeLabel).trim()
+              ? `on ${dateLabel} at ${timeLabel}`
+              : `on ${dateLabel}`;
+          const message =
+            `You have already created an appointment with Dr. ${doctorOnlyName}, patient ${patientName}, ${whenClauseCons}, status ${stLabel}, for consultation ${consultationName}.\n\n` +
+            `Please select another consultation or change status, another date, or update the existing appointment.`;
+          return res.status(409).json({
+            error: "Duplicate appointment",
+            code: "DUPLICATE_APPOINTMENT_SERVICE",
+            message,
+            duplicateType: "consultation",
+            existingAppointment: row,
+          });
+        }
+      }
+
       const appointment = await storage.createAppointment(appointmentToCreate);
 
       // Get patient and provider details for notifications
@@ -17301,33 +17421,99 @@ This treatment plan should be reviewed and adjusted based on individual patient 
         return res.status(500).json({ error: "Failed to create or find patient" });
       }
 
-      // Prevent duplicate appointments for the same patient with the same doctor on the same day (status not cancelled)
-      const duplicateSameDay = await pool.query(
-        `SELECT appointment_id,
-                provider_id,
-                scheduled_at,
-                to_char(scheduled_at::timestamp, 'YYYY-MM-DD') as scheduled_date,
-                to_char(scheduled_at::timestamp, 'HH24:MI') as scheduled_time,
-                duration,
-                appointment_type,
-                consultation_id,
-                treatment_id,
-                description
-         FROM appointments
-         WHERE organization_id = $1
-           AND patient_id = $2
-           AND provider_id = $3
-           AND status <> 'cancelled'
-           AND DATE(scheduled_at::timestamp) = $4::date
-         ORDER BY scheduled_at DESC
-         LIMIT 1`,
-        [organizationId, patientId, Number(doctorId), date]
-      );
-      if (duplicateSameDay.rows.length > 0) {
+      // Same doctor + patient + date + same treatment_id OR same consultation_id blocks booking;
+      // otherwise allow multiple appointments per day when the service differs (aligned with staff calendar).
+      const atypePub = String(appointmentType || "consultation").toLowerCase();
+      const tIdPub = treatmentId != null && treatmentId !== "" ? Number(treatmentId) : NaN;
+      const cIdPub = consultationId != null && consultationId !== "" ? Number(consultationId) : NaN;
+      let duplicatePubRow: any = null;
+
+      if (atypePub === "treatment" && Number.isFinite(tIdPub)) {
+        const rPub = await pool.query(
+          `SELECT appointment_id,
+                  provider_id,
+                  scheduled_at,
+                  to_char(scheduled_at::timestamp, 'YYYY-MM-DD') as scheduled_date,
+                  to_char(scheduled_at::timestamp, 'HH24:MI') as scheduled_time,
+                  duration,
+                  appointment_type,
+                  consultation_id,
+                  treatment_id,
+                  description
+           FROM appointments
+           WHERE organization_id = $1
+             AND patient_id = $2
+             AND provider_id = $3
+             AND LOWER(TRIM(COALESCE(status::text, ''))) IN ('scheduled', 'confirmed')
+             AND DATE(scheduled_at::timestamp) = $4::date
+             AND appointment_type = 'treatment'
+             AND treatment_id = $5
+           ORDER BY scheduled_at DESC
+           LIMIT 1`,
+          [organizationId, patientId, Number(doctorId), date, tIdPub]
+        );
+        if (rPub.rows.length > 0) duplicatePubRow = rPub.rows[0];
+      } else if (atypePub === "consultation" && Number.isFinite(cIdPub)) {
+        const rPub = await pool.query(
+          `SELECT appointment_id,
+                  provider_id,
+                  scheduled_at,
+                  to_char(scheduled_at::timestamp, 'YYYY-MM-DD') as scheduled_date,
+                  to_char(scheduled_at::timestamp, 'HH24:MI') as scheduled_time,
+                  duration,
+                  appointment_type,
+                  consultation_id,
+                  treatment_id,
+                  description
+           FROM appointments
+           WHERE organization_id = $1
+             AND patient_id = $2
+             AND provider_id = $3
+             AND LOWER(TRIM(COALESCE(status::text, ''))) IN ('scheduled', 'confirmed')
+             AND DATE(scheduled_at::timestamp) = $4::date
+             AND appointment_type = 'consultation'
+             AND consultation_id = $5
+           ORDER BY scheduled_at DESC
+           LIMIT 1`,
+          [organizationId, patientId, Number(doctorId), date, cIdPub]
+        );
+        if (rPub.rows.length > 0) duplicatePubRow = rPub.rows[0];
+      } else {
+        const duplicateSameDay = await pool.query(
+          `SELECT appointment_id,
+                  provider_id,
+                  scheduled_at,
+                  to_char(scheduled_at::timestamp, 'YYYY-MM-DD') as scheduled_date,
+                  to_char(scheduled_at::timestamp, 'HH24:MI') as scheduled_time,
+                  duration,
+                  appointment_type,
+                  consultation_id,
+                  treatment_id,
+                  description
+           FROM appointments
+           WHERE organization_id = $1
+             AND patient_id = $2
+             AND provider_id = $3
+             AND LOWER(TRIM(COALESCE(status::text, ''))) IN ('scheduled', 'confirmed')
+             AND DATE(scheduled_at::timestamp) = $4::date
+           ORDER BY scheduled_at DESC
+           LIMIT 1`,
+          [organizationId, patientId, Number(doctorId), date]
+        );
+        if (duplicateSameDay.rows.length > 0) duplicatePubRow = duplicateSameDay.rows[0];
+      }
+
+      if (duplicatePubRow) {
+        const dupCode =
+          atypePub === "treatment" && Number.isFinite(tIdPub)
+            ? "DUPLICATE_APPOINTMENT_SERVICE"
+            : atypePub === "consultation" && Number.isFinite(cIdPub)
+              ? "DUPLICATE_APPOINTMENT_SERVICE"
+              : "DUPLICATE_PATIENT_SAME_DAY";
         return res.status(409).json({
           error: "Patient already has an appointment on this day.",
-          code: "DUPLICATE_PATIENT_SAME_DAY",
-          existingAppointment: duplicateSameDay.rows[0],
+          code: dupCode,
+          existingAppointment: duplicatePubRow,
           patient: { id: patientId, name, email: email || null, phone: phone || null },
         });
       }
@@ -17624,7 +17810,7 @@ This treatment plan should be reviewed and adjusted based on individual patient 
   app.post("/api/public/:subdomain/appointments/check-duplicate", async (req: TenantRequest, res) => {
     try {
       const sub = String(req.params.subdomain || "").trim();
-      const { name, phone, email, doctorId, date } = req.body || {};
+      const { name, phone, email, doctorId, date, appointmentType, treatmentId, consultationId } = req.body || {};
       if (!sub) return res.status(400).json({ error: "Missing subdomain" });
       if (!doctorId || !date || (!email && !phone && !name)) {
         return res.status(400).json({ error: "Missing required fields" });
@@ -17650,32 +17836,93 @@ This treatment plan should be reviewed and adjusted based on individual patient 
       }
       if (!patientId) return res.json({ duplicate: false });
 
-      // Check duplicate for same day and same doctor
-      const dup = await pool.query(
-        `SELECT appointment_id,
-                provider_id,
-                scheduled_at,
-                to_char(scheduled_at::timestamp, 'YYYY-MM-DD') as scheduled_date,
-                to_char(scheduled_at::timestamp, 'HH24:MI') as scheduled_time,
-                duration,
-                appointment_type,
-                consultation_id,
-                treatment_id,
-                description
-         FROM appointments
-         WHERE organization_id = $1
-           AND patient_id = $2
-           AND provider_id = $3
-           AND status <> 'cancelled'
-           AND DATE(scheduled_at::timestamp) = $4::date
-         ORDER BY scheduled_at DESC
-         LIMIT 1`,
-        [organizationId, patientId, Number(doctorId), date]
-      );
+      const atypeChk = String(appointmentType || "consultation").toLowerCase();
+      const tIdChk = treatmentId != null && treatmentId !== "" ? Number(treatmentId) : NaN;
+      const cIdChk = consultationId != null && consultationId !== "" ? Number(consultationId) : NaN;
+
+      let dup: { rows: any[] };
+      if (atypeChk === "treatment" && Number.isFinite(tIdChk)) {
+        dup = await pool.query(
+          `SELECT appointment_id,
+                  provider_id,
+                  scheduled_at,
+                  to_char(scheduled_at::timestamp, 'YYYY-MM-DD') as scheduled_date,
+                  to_char(scheduled_at::timestamp, 'HH24:MI') as scheduled_time,
+                  duration,
+                  appointment_type,
+                  consultation_id,
+                  treatment_id,
+                  description
+           FROM appointments
+           WHERE organization_id = $1
+             AND patient_id = $2
+             AND provider_id = $3
+             AND LOWER(TRIM(COALESCE(status::text, ''))) IN ('scheduled', 'confirmed')
+             AND DATE(scheduled_at::timestamp) = $4::date
+             AND appointment_type = 'treatment'
+             AND treatment_id = $5
+           ORDER BY scheduled_at DESC
+           LIMIT 1`,
+          [organizationId, patientId, Number(doctorId), date, tIdChk]
+        );
+      } else if (atypeChk === "consultation" && Number.isFinite(cIdChk)) {
+        dup = await pool.query(
+          `SELECT appointment_id,
+                  provider_id,
+                  scheduled_at,
+                  to_char(scheduled_at::timestamp, 'YYYY-MM-DD') as scheduled_date,
+                  to_char(scheduled_at::timestamp, 'HH24:MI') as scheduled_time,
+                  duration,
+                  appointment_type,
+                  consultation_id,
+                  treatment_id,
+                  description
+           FROM appointments
+           WHERE organization_id = $1
+             AND patient_id = $2
+             AND provider_id = $3
+             AND LOWER(TRIM(COALESCE(status::text, ''))) IN ('scheduled', 'confirmed')
+             AND DATE(scheduled_at::timestamp) = $4::date
+             AND appointment_type = 'consultation'
+             AND consultation_id = $5
+           ORDER BY scheduled_at DESC
+           LIMIT 1`,
+          [organizationId, patientId, Number(doctorId), date, cIdChk]
+        );
+      } else {
+        dup = await pool.query(
+          `SELECT appointment_id,
+                  provider_id,
+                  scheduled_at,
+                  to_char(scheduled_at::timestamp, 'YYYY-MM-DD') as scheduled_date,
+                  to_char(scheduled_at::timestamp, 'HH24:MI') as scheduled_time,
+                  duration,
+                  appointment_type,
+                  consultation_id,
+                  treatment_id,
+                  description
+           FROM appointments
+           WHERE organization_id = $1
+             AND patient_id = $2
+             AND provider_id = $3
+             AND LOWER(TRIM(COALESCE(status::text, ''))) IN ('scheduled', 'confirmed')
+             AND DATE(scheduled_at::timestamp) = $4::date
+           ORDER BY scheduled_at DESC
+           LIMIT 1`,
+          [organizationId, patientId, Number(doctorId), date]
+        );
+      }
+
       if (dup.rows.length > 0) {
+        const dupCode =
+          atypeChk === "treatment" && Number.isFinite(tIdChk)
+            ? "DUPLICATE_APPOINTMENT_SERVICE"
+            : atypeChk === "consultation" && Number.isFinite(cIdChk)
+              ? "DUPLICATE_APPOINTMENT_SERVICE"
+              : "DUPLICATE_PATIENT_SAME_DAY";
         return res.json({
           duplicate: true,
-          code: "DUPLICATE_PATIENT_SAME_DAY",
+          code: dupCode,
           existingAppointment: dup.rows[0],
         });
       }

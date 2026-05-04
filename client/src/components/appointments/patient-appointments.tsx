@@ -2994,7 +2994,7 @@ export default function PatientAppointments({
 
       {/* Cancel Appointment Confirmation Dialog */}
       <Dialog open={!!cancellingAppointmentId} onOpenChange={closeCancelModal}>
-        <DialogContent>
+        <DialogContent className="max-h-[min(90vh,90dvh)] max-w-[min(28rem,calc(100vw-2rem))] w-full overflow-y-auto overflow-x-hidden">
           <DialogHeader>
             <DialogTitle>Cancel Appointment</DialogTitle>
             <DialogDescription>
@@ -3050,7 +3050,7 @@ export default function PatientAppointments({
 
       {/* Success Modal */}
       <Dialog open={showSuccessModal} onOpenChange={setShowSuccessModal}>
-        <DialogContent className="max-w-md">
+        <DialogContent className="max-h-[min(90vh,90dvh)] max-w-[min(28rem,calc(100vw-2rem))] w-full overflow-y-auto overflow-x-hidden">
           <div className="flex flex-col items-center text-center py-6 space-y-4">
             {/* Green Check Circle Icon */}
             <div className="w-16 h-16 bg-green-100 dark:bg-green-900/30 rounded-full flex items-center justify-center">
@@ -3087,7 +3087,7 @@ export default function PatientAppointments({
 
       {/* Insufficient Time Available Modal */}
       <Dialog open={showInsufficientTimeModal} onOpenChange={setShowInsufficientTimeModal}>
-        <DialogContent className="max-w-md">
+        <DialogContent className="max-h-[min(90vh,90dvh)] max-w-[min(28rem,calc(100vw-2rem))] w-full overflow-y-auto overflow-x-hidden">
           <div className="flex flex-col items-center text-center py-6 space-y-4">
             {/* Red Warning Icon */}
             <div className="w-16 h-16 bg-red-100 dark:bg-red-900/30 rounded-full flex items-center justify-center">

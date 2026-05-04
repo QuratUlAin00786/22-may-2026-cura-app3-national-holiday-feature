@@ -17,6 +17,19 @@ const statusColors = {
   no_show: "#9B9EAF"
 };
 
+function staffAppointmentStatusBadgeStyle(status: string | undefined): React.CSSProperties {
+  const norm = String(status || "scheduled")
+    .toLowerCase()
+    .trim()
+    .replace(/\s+/g, "_");
+  const bg =
+    statusColors[norm as keyof typeof statusColors] ?? statusColors.scheduled;
+  return {
+    backgroundColor: bg,
+    color: norm === "completed" ? "#000000" : "#ffffff",
+  };
+}
+
 const priorityColors = {
   high: "#EF4444",
   medium: "#F59E0B", 
@@ -278,8 +291,8 @@ export default function NurseAppointments({ onNewAppointment }: { onNewAppointme
                             {priority.toUpperCase()}
                           </Badge>
                           <Badge 
-                            style={{ backgroundColor: statusColors[appointment.status as keyof typeof statusColors] }}
-                            className="text-white text-xs"
+                            className="text-xs"
+                            style={staffAppointmentStatusBadgeStyle(appointment.status)}
                           >
                             {appointment.status.toUpperCase()}
                           </Badge>
