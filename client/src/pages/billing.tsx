@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from "react";
+import React, { useState, useEffect, useCallback, useMemo } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { apiRequest, buildUrl } from "@/lib/queryClient";
 import { format } from "date-fns";
@@ -331,6 +331,23 @@ function PricingManagementDashboard(props?: { scopeToCurrentUser?: { displayName
   const [defaultTestsAdded, setDefaultTestsAdded] = useState(false);
   const [isAddingDefaultTests, setIsAddingDefaultTests] = useState(false);
   const [isAddingDefaultImaging, setIsAddingDefaultImaging] = useState(false);
+  const [isAddingDefaultTreatmentsInfo, setIsAddingDefaultTreatmentsInfo] = useState(false);
+  const [showDefaultTreatmentsInfoProgressModal, setShowDefaultTreatmentsInfoProgressModal] = useState(false);
+  const [defaultTreatmentsInfoProgress, setDefaultTreatmentsInfoProgress] = useState({
+    current: 0,
+    total: 0,
+    currentName: "",
+    phase: "idle" as "idle" | "running" | "done",
+  });
+  const [isDeletingDefaultTreatmentsInfo, setIsDeletingDefaultTreatmentsInfo] = useState(false);
+  const [showConfirmDeleteDefaultTreatmentsInfoModal, setShowConfirmDeleteDefaultTreatmentsInfoModal] = useState(false);
+  const [showDeleteDefaultTreatmentsInfoProgressModal, setShowDeleteDefaultTreatmentsInfoProgressModal] = useState(false);
+  const [deleteDefaultTreatmentsInfoProgress, setDeleteDefaultTreatmentsInfoProgress] = useState({
+    current: 0,
+    total: 0,
+    currentName: "",
+    phase: "idle" as "idle" | "running" | "done",
+  });
   const [showImagingExistsModal, setShowImagingExistsModal] = useState(false);
   const [showTestsExistsModal, setShowTestsExistsModal] = useState(false);
   const [showDeleteAllImagingDialog, setShowDeleteAllImagingDialog] = useState(false);
@@ -354,6 +371,7 @@ function PricingManagementDashboard(props?: { scopeToCurrentUser?: { displayName
   const [editingTreatmentInfo, setEditingTreatmentInfo] = useState<any>(null);
   const [newTreatmentInfo, setNewTreatmentInfo] = useState({ name: "", colorCode: "#2563eb" });
   const [isSavingTreatmentInfo, setIsSavingTreatmentInfo] = useState(false);
+  const [treatmentsInfoSearch, setTreatmentsInfoSearch] = useState("");
   const [showAddTreatmentDialog, setShowAddTreatmentDialog] = useState(false);
   const [treatmentForm, setTreatmentForm] = useState({
     name: "",
@@ -372,6 +390,13 @@ function PricingManagementDashboard(props?: { scopeToCurrentUser?: { displayName
   const [showBulkTreatmentSuccessModal, setShowBulkTreatmentSuccessModal] = useState(false);
   const [bulkTreatmentSuccessMessage, setBulkTreatmentSuccessMessage] = useState("");
   const [bulkTreatmentSuccessType, setBulkTreatmentSuccessType] = useState<"success" | "info">("success");
+  const [showBulkTreatmentProgressModal, setShowBulkTreatmentProgressModal] = useState(false);
+  const [bulkTreatmentProgress, setBulkTreatmentProgress] = useState({
+    current: 0,
+    total: 0,
+    currentName: "",
+    phase: "idle" as "idle" | "running" | "done",
+  });
 
   const closeTreatmentsInfoModal = () => {
     setShowTreatmentsInfoModal(false);
@@ -1206,6 +1231,7 @@ function PricingManagementDashboard(props?: { scopeToCurrentUser?: { displayName
     }
     setTreatmentError("");
     setIsSavingTreatment(true);
+    setShowBulkTreatmentProgressModal(true);
     try {
       const doctorIdNorm = treatmentForm.doctorId ?? null;
       const doctorNameNorm = String(treatmentForm.doctorName ?? "").trim().toLowerCase();
@@ -1225,10 +1251,26 @@ function PricingManagementDashboard(props?: { scopeToCurrentUser?: { displayName
         treatmentsToCheck.filter(isSameDoctor).map((t: any) => String(t.name ?? "").trim().toLowerCase())
       );
 
+      setBulkTreatmentProgress({
+        current: 0,
+        total: selected.length,
+        currentName: "",
+        phase: "running",
+      });
+
       let addedCount = 0;
       let skippedCount = 0;
-      for (const [infoId, { price }] of selected) {
+      for (let i = 0; i < selected.length; i++) {
+        const [infoId, { price }] = selected[i];
         const info = treatmentsInfoList.find((i: any) => String(i.id) === infoId);
+        const displayName = info?.name ? String(info.name) : `Treatment #${i + 1}`;
+        setBulkTreatmentProgress((p) => ({
+          ...p,
+          current: i + 1,
+          total: p.total || selected.length,
+          currentName: displayName,
+          phase: "running",
+        }));
         if (!info) continue;
         const nameKey = String(info.name ?? "").trim().toLowerCase();
         if (existingNamesForDoctor.has(nameKey)) {
@@ -1267,9 +1309,11 @@ function PricingManagementDashboard(props?: { scopeToCurrentUser?: { displayName
       setBulkTreatmentSuccessType(resultType);
       setBulkTreatmentSuccessMessage(msg);
       setShowBulkTreatmentSuccessModal(true);
+      setBulkTreatmentProgress((p) => ({ ...p, phase: "done" }));
     } catch (error: any) {
       setTreatmentError(error?.message || "Failed to add some treatments.");
       toast({ title: "Error", description: error?.message || "Failed to add treatments.", variant: "destructive" });
+      setBulkTreatmentProgress((p) => ({ ...p, phase: "done" }));
     } finally {
       setIsSavingTreatment(false);
     }
@@ -1315,6 +1359,326 @@ function PricingManagementDashboard(props?: { scopeToCurrentUser?: { displayName
     } finally {
       setShowDeleteTreatmentDialog(false);
       setTreatmentToDelete(null);
+    }
+  };
+
+  const DEFAULT_TREATMENTS_INFO_CATEGORIES: Array<{ heading: string; names: string[] }> = [
+    {
+      heading: "1. Facial & Skin Treatments",
+      names: [
+        "HydraFacial",
+        "Deep Cleansing Facial",
+        "Anti-Aging Facial",
+        "Brightening Facial",
+        "Acne Facial",
+        "Sensitive Skin Facial",
+        "Oxygen Facial",
+        "Chemical Peel",
+        "Carbon Laser Peel",
+        "Microdermabrasion",
+        "Dermaplaning",
+      ],
+    },
+    {
+      heading: "2. Laser Treatments",
+      names: [
+        "Laser Hair Removal",
+        "Laser Skin Rejuvenation",
+        "Laser Pigmentation Removal",
+        "Laser Acne Scar Treatment",
+        "Laser Tattoo Removal",
+        "Laser Vein Treatment",
+        "Carbon Laser Facial",
+      ],
+    },
+    {
+      heading: "3. Injectables & Anti-Aging",
+      names: [
+        "Botox",
+        "Dermal Fillers",
+        "Lip Fillers",
+        "Cheek Fillers",
+        "Jawline Contouring",
+        "Chin Filler",
+        "Under-Eye Filler",
+        "Profhilo",
+        "Skin Boosters",
+        "Mesotherapy",
+      ],
+    },
+    {
+      heading: "4. PRP & Regenerative Treatments",
+      names: [
+        "PRP Face",
+        "PRP Hair",
+        "PRP Under Eye",
+        "PRF Treatment",
+        "Exosome Therapy",
+        "Growth Factor Therapy",
+      ],
+    },
+    {
+      heading: "5. Body Contouring & Slimming",
+      names: [
+        "Fat Freezing",
+        "Body Sculpting",
+        "Radiofrequency Skin Tightening",
+        "Cavitation Treatment",
+        "Cellulite Reduction",
+        "Lymphatic Drainage",
+        "Stretch Mark Treatment",
+      ],
+    },
+    {
+      heading: "6. Hair & Scalp Treatments",
+      names: [
+        "Hair PRP",
+        "Hair Mesotherapy",
+        "Hair Growth Therapy",
+        "Scalp Detox",
+        "Dandruff Treatment",
+        "Hair Loss Consultation",
+      ],
+    },
+    {
+      heading: "7. Skin Concerns Treatment",
+      names: [
+        "Acne Treatment",
+        "Acne Scar Treatment",
+        "Pigmentation Treatment",
+        "Melasma Treatment",
+        "Open Pores Treatment",
+        "Dark Circles Treatment",
+        "Fine Lines & Wrinkles Treatment",
+        "Skin Tightening",
+        "Skin Whitening / Brightening Treatment",
+      ],
+    },
+    {
+      heading: "8. Advanced Aesthetic Procedures",
+      names: [
+        "Microneedling",
+        "RF Microneedling",
+        "HIFU",
+        "Ultherapy",
+        "Thread Lift",
+        "Mole Removal",
+        "Wart Removal",
+        "Skin Tag Removal",
+        "Scar Revision",
+        "Face Contouring",
+      ],
+    },
+    {
+      heading: "9. Beauty & Cosmetic Services",
+      names: [
+        "Eyebrow Shaping",
+        "Lash Lift",
+        "Brow Lamination",
+        "Makeup Consultation",
+        "Bridal Skin Package",
+        "Glow Treatment",
+        "Lip Brightening",
+        "Underarm Brightening",
+        "Hand & Feet Brightening",
+      ],
+    },
+    {
+      heading: "10. Consultation Services",
+      names: [
+        "Aesthetic Consultation",
+        "Dermatology Consultation",
+        "Laser Consultation",
+        "Hair Loss Consultation",
+        "Anti-Aging Consultation",
+        "Weight Loss Consultation",
+        "Skin Analysis Session",
+      ],
+    },
+  ];
+
+  const DEFAULT_TREATMENTS_INFO_NAMES: string[] = useMemo(
+    () =>
+      DEFAULT_TREATMENTS_INFO_CATEGORIES.flatMap((c) => c.names)
+        .map((n) => String(n || "").trim())
+        .filter(Boolean),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [],
+  );
+
+  const defaultTreatmentsNameSetLc = useMemo(() => {
+    return new Set(DEFAULT_TREATMENTS_INFO_NAMES.map((n) => n.toLowerCase()));
+  }, [DEFAULT_TREATMENTS_INFO_NAMES]);
+
+  const hslToHex = (h: number, s: number, l: number): string => {
+    const sNorm = s / 100;
+    const lNorm = l / 100;
+    const c = (1 - Math.abs(2 * lNorm - 1)) * sNorm;
+    const x = c * (1 - Math.abs(((h / 60) % 2) - 1));
+    const m = lNorm - c / 2;
+    let r = 0, g = 0, b = 0;
+    if (h < 60) [r, g, b] = [c, x, 0];
+    else if (h < 120) [r, g, b] = [x, c, 0];
+    else if (h < 180) [r, g, b] = [0, c, x];
+    else if (h < 240) [r, g, b] = [0, x, c];
+    else if (h < 300) [r, g, b] = [x, 0, c];
+    else [r, g, b] = [c, 0, x];
+    const toHex = (n: number) => Math.round((n + m) * 255).toString(16).padStart(2, "0");
+    return `#${toHex(r)}${toHex(g)}${toHex(b)}`.toUpperCase();
+  };
+
+  const colorForTreatmentIndex = (idx: number): string => {
+    // Golden-angle hues give visually distinct colors across many entries.
+    const hue = (idx * 137.508) % 360;
+    return hslToHex(hue, 72, 48);
+  };
+
+  const addDefaultTreatmentsInfo = async () => {
+    if (isAddingDefaultTreatmentsInfo) return;
+    setIsAddingDefaultTreatmentsInfo(true);
+    setShowDefaultTreatmentsInfoProgressModal(true);
+    try {
+      const existingNames = new Set(
+        (treatmentsInfoList || [])
+          .map((t: any) => String(t?.name ?? "").trim().toLowerCase())
+          .filter(Boolean),
+      );
+
+      const uniqueDefaults = DEFAULT_TREATMENTS_INFO_NAMES
+        .map((n) => String(n || "").trim())
+        .filter(Boolean)
+        .filter((n, i, arr) => {
+          const key = n.toLowerCase();
+          return arr.findIndex((x) => x.toLowerCase() === key) === i;
+        });
+
+      setDefaultTreatmentsInfoProgress({
+        current: 0,
+        total: uniqueDefaults.length,
+        currentName: "",
+        phase: "running",
+      });
+
+      let added = 0;
+      let skipped = 0;
+      let failed = 0;
+      let colorIndex = 0;
+
+      for (const name of uniqueDefaults) {
+        setDefaultTreatmentsInfoProgress((p) => ({
+          ...p,
+          current: Math.min(p.current + 1, p.total || uniqueDefaults.length),
+          currentName: name,
+          phase: "running",
+        }));
+
+        const key = name.toLowerCase();
+        if (existingNames.has(key)) {
+          skipped++;
+          continue;
+        }
+
+        const payload = { name, colorCode: colorForTreatmentIndex(colorIndex++) };
+        try {
+          const response = await apiRequest("POST", "/api/treatments-info", payload);
+          if (!response.ok) {
+            failed++;
+            continue;
+          }
+          added++;
+          existingNames.add(key);
+        } catch {
+          failed++;
+        }
+      }
+
+      invalidateTreatmentsInfoCache();
+
+      setDefaultTreatmentsInfoProgress((p) => ({ ...p, phase: "done" }));
+
+      if (added > 0) {
+        toast({
+          title: "Default treatments added",
+          description: `Added ${added} treatment${added === 1 ? "" : "s"}${skipped ? ` (${skipped} already existed)` : ""}${failed ? ` (${failed} failed)` : ""}.`,
+        });
+      } else if (skipped > 0 && failed === 0) {
+        toast({
+          title: "Nothing to add",
+          description: "All default treatments already exist in Treatments metadata.",
+        });
+      } else {
+        toast({
+          title: "Could not add default treatments",
+          description: "No default treatments were added.",
+          variant: "destructive",
+        });
+      }
+    } finally {
+      setIsAddingDefaultTreatmentsInfo(false);
+    }
+  };
+
+  const deleteAllDefaultTreatmentsInfo = async () => {
+    if (isDeletingDefaultTreatmentsInfo) return;
+    setIsDeletingDefaultTreatmentsInfo(true);
+    setShowDeleteDefaultTreatmentsInfoProgressModal(true);
+    try {
+      const defaultsToDelete = (treatmentsInfoList || []).filter((info: any) => {
+        const nameLc = String(info?.name ?? "").trim().toLowerCase();
+        return !!nameLc && defaultTreatmentsNameSetLc.has(nameLc);
+      });
+
+      setDeleteDefaultTreatmentsInfoProgress({
+        current: 0,
+        total: defaultsToDelete.length,
+        currentName: "",
+        phase: "running",
+      });
+
+      let deleted = 0;
+      let failed = 0;
+
+      for (let i = 0; i < defaultsToDelete.length; i++) {
+        const info = defaultsToDelete[i];
+        const name = String(info?.name ?? "");
+        setDeleteDefaultTreatmentsInfoProgress((p) => ({
+          ...p,
+          current: i + 1,
+          currentName: name,
+          phase: "running",
+        }));
+
+        try {
+          const response = await apiRequest("DELETE", `/api/treatments-info/${info.id}`, {});
+          if (response.ok) deleted++;
+          else failed++;
+        } catch {
+          failed++;
+        }
+      }
+
+      invalidateTreatmentsInfoCache();
+      setDeleteDefaultTreatmentsInfoProgress((p) => ({ ...p, phase: "done" }));
+
+      if (deleted > 0) {
+        toast({
+          title: "Default treatments deleted",
+          description: `Deleted ${deleted} treatment${deleted === 1 ? "" : "s"}${failed ? ` (${failed} failed)` : ""}.`,
+        });
+      } else if (defaultsToDelete.length === 0) {
+        toast({
+          title: "Nothing to delete",
+          description: "No default treatments were found in Treatments metadata.",
+        });
+      } else {
+        toast({
+          title: "Delete failed",
+          description: "No default treatments were deleted.",
+          variant: "destructive",
+        });
+      }
+    } finally {
+      setIsDeletingDefaultTreatmentsInfo(false);
     }
   };
 
@@ -2657,69 +3021,200 @@ function PricingManagementDashboard(props?: { scopeToCurrentUser?: { displayName
               {treatmentsInfoList.length} entries
             </span>
           </div>
-          {canCreate('billing') && (
-            <Button
-              size="sm"
-              variant="outline"
-              onClick={openTreatmentsInfoModalForCreate}
-              data-testid="button-create-treatments-info-alt"
-              disabled={isSavingTreatmentInfo}
-            >
-              Create Treatments
-            </Button>
-          )}
+          <div className="flex items-center gap-2">
+            <div className="w-[260px]">
+              <Input
+                value={treatmentsInfoSearch}
+                onChange={(e) => setTreatmentsInfoSearch(e.target.value)}
+                placeholder="Search treatments..."
+                data-testid="input-search-treatments-metadata"
+              />
+            </div>
+            {canCreate('billing') && (
+              <div className="flex gap-2">
+                <Button
+                  size="sm"
+                  variant="destructive"
+                  onClick={() => setShowConfirmDeleteDefaultTreatmentsInfoModal(true)}
+                  data-testid="button-delete-all-default-treatment"
+                  disabled={isDeletingDefaultTreatmentsInfo || loadingTreatmentsInfo}
+                >
+                  <Trash2 className="h-4 w-4 mr-2" />
+                  Delete All Default Treatments
+                </Button>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={addDefaultTreatmentsInfo}
+                  data-testid="button-add-default-treatment"
+                  disabled={isAddingDefaultTreatmentsInfo || loadingTreatmentsInfo}
+                >
+                  {isAddingDefaultTreatmentsInfo ? "Adding..." : "Add Default Treatment"}
+                </Button>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={openTreatmentsInfoModalForCreate}
+                  data-testid="button-create-treatments-info-alt"
+                  disabled={isSavingTreatmentInfo}
+                >
+                  Create Treatments
+                </Button>
+              </div>
+            )}
+          </div>
         </div>
-        <div className="overflow-x-auto">
-          <table className="w-full text-sm">
-            <thead>
-              <tr className="border-b bg-gray-50 dark:bg-gray-800">
-                <th className="text-left p-3">ID</th>
-                <th className="text-left p-3">Name</th>
-                <th className="text-left p-3">Color</th>
-                <th className="text-left p-3">Created At</th>
-              <th className="text-left p-3">Actions</th>
-              </tr>
-            </thead>
-            <tbody>
-              {treatmentsInfoList.map((info: any) => (
-                <tr key={info.id} className="border-b hover:bg-gray-50 dark:hover:bg-gray-800">
-                  <td className="p-3">{info.id}</td>
-                  <td className="p-3 font-medium">{info.name}</td>
-                  <td className="p-3">
-                    <div className="flex items-center gap-2">
-                      <span
-                        className="w-4 h-4 rounded-full border"
-                        style={{ backgroundColor: info.colorCode || "#000" }}
-                      />
-                      <span>{info.colorCode?.toUpperCase() || "—"}</span>
+        {(() => {
+          const q = String(treatmentsInfoSearch || "").trim().toLowerCase();
+          const byNameLc = new Map<string, any>();
+          (treatmentsInfoList || []).forEach((info: any) => {
+            const key = String(info?.name ?? "").trim().toLowerCase();
+            if (key) byNameLc.set(key, info);
+          });
+
+          const defaultItems = (treatmentsInfoList || []).filter((info: any) => {
+            const nameLc = String(info?.name ?? "").trim().toLowerCase();
+            return !!nameLc && defaultTreatmentsNameSetLc.has(nameLc);
+          });
+          const defaultIds = new Set(defaultItems.map((i: any) => i.id));
+          const otherItemsAll = (treatmentsInfoList || []).filter((info: any) => !defaultIds.has(info.id));
+          const otherItems = q
+            ? otherItemsAll.filter((info: any) => String(info?.name ?? "").toLowerCase().includes(q))
+            : otherItemsAll;
+
+          return (
+            <div className="space-y-6">
+              {/* Default treatments grouped by category */}
+              <div className="space-y-4">
+                {DEFAULT_TREATMENTS_INFO_CATEGORIES.map((cat) => {
+                  const entries = cat.names
+                    .map((n) => byNameLc.get(String(n).toLowerCase()))
+                    .filter(Boolean)
+                    .filter((info: any) => (q ? String(info?.name ?? "").toLowerCase().includes(q) : true));
+                  if (entries.length === 0) return null;
+
+                  return (
+                    <div key={cat.heading} className="border rounded-md overflow-hidden bg-white dark:bg-gray-900">
+                      <div className="bg-gray-100 dark:bg-gray-800 px-4 py-3 font-semibold text-sm">
+                        {cat.heading}
+                      </div>
+                      <div className="overflow-x-auto">
+                        <table className="w-full text-sm">
+                          <thead>
+                            <tr className="border-b bg-gray-50 dark:bg-gray-800">
+                              <th className="text-left p-3">Name</th>
+                              <th className="text-left p-3">Color</th>
+                              <th className="text-left p-3">Created At</th>
+                              <th className="text-left p-3">Actions</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {entries.map((info: any) => (
+                              <tr key={info.id} className="border-b last:border-b-0 hover:bg-gray-50 dark:hover:bg-gray-800">
+                                <td className="p-3 font-medium">{info.name}</td>
+                                <td className="p-3">
+                                  <div className="flex items-center gap-2">
+                                    <span
+                                      className="w-4 h-4 rounded-full border"
+                                      style={{ backgroundColor: info.colorCode || "#000" }}
+                                    />
+                                    <span>{info.colorCode?.toUpperCase() || "—"}</span>
+                                  </div>
+                                </td>
+                                <td className="p-3">{new Date(info.createdAt).toLocaleString()}</td>
+                                <td className="p-3">
+                                  <div className="flex items-center gap-2">
+                                    <Button
+                                      variant="ghost"
+                                      size="sm"
+                                      onClick={() => openTreatmentsInfoModalForEdit(info)}
+                                      data-testid={`button-edit-treatment-info-${info.id}`}
+                                    >
+                                      <Edit className="h-4 w-4" />
+                                    </Button>
+                                    <Button
+                                      variant="ghost"
+                                      size="sm"
+                                      onClick={() => handleDeleteTreatmentsInfo(info)}
+                                      data-testid={`button-delete-treatment-info-${info.id}`}
+                                    >
+                                      <Trash2 className="h-4 w-4 text-rose-600" />
+                                    </Button>
+                                  </div>
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
                     </div>
-                  </td>
-                  <td className="p-3">{new Date(info.createdAt).toLocaleString()}</td>
-                  <td className="p-3">
-                    <div className="flex items-center gap-2">
-                      <Button
-                        variant="ghost"
-                        size="sm"
-                        onClick={() => openTreatmentsInfoModalForEdit(info)}
-                        data-testid={`button-edit-treatment-info-${info.id}`}
-                      >
-                        <Edit className="h-4 w-4" />
-                      </Button>
-                      <Button
-                        variant="ghost"
-                        size="sm"
-                        onClick={() => handleDeleteTreatmentsInfo(info)}
-                        data-testid={`button-delete-treatment-info-${info.id}`}
-                      >
-                        <Trash2 className="h-4 w-4 text-rose-600" />
-                      </Button>
-                    </div>
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
+                  );
+                })}
+              </div>
+
+              {/* Other treatments (not part of defaults) */}
+              <div className="border rounded-md overflow-hidden bg-white dark:bg-gray-900">
+                <div className="bg-gray-100 dark:bg-gray-800 px-4 py-3 font-semibold text-sm">
+                  Other Treatments
+                  <span className="ml-2 text-xs font-normal text-gray-500">
+                    {otherItems.length}
+                  </span>
+                </div>
+                <div className="overflow-x-auto">
+                  <table className="w-full text-sm">
+                    <thead>
+                      <tr className="border-b bg-gray-50 dark:bg-gray-800">
+                        <th className="text-left p-3">ID</th>
+                        <th className="text-left p-3">Name</th>
+                        <th className="text-left p-3">Color</th>
+                        <th className="text-left p-3">Created At</th>
+                        <th className="text-left p-3">Actions</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {otherItems.map((info: any) => (
+                        <tr key={info.id} className="border-b last:border-b-0 hover:bg-gray-50 dark:hover:bg-gray-800">
+                          <td className="p-3">{info.id}</td>
+                          <td className="p-3 font-medium">{info.name}</td>
+                          <td className="p-3">
+                            <div className="flex items-center gap-2">
+                              <span
+                                className="w-4 h-4 rounded-full border"
+                                style={{ backgroundColor: info.colorCode || "#000" }}
+                              />
+                              <span>{info.colorCode?.toUpperCase() || "—"}</span>
+                            </div>
+                          </td>
+                          <td className="p-3">{new Date(info.createdAt).toLocaleString()}</td>
+                          <td className="p-3">
+                            <div className="flex items-center gap-2">
+                              <Button
+                                variant="ghost"
+                                size="sm"
+                                onClick={() => openTreatmentsInfoModalForEdit(info)}
+                                data-testid={`button-edit-treatment-info-${info.id}`}
+                              >
+                                <Edit className="h-4 w-4" />
+                              </Button>
+                              <Button
+                                variant="ghost"
+                                size="sm"
+                                onClick={() => handleDeleteTreatmentsInfo(info)}
+                                data-testid={`button-delete-treatment-info-${info.id}`}
+                              >
+                                <Trash2 className="h-4 w-4 text-rose-600" />
+                              </Button>
+                            </div>
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            </div>
+          );
+        })()}
       </TabsContent>
 
 
@@ -3948,6 +4443,84 @@ function PricingManagementDashboard(props?: { scopeToCurrentUser?: { displayName
         </DialogContent>
       </Dialog>
 
+      {/* Add Selected Treatments Progress Modal */}
+      <Dialog
+        open={showBulkTreatmentProgressModal}
+        onOpenChange={(open) => {
+          if (bulkTreatmentProgress.phase === "running") return;
+          setShowBulkTreatmentProgressModal(open);
+        }}
+      >
+        <DialogContent
+          className="max-w-md"
+          onInteractOutside={(e) => {
+            if (bulkTreatmentProgress.phase === "running") e.preventDefault();
+          }}
+        >
+          <DialogHeader>
+            <DialogTitle>
+              {bulkTreatmentProgress.phase === "done" ? "Treatments Added" : "Adding Treatments..."}
+            </DialogTitle>
+            <DialogDescription>
+              {bulkTreatmentProgress.phase === "done"
+                ? "Selected treatments have been processed."
+                : "Please wait while selected treatments are being added."}
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-4 py-4">
+            {bulkTreatmentProgress.phase !== "done" && (
+              <div className="flex items-center gap-3">
+                <div className="animate-spin rounded-full h-5 w-5 border-b-2 border-gray-900 dark:border-gray-100" />
+                <div className="flex-1">
+                  {bulkTreatmentProgress.currentName ? (
+                    <p className="text-sm text-gray-600 dark:text-gray-400">
+                      Adding:{" "}
+                      <span className="font-medium text-gray-900 dark:text-gray-100">
+                        {bulkTreatmentProgress.currentName}
+                      </span>
+                    </p>
+                  ) : (
+                    <p className="text-sm text-gray-600 dark:text-gray-400">Preparing list...</p>
+                  )}
+                </div>
+              </div>
+            )}
+
+            {bulkTreatmentProgress.total > 0 && (
+              <>
+                <div className="w-full bg-gray-200 rounded-full h-2 dark:bg-gray-700">
+                  <div
+                    className="bg-blue-600 h-2 rounded-full transition-all duration-300"
+                    style={{
+                      width: `${Math.min(
+                        100,
+                        (bulkTreatmentProgress.current / bulkTreatmentProgress.total) * 100,
+                      )}%`,
+                    }}
+                  />
+                </div>
+                <p className="text-xs text-gray-500 dark:text-gray-400 text-center">
+                  {Math.min(bulkTreatmentProgress.current, bulkTreatmentProgress.total)} of{" "}
+                  {bulkTreatmentProgress.total} processed
+                </p>
+              </>
+            )}
+          </div>
+
+          {bulkTreatmentProgress.phase === "done" && (
+            <DialogFooter>
+              <Button
+                variant="outline"
+                onClick={() => setShowBulkTreatmentProgressModal(false)}
+                data-testid="button-close-bulk-treatment-progress"
+              >
+                Close
+              </Button>
+            </DialogFooter>
+          )}
+        </DialogContent>
+      </Dialog>
+
       {/* Duplicate Service Names Dialog */}
       <Dialog open={showDuplicateDialog} onOpenChange={setShowDuplicateDialog}>
         <DialogContent>
@@ -4412,6 +4985,203 @@ function PricingManagementDashboard(props?: { scopeToCurrentUser?: { displayName
               </>
             )}
           </div>
+        </DialogContent>
+      </Dialog>
+
+      {/* Default Treatments Metadata Progress Dialog */}
+      <Dialog
+        open={showDefaultTreatmentsInfoProgressModal}
+        onOpenChange={(open) => {
+          // Prevent closing while running
+          if (defaultTreatmentsInfoProgress.phase === "running") return;
+          setShowDefaultTreatmentsInfoProgressModal(open);
+        }}
+      >
+        <DialogContent className="max-w-md" onInteractOutside={(e) => {
+          if (defaultTreatmentsInfoProgress.phase === "running") e.preventDefault();
+        }}>
+          <DialogHeader>
+            <DialogTitle>
+              {defaultTreatmentsInfoProgress.phase === "done"
+                ? "Default Treatments Added"
+                : "Adding Default Treatments..."}
+            </DialogTitle>
+            <DialogDescription>
+              {defaultTreatmentsInfoProgress.phase === "done"
+                ? "Default treatment names have been processed."
+                : "Please wait while default treatment names are being added."}
+            </DialogDescription>
+          </DialogHeader>
+
+          <div className="space-y-4 py-4">
+            {defaultTreatmentsInfoProgress.phase !== "done" && (
+              <div className="flex items-center gap-3">
+                <div className="animate-spin rounded-full h-5 w-5 border-b-2 border-gray-900 dark:border-gray-100"></div>
+                <div className="flex-1">
+                  {defaultTreatmentsInfoProgress.currentName ? (
+                    <p className="text-sm text-gray-600 dark:text-gray-400">
+                      Adding:{" "}
+                      <span className="font-medium text-gray-900 dark:text-gray-100">
+                        {defaultTreatmentsInfoProgress.currentName}
+                      </span>
+                    </p>
+                  ) : (
+                    <p className="text-sm text-gray-600 dark:text-gray-400">
+                      Preparing list...
+                    </p>
+                  )}
+                </div>
+              </div>
+            )}
+
+            {defaultTreatmentsInfoProgress.total > 0 && (
+              <>
+                <div className="w-full bg-gray-200 rounded-full h-2 dark:bg-gray-700">
+                  <div
+                    className="bg-blue-600 h-2 rounded-full transition-all duration-300"
+                    style={{
+                      width: `${Math.min(
+                        100,
+                        (defaultTreatmentsInfoProgress.current / defaultTreatmentsInfoProgress.total) * 100,
+                      )}%`,
+                    }}
+                  />
+                </div>
+                <p className="text-xs text-gray-500 dark:text-gray-400 text-center">
+                  {Math.min(defaultTreatmentsInfoProgress.current, defaultTreatmentsInfoProgress.total)} of{" "}
+                  {defaultTreatmentsInfoProgress.total} processed
+                </p>
+              </>
+            )}
+          </div>
+
+          {defaultTreatmentsInfoProgress.phase === "done" && (
+            <DialogFooter>
+              <Button
+                variant="outline"
+                onClick={() => setShowDefaultTreatmentsInfoProgressModal(false)}
+                data-testid="button-close-default-treatment-progress"
+              >
+                Close
+              </Button>
+            </DialogFooter>
+          )}
+        </DialogContent>
+      </Dialog>
+
+      {/* Delete Default Treatments Metadata Progress Dialog */}
+      <Dialog
+        open={showDeleteDefaultTreatmentsInfoProgressModal}
+        onOpenChange={(open) => {
+          if (deleteDefaultTreatmentsInfoProgress.phase === "running") return;
+          setShowDeleteDefaultTreatmentsInfoProgressModal(open);
+        }}
+      >
+        <DialogContent className="max-w-md" onInteractOutside={(e) => {
+          if (deleteDefaultTreatmentsInfoProgress.phase === "running") e.preventDefault();
+        }}>
+          <DialogHeader>
+            <DialogTitle>
+              {deleteDefaultTreatmentsInfoProgress.phase === "done"
+                ? "Default Treatments Deleted"
+                : "Deleting Default Treatments..."}
+            </DialogTitle>
+            <DialogDescription>
+              {deleteDefaultTreatmentsInfoProgress.phase === "done"
+                ? "Default treatment names have been processed."
+                : "Please wait while default treatment names are being deleted."}
+            </DialogDescription>
+          </DialogHeader>
+
+          <div className="space-y-4 py-4">
+            {deleteDefaultTreatmentsInfoProgress.phase !== "done" && (
+              <div className="flex items-center gap-3">
+                <div className="animate-spin rounded-full h-5 w-5 border-b-2 border-gray-900 dark:border-gray-100"></div>
+                <div className="flex-1">
+                  {deleteDefaultTreatmentsInfoProgress.currentName ? (
+                    <p className="text-sm text-gray-600 dark:text-gray-400">
+                      Deleting:{" "}
+                      <span className="font-medium text-gray-900 dark:text-gray-100">
+                        {deleteDefaultTreatmentsInfoProgress.currentName}
+                      </span>
+                    </p>
+                  ) : (
+                    <p className="text-sm text-gray-600 dark:text-gray-400">
+                      Preparing list...
+                    </p>
+                  )}
+                </div>
+              </div>
+            )}
+
+            {deleteDefaultTreatmentsInfoProgress.total > 0 && (
+              <>
+                <div className="w-full bg-gray-200 rounded-full h-2 dark:bg-gray-700">
+                  <div
+                    className="bg-blue-600 h-2 rounded-full transition-all duration-300"
+                    style={{
+                      width: `${Math.min(
+                        100,
+                        (deleteDefaultTreatmentsInfoProgress.current / deleteDefaultTreatmentsInfoProgress.total) * 100,
+                      )}%`,
+                    }}
+                  />
+                </div>
+                <p className="text-xs text-gray-500 dark:text-gray-400 text-center">
+                  {Math.min(deleteDefaultTreatmentsInfoProgress.current, deleteDefaultTreatmentsInfoProgress.total)} of{" "}
+                  {deleteDefaultTreatmentsInfoProgress.total} processed
+                </p>
+              </>
+            )}
+          </div>
+
+          {deleteDefaultTreatmentsInfoProgress.phase === "done" && (
+            <DialogFooter>
+              <Button
+                variant="outline"
+                onClick={() => setShowDeleteDefaultTreatmentsInfoProgressModal(false)}
+                data-testid="button-close-delete-default-treatment-progress"
+              >
+                Close
+              </Button>
+            </DialogFooter>
+          )}
+        </DialogContent>
+      </Dialog>
+
+      {/* Confirm Delete Default Treatments Metadata Dialog */}
+      <Dialog
+        open={showConfirmDeleteDefaultTreatmentsInfoModal}
+        onOpenChange={setShowConfirmDeleteDefaultTreatmentsInfoModal}
+      >
+        <DialogContent className="max-w-md">
+          <DialogHeader>
+            <DialogTitle>Delete Default Treatments?</DialogTitle>
+            <DialogDescription>
+              Delete ALL default treatments metadata? This will only delete entries that match the default list.
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter className="space-x-2">
+            <Button
+              variant="outline"
+              onClick={() => setShowConfirmDeleteDefaultTreatmentsInfoModal(false)}
+              disabled={isDeletingDefaultTreatmentsInfo}
+              data-testid="button-cancel-delete-all-default-treatment"
+            >
+              Cancel
+            </Button>
+            <Button
+              variant="destructive"
+              onClick={async () => {
+                setShowConfirmDeleteDefaultTreatmentsInfoModal(false);
+                await deleteAllDefaultTreatmentsInfo();
+              }}
+              disabled={isDeletingDefaultTreatmentsInfo}
+              data-testid="button-confirm-delete-all-default-treatment"
+            >
+              Yes, Delete
+            </Button>
+          </DialogFooter>
         </DialogContent>
       </Dialog>
     </Tabs>

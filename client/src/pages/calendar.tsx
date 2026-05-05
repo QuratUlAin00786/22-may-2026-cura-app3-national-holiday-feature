@@ -68,6 +68,22 @@ const formatRoleLabel = (role?: string) => {
     .join(' ');
 };
 
+/** User-facing text from apiRequest failures like `400: {"error":"..."}`. */
+function extractCalendarApiUserMessage(error: unknown): string {
+  const raw = error instanceof Error ? error.message : String(error ?? "");
+  const m = raw.match(/^\d+:\s*([\s\S]+)$/);
+  const body = m ? m[1].trim() : raw.trim();
+  if (!body) return "Something went wrong. Please try again.";
+  try {
+    const j = JSON.parse(body);
+    if (typeof j?.error === "string" && j.error.trim()) return j.error.trim();
+    if (typeof j?.message === "string" && j.message.trim()) return j.message.trim();
+  } catch {
+    /* plain text body */
+  }
+  return body.length > 800 ? `${body.slice(0, 797)}…` : body;
+}
+
 /** Parse scheduledAt without UTC shift (naive / clinic-local timestamps). */
 function parseScheduledAtAsLocalCalendar(value: string | Date): Date {
   if (value instanceof Date) {
@@ -830,6 +846,38 @@ const getAppointmentTypeLabel = (appointment: any): string => {
   const [patientOverlapConflictRecord, setPatientOverlapConflictRecord] = useState<any | null>(null);
   const [showBookingErrorModal, setShowBookingErrorModal] = useState(false);
   const [bookingErrorMessage, setBookingErrorMessage] = useState("");
+  const [bookingErrorTitle, setBookingErrorTitle] = useState("Booking Error");
+  const [bookingConflictAppointments, setBookingConflictAppointments] = useState<any[]>([]);
+  const [updatingConflictAppointmentId, setUpdatingConflictAppointmentId] = useState<number | null>(null);
+
+  const updateConflictAppointmentStatusMutation = useMutation({
+    mutationFn: async ({ id, status }: { id: number; status: string }) => {
+      const response = await apiRequest("PATCH", `/api/appointments/${id}`, { status });
+      if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(errorText || "Failed to update appointment status");
+      }
+      return response.json();
+    },
+    onMutate: ({ id }) => {
+      setUpdatingConflictAppointmentId(Number(id));
+    },
+    onSuccess: async () => {
+      // Refresh appointments so the calendar reflects updated statuses
+      await queryClient.invalidateQueries({ queryKey: ["/api/appointments"] });
+      await queryClient.refetchQueries({ queryKey: ["/api/appointments"] });
+    },
+    onError: (error: any) => {
+      toast({
+        title: "Update failed",
+        description: error?.message || "Could not update appointment status.",
+        variant: "destructive",
+      });
+    },
+    onSettled: () => {
+      setUpdatingConflictAppointmentId(null);
+    },
+  });
   
   // Invoice modal state
   const [showInvoiceModal, setShowInvoiceModal] = useState(false);
@@ -2390,28 +2438,26 @@ const getAppointmentTypeLabel = (appointment: any): string => {
         errorMessage = "Your session has expired. Please log out and log back in to continue.";
       } else if (error.message && error.message.includes("already scheduled at this time")) {
         errorTitle = "Time Slot Unavailable";
-        errorMessage = "This time slot is already booked. Please select a different time.";
+        errorMessage =
+          "This time slot can’t be confirmed because there is already another appointment that overlaps with the selected provider’s schedule. " +
+          "Please choose a different time slot, or reschedule/cancel/complete the conflicting appointment first.";
       } else if (error.message && error.message.includes("Doctor is already scheduled")) {
         errorTitle = "Doctor Unavailable";
-        errorMessage = "The selected doctor is not available at this time. Please choose a different time slot.";
+        errorMessage =
+          "This booking couldn’t be confirmed because the selected provider already has an appointment during this time window. " +
+          "Please choose a different time slot, or reschedule/cancel/complete the conflicting appointment first.";
       } else if (error.message && error.message.includes("Patient ID is required")) {
         errorTitle = "Missing Information";
         errorMessage = "Patient information is missing. Please try again or contact support if the issue persists.";
       }
       
+      setBookingErrorTitle(errorTitle);
       setBookingErrorMessage(errorMessage);
       setShowBookingErrorModal(true);
       setShowInvoiceModal(false);
       setShowInvoiceSummary(false);
       setShowConfirmationModal(false);
       setShowNewAppointmentModal(false);
-      
-      // Also show a toast for immediate feedback
-      toast({
-        title: errorTitle,
-        description: errorMessage,
-        variant: "destructive",
-      });
     },
   });
 
@@ -2511,11 +2557,30 @@ const getAppointmentTypeLabel = (appointment: any): string => {
           /* fall through */
         }
       }
-      toast({
-        title: "Booking Failed",
-        description: raw.replace(/^409:\s*/, "").slice(0, 300) || "Failed to create appointment. Please try again.",
-        variant: "destructive",
-      });
+      const userMsg = extractCalendarApiUserMessage(error);
+      // If server provided conflict appointment details, show them in the modal.
+      try {
+        const conflictMatch = raw.match(/^\d+:\s*([\s\S]+)$/);
+        const body = (conflictMatch ? conflictMatch[1] : raw).trim();
+        const j = JSON.parse(body);
+        if (j?.code === "PROVIDER_TIME_CONFLICT" && Array.isArray(j?.conflicts)) {
+          setBookingConflictAppointments(j.conflicts);
+        } else {
+          setBookingConflictAppointments([]);
+        }
+      } catch {
+        setBookingConflictAppointments([]);
+      }
+      const title =
+        /already scheduled|not available|time slot|different time|unavailable|overlap/i.test(userMsg)
+          ? "Unable to book"
+          : "Booking Error";
+      setBookingErrorTitle(title);
+      setBookingErrorMessage(
+        userMsg || raw.replace(/^409:\s*/, "").slice(0, 300) || "Failed to create appointment. Please try again.",
+      );
+      setShowBookingErrorModal(true);
+      setShowConfirmationModal(false);
     },
   });
 
@@ -5925,7 +5990,7 @@ const getAppointmentTypeLabel = (appointment: any): string => {
           <DialogContent className="max-w-lg dark:border-gray-700 dark:bg-slate-800">
             <DialogHeader>
               <DialogTitle className="text-xl font-bold text-red-600 dark:text-red-400">
-                Scheduling conflict
+                Patient has Already an appointment with another doctor
               </DialogTitle>
               <DialogDescription asChild>
                 <p className="text-left text-sm text-gray-700 dark:text-gray-300 pt-1 leading-relaxed">
@@ -6168,21 +6233,153 @@ const getAppointmentTypeLabel = (appointment: any): string => {
                     <X className="h-8 w-8 text-red-600" />
                   </div>
                   <h2 className="text-2xl font-bold text-gray-900 mb-2">
-                    Booking Error
+                    {bookingErrorTitle}
                   </h2>
-                  <p className="text-gray-600 mb-6">
+                  <p className="text-gray-600 mb-6 text-left whitespace-pre-wrap break-words">
                     {bookingErrorMessage}
                   </p>
-                  <Button
-                    onClick={() => {
-                      setShowBookingErrorModal(false);
-                    }}
-                    className="w-full"
-                    variant="destructive"
-                    data-testid="button-close-booking-error"
-                  >
-                    OK
-                  </Button>
+                  {bookingConflictAppointments.length > 0 && (
+                    <div className="w-full mb-6 text-left">
+                      <div className="text-sm font-semibold text-gray-900 mb-2">
+                        Overlapping appointment(s)
+                      </div>
+                      <p className="text-xs text-gray-600 mb-3">
+                        To continue, update each overlapping appointment to <span className="font-medium">Completed</span> or <span className="font-medium">Cancelled</span>.
+                      </p>
+                      <div className="space-y-2 max-h-56 overflow-y-auto">
+                        {bookingConflictAppointments.map((c: any) => {
+                          const start = c?.scheduledAt ? parseScheduledAtAsLocalCalendar(c.scheduledAt) : null;
+                          const dur = c?.duration != null && Number(c.duration) > 0 ? Number(c.duration) : 30;
+                          const end = start ? new Date(start.getTime() + dur * 60 * 1000) : null;
+                          const timeLabel =
+                            start && end && !Number.isNaN(start.getTime()) && !Number.isNaN(end.getTime())
+                              ? `${format(start, "h:mm a")} – ${format(end, "h:mm a")} · ${dur} min`
+                              : "Time unavailable";
+                          const status = String(c?.status ?? "scheduled").replace(/_/g, " ");
+                          const apptId = c?.appointmentId || `#${c?.id ?? "—"}`;
+                          const patientName =
+                            patients?.find((p: any) => Number(p.id) === Number(c?.patientId))?.firstName
+                              ? `${patients.find((p: any) => Number(p.id) === Number(c?.patientId))?.firstName} ${patients.find((p: any) => Number(p.id) === Number(c?.patientId))?.lastName}`.trim()
+                              : (c?.patientId ? `Patient ID: ${c.patientId}` : "Patient");
+                          const provider =
+                            users?.find((u: any) => Number(u.id) === Number(c?.providerId));
+                          const providerName = provider ? `${provider.firstName || ""} ${provider.lastName || ""}`.trim() : (c?.providerId ? `Provider ID: ${c.providerId}` : "Provider");
+                          const resolved = ["completed", "cancelled"].includes(String(c?.status || "").toLowerCase());
+
+                          return (
+                            <div key={String(c?.id ?? apptId)} className="p-3 bg-gray-50 border border-gray-200 rounded-md">
+                              <div className="flex items-start justify-between gap-3">
+                                <div>
+                                  <div className="text-sm font-medium text-gray-900">{apptId}</div>
+                                  <div className="text-xs text-gray-700">{timeLabel}</div>
+                                  <div className="text-xs text-gray-700">Patient: {patientName}</div>
+                                  <div className="text-xs text-gray-700">Provider: {providerName}</div>
+                                </div>
+                                <div className="min-w-[170px]">
+                                  <div className="text-[11px] text-gray-600 mb-1">Status</div>
+                                  <Select
+                                    value={String(c?.status || "scheduled")}
+                                    onValueChange={async (value) => {
+                                      const next = String(value || "").toLowerCase();
+                                      const idNum = Number(c?.id);
+                                      if (!idNum) return;
+                                      await updateConflictAppointmentStatusMutation.mutateAsync({ id: idNum, status: next });
+                                      // Update local list so the modal immediately reflects the new status.
+                                      setBookingConflictAppointments((prev) =>
+                                        prev.map((x: any) => (Number(x?.id) === idNum ? { ...x, status: next } : x)),
+                                      );
+                                    }}
+                                  >
+                                    <SelectTrigger className="h-8" data-testid={`select-conflict-status-${c?.id}`}>
+                                      <SelectValue placeholder="Select status" />
+                                    </SelectTrigger>
+                                    <SelectContent>
+                                      <SelectItem value="scheduled">Scheduled</SelectItem>
+                                      <SelectItem value="confirmed">Confirmed</SelectItem>
+                                      <SelectItem value="in_progress">In Progress</SelectItem>
+                                      <SelectItem value="completed">Completed</SelectItem>
+                                      <SelectItem value="cancelled">Cancelled</SelectItem>
+                                      <SelectItem value="no_show">No Show</SelectItem>
+                                    </SelectContent>
+                                  </Select>
+                                  {updatingConflictAppointmentId === Number(c?.id) && (
+                                    <div className="text-[10px] text-gray-500 mt-1">Updating status...</div>
+                                  )}
+                                  {!resolved && (
+                                    <div className="text-[10px] text-rose-600 mt-1">
+                                      Must be completed/cancelled to proceed
+                                    </div>
+                                  )}
+                                </div>
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  )}
+                  {bookingConflictAppointments.length > 0 ? (
+                    <div className="w-full space-y-2">
+                      <Button
+                        onClick={() => {
+                          const allResolved = bookingConflictAppointments.every((c: any) =>
+                            ["completed", "cancelled"].includes(String(c?.status || "").toLowerCase()),
+                          );
+                          if (!allResolved) return;
+                          setShowBookingErrorModal(false);
+                          setBookingErrorTitle("Booking Error");
+                          setBookingConflictAppointments([]);
+                          if (pendingAppointmentData) {
+                            // Retry booking now that conflicts are resolved
+                            createDoctorAppointmentMutation.mutate(pendingAppointmentData);
+                          } else if (isDoctorLike(user?.role)) {
+                            setShowNewAppointmentModal(true);
+                          }
+                        }}
+                        className="w-full bg-blue-600 hover:bg-blue-700 text-white disabled:opacity-60"
+                        disabled={
+                          updatingConflictAppointmentId != null ||
+                          !bookingConflictAppointments.every((c: any) =>
+                            ["completed", "cancelled"].includes(String(c?.status || "").toLowerCase()),
+                          )
+                        }
+                        data-testid="button-continue-booking-after-conflicts"
+                      >
+                        Continue Booking
+                      </Button>
+                      <Button
+                        onClick={() => {
+                          setShowBookingErrorModal(false);
+                          setBookingErrorTitle("Booking Error");
+                          setBookingConflictAppointments([]);
+                          if (isDoctorLike(user?.role)) {
+                            setShowNewAppointmentModal(true);
+                          }
+                        }}
+                        className="w-full"
+                        variant="destructive"
+                        data-testid="button-close-booking-error"
+                      >
+                        Cancel
+                      </Button>
+                    </div>
+                  ) : (
+                    <Button
+                      onClick={() => {
+                        setShowBookingErrorModal(false);
+                        setBookingErrorTitle("Booking Error");
+                        setBookingConflictAppointments([]);
+                        if (isDoctorLike(user?.role)) {
+                          setShowNewAppointmentModal(true);
+                        }
+                      }}
+                      className="w-full"
+                      variant="destructive"
+                      data-testid="button-close-booking-error"
+                    >
+                      OK
+                    </Button>
+                  )}
                 </div>
               </div>
             </div>

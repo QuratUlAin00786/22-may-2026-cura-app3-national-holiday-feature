@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo } from "react";
+import React, { useState, useEffect, useMemo, useCallback } from "react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -47,7 +47,7 @@ function formatAppointmentStatusLabelDoc(status: unknown): string {
 
 const statusColors = {
   scheduled: "#4A7DFF",
-  completed: "#6CFFEB", 
+  completed: "#BBF7D0", 
   cancelled: "#162B61",
   no_show: "#9B9EAF"
 };
@@ -79,6 +79,9 @@ export default function DoctorAppointments({ onNewAppointment }: { onNewAppointm
   
   // Cancel confirmation modal state
   const [appointmentToCancel, setAppointmentToCancel] = useState<number | null>(null);
+  const [editingStatusAppointmentId, setEditingStatusAppointmentId] = useState<number | null>(null);
+  const [statusDraft, setStatusDraft] = useState<string>("scheduled");
+  const [updatingStatusAppointmentId, setUpdatingStatusAppointmentId] = useState<number | null>(null);
   const [showPatientOverlapConflict, setShowPatientOverlapConflict] = useState(false);
   const [patientOverlapConflictRecord, setPatientOverlapConflictRecord] = useState<any | null>(null);
   
@@ -508,6 +511,34 @@ export default function DoctorAppointments({ onNewAppointment }: { onNewAppointm
     },
   });
 
+  const updateAppointmentStatusMutation = useMutation({
+    mutationFn: async ({ appointmentId, status }: { appointmentId: number; status: string }) => {
+      const response = await apiRequest("PATCH", `/api/appointments/${appointmentId}`, { status });
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => ({ error: "Failed to update appointment status" }));
+        throw new Error(errorData.error || errorData.message || "Failed to update appointment status");
+      }
+      return response.json();
+    },
+    onMutate: ({ appointmentId }) => {
+      setUpdatingStatusAppointmentId(Number(appointmentId));
+    },
+    onSuccess: async () => {
+      queryClient.invalidateQueries({ queryKey: ["/api/appointments"] });
+      queryClient.refetchQueries({ queryKey: ["/api/appointments"] });
+    },
+    onError: (error: any) => {
+      toast({
+        title: "Update Failed",
+        description: error?.message || "Failed to update appointment status.",
+        variant: "destructive",
+      });
+    },
+    onSettled: () => {
+      setUpdatingStatusAppointmentId(null);
+    },
+  });
+
   const handleEditAppointment = (appointment: any) => {
     setEditingAppointment(appointment);
     
@@ -915,6 +946,36 @@ export default function DoctorAppointments({ onNewAppointment }: { onNewAppointm
 
   const appointmentTimeTick = useAppointmentTimeTick();
   const nowForCardStyle = useMemo(() => new Date(), [appointmentTimeTick]);
+
+  const getNextUpcomingAppointmentId = useCallback(
+    (appointmentsList: any[]): number | null => {
+      if (!Array.isArray(appointmentsList) || appointmentsList.length === 0) return null;
+
+      const toStartEnd = (apt: any) => {
+        const start = apt?.scheduledAt ? parseScheduledAtAsLocal(apt.scheduledAt) : new Date(NaN);
+        const dur = apt?.duration != null && Number(apt.duration) > 0 ? Number(apt.duration) : 30;
+        const end = new Date(start.getTime() + dur * 60 * 1000);
+        return { start, end };
+      };
+
+      const all = appointmentsList
+        .map((apt: any) => ({ apt, ...toStartEnd(apt) }))
+        .filter(({ start }) => !Number.isNaN(start.getTime()))
+        .sort((a, b) => a.start.getTime() - b.start.getTime());
+
+      const ongoing = all.filter(({ start, end }) => start <= nowForCardStyle && end > nowForCardStyle);
+
+      if (ongoing.length > 0) {
+        const maxOngoingEnd = ongoing.reduce((acc, cur) => (cur.end > acc ? cur.end : acc), ongoing[0].end);
+        const afterOngoing = all.filter(({ start }) => start > maxOngoingEnd);
+        return afterOngoing.length > 0 ? Number(afterOngoing[0].apt.id) : null;
+      }
+
+      const upcoming = all.filter(({ start }) => start > nowForCardStyle);
+      return upcoming.length > 0 ? Number(upcoming[0].apt.id) : null;
+    },
+    [nowForCardStyle],
+  );
 
   // Parse shift time to minutes (e.g., "09:30" -> 570)
   const parseShiftTimeToMinutes = (time?: string): number => {
@@ -1378,13 +1439,14 @@ export default function DoctorAppointments({ onNewAppointment }: { onNewAppointm
                   </CardTitle>
                 </CardHeader>
                 <CardContent className="pt-0 px-2 pb-2 space-y-1">
-                  {sortAppointmentsByCardTimeKind(
-                    dayAppointments,
-                    nowForCardStyle,
-                    parseScheduledAtAsLocal,
-                  )
-                    .slice(0, 4)
-                    .map((appointment: any) => {
+                  {(() => {
+                    const sorted = sortAppointmentsByCardTimeKind(
+                      dayAppointments,
+                      nowForCardStyle,
+                      parseScheduledAtAsLocal,
+                    );
+                    const nextId = getNextUpcomingAppointmentId(sorted);
+                    return sorted.slice(0, 4).map((appointment: any) => {
                       const cardTimeKind = getAppointmentCardTimeKind(
                         appointment,
                         nowForCardStyle,
@@ -1406,6 +1468,13 @@ export default function DoctorAppointments({ onNewAppointment }: { onNewAppointm
                               Ongoing
                             </Badge>
                           )}
+                          {nextId != null && Number(appointment.id) === Number(nextId) && (
+                            <Badge
+                              className={`${appointmentOngoingBadgeClassName} ${appointmentOngoingBadgePositionClassName} text-[10px] px-1.5 py-0 h-5 leading-none bg-indigo-100 text-indigo-800 dark:bg-indigo-900/40 dark:text-indigo-200`}
+                            >
+                              Next
+                            </Badge>
+                          )}
                           <div className="font-medium truncate text-gray-900 dark:text-gray-100 pr-12">
                             {formatAppointmentTimeRange(appointment)}
                           </div>
@@ -1415,7 +1484,8 @@ export default function DoctorAppointments({ onNewAppointment }: { onNewAppointm
                           <div className="text-gray-500 dark:text-gray-400 truncate">{appointment.type}</div>
                         </div>
                       );
-                    })}
+                    });
+                  })()}
                   {dayAppointments.length > 4 && (
                     <div className="text-xs text-gray-500 dark:text-gray-400 text-center py-1">
                       +{dayAppointments.length - 4} more
@@ -1459,11 +1529,14 @@ export default function DoctorAppointments({ onNewAppointment }: { onNewAppointm
           </CardHeader>
           <CardContent>
             <div className="space-y-3">
-              {sortAppointmentsByCardTimeKind(
-                getAppointmentsForDate(selectedDate),
-                nowForCardStyle,
-                parseScheduledAtAsLocal,
-              ).map((appointment: any) => {
+              {(() => {
+                const sorted = sortAppointmentsByCardTimeKind(
+                  getAppointmentsForDate(selectedDate),
+                  nowForCardStyle,
+                  parseScheduledAtAsLocal,
+                );
+                const nextId = getNextUpcomingAppointmentId(sorted);
+                return sorted.map((appointment: any) => {
                 const patient = patientsData?.find((p: any) => p.id === appointment.patientId);
                 const serviceLabel = getAppointmentServiceLabel(appointment);
                 
@@ -1486,6 +1559,13 @@ export default function DoctorAppointments({ onNewAppointment }: { onNewAppointm
                         Ongoing
                       </Badge>
                     )}
+                    {nextId != null && Number(appointment.id) === Number(nextId) && (
+                      <Badge
+                        className={`${appointmentOngoingBadgeClassName} ${appointmentOngoingBadgePositionClassName} bg-indigo-100 text-indigo-800 dark:bg-indigo-900/40 dark:text-indigo-200`}
+                      >
+                        Next
+                      </Badge>
+                    )}
                     <CardContent className="p-4">
                       <div className="flex items-center justify-between">
                         <div className="flex items-center space-x-4">
@@ -1501,6 +1581,14 @@ export default function DoctorAppointments({ onNewAppointment }: { onNewAppointm
                           {serviceLabel && (
                             <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">Service: {serviceLabel}</p>
                           )}
+                          {(user?.role?.toLowerCase() === "nurse" || user?.role?.toLowerCase() === "doctor") &&
+                            appointment.description != null &&
+                            String(appointment.description).trim() !== "" && (
+                              <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">
+                                <span className="font-medium text-gray-600 dark:text-gray-300">Description: </span>
+                                {String(appointment.description).trim()}
+                              </p>
+                            )}
                             {patient && (
                               <>
                                 {patient.patientId && (
@@ -1540,13 +1628,16 @@ export default function DoctorAppointments({ onNewAppointment }: { onNewAppointm
                           </div>
                         </div>
                       </div>
-                      {appointment.description && (
+                      {appointment.description &&
+                        user?.role?.toLowerCase() !== "nurse" &&
+                        user?.role?.toLowerCase() !== "doctor" && (
                         <p className="text-sm text-gray-600 dark:text-gray-300 mt-2">{appointment.description}</p>
                       )}
                     </CardContent>
                   </Card>
                 );
-              })}
+              });
+              })()}
               {getAppointmentsForDate(selectedDate).length === 0 && (
                 <div className="text-center py-8 text-gray-500 dark:text-gray-400">
                   <Calendar className="h-12 w-12 mx-auto mb-4 text-gray-300 dark:text-gray-600" />
@@ -1572,11 +1663,14 @@ export default function DoctorAppointments({ onNewAppointment }: { onNewAppointm
           </CardHeader>
           <CardContent>
             <div className="space-y-3">
-              {sortAppointmentsByCardTimeKind(
-                getAppointmentsForDate(selectedDate),
-                nowForCardStyle,
-                parseScheduledAtAsLocal,
-              ).map((appointment: any) => {
+              {(() => {
+                const sorted = sortAppointmentsByCardTimeKind(
+                  getAppointmentsForDate(selectedDate),
+                  nowForCardStyle,
+                  parseScheduledAtAsLocal,
+                );
+                const nextId = getNextUpcomingAppointmentId(sorted);
+                return sorted.map((appointment: any) => {
                 const doctor = usersData?.find((u: any) => u.id === appointment.providerId);
                 // Try multiple matching strategies to find the patient
                 const patient = patientsData?.find((p: any) => 
@@ -1624,10 +1718,17 @@ export default function DoctorAppointments({ onNewAppointment }: { onNewAppointm
                         Ongoing
                       </Badge>
                     )}
+                    {nextId != null && Number(appointment.id) === Number(nextId) && (
+                      <Badge
+                        className={`${appointmentOngoingBadgeClassName} ${appointmentOngoingBadgePositionClassName} bg-indigo-100 text-indigo-800 dark:bg-indigo-900/40 dark:text-indigo-200`}
+                      >
+                        Next
+                      </Badge>
+                    )}
                     <CardContent className="p-4">
                       {/* Header with Title and Actions */}
                       <div className="flex items-start justify-between mb-4">
-                        <h3 className="text-lg font-semibold text-gray-900 dark:text-gray-100">
+                        <h3 className="text-lg font-semibold text-gray-900 dark:text-gray-100 flex flex-wrap items-baseline gap-x-2 gap-y-1">
                           {(() => {
                             // For nurse/doctor roles, ALWAYS show computed heading (ignore appointment.title)
                             // so we don't end up with just "Appointment with" when title is set but not useful.
@@ -1638,7 +1739,17 @@ export default function DoctorAppointments({ onNewAppointment }: { onNewAppointm
                                 ? `${patient.firstName} ${patient.lastName}`.trim()
                                 : getPatientName(appointment.patientId);
                               const duration = appointment.duration || 30;
-                              return `Appointment with ${loggedInUserName} - Patient ${patientName || "Patient"} (${duration} min)`;
+                              const label = (patientName || "Patient").trim() || "Patient";
+                              return (
+                                <>
+                                  <span className="font-semibold text-gray-600 dark:text-gray-400">
+                                    Patient: {label}&apos;s{" "}
+                                    <span className="text-xs font-normal">
+                                      appointment ({duration} min)
+                                    </span>
+                                  </span>
+                                </>
+                              );
                             }
 
                             // For other roles, keep existing behavior
@@ -1677,135 +1788,286 @@ export default function DoctorAppointments({ onNewAppointment }: { onNewAppointm
                               Cancel Appointment
                             </Button>
                           )}
-                          <Badge 
-                            style={staffAppointmentStatusBadgeStyle(appointment.status)}
-                          >
-                            {appointment.status.toUpperCase()}
-                          </Badge>
+                          {(user?.role?.toLowerCase() === "nurse" || user?.role?.toLowerCase() === "doctor") &&
+                          editingStatusAppointmentId === Number(appointment.id) ? (
+                            <div className="flex flex-col items-start gap-1">
+                              <div className="flex items-center gap-2">
+                                <Select
+                                  value={statusDraft || String(appointment.status || "scheduled")}
+                                  onValueChange={async (value) => {
+                                    const next = String(value || "").toLowerCase();
+                                    setStatusDraft(next);
+                                    await updateAppointmentStatusMutation.mutateAsync({
+                                      appointmentId: Number(appointment.id),
+                                      status: next,
+                                    });
+                                    setEditingStatusAppointmentId(null);
+                                  }}
+                                >
+                                  <SelectTrigger className="h-7 w-[160px]" data-testid={`select-status-week-${appointment.id}`}>
+                                    <SelectValue placeholder="Select status" />
+                                  </SelectTrigger>
+                                  <SelectContent>
+                                    <SelectItem value="scheduled">Scheduled</SelectItem>
+                                    <SelectItem value="confirmed">Confirmed</SelectItem>
+                                    <SelectItem value="in_progress">In Progress</SelectItem>
+                                    <SelectItem value="completed">Completed</SelectItem>
+                                    <SelectItem value="cancelled">Cancelled</SelectItem>
+                                    <SelectItem value="no_show">No Show</SelectItem>
+                                  </SelectContent>
+                                </Select>
+                                <Button
+                                  variant="ghost"
+                                  size="sm"
+                                  className="h-7 px-2"
+                                  onClick={() => setEditingStatusAppointmentId(null)}
+                                  data-testid={`button-cancel-status-week-${appointment.id}`}
+                                >
+                                  <X className="h-4 w-4" />
+                                </Button>
+                              </div>
+                              {updatingStatusAppointmentId === Number(appointment.id) && (
+                                <span className="text-[10px] text-gray-500 dark:text-gray-400">
+                                  Updating status...
+                                </span>
+                              )}
+                            </div>
+                          ) : (
+                            <Badge
+                              className={((user?.role?.toLowerCase() === "nurse" || user?.role?.toLowerCase() === "doctor") ? "cursor-pointer select-none inline-flex items-center" : undefined)}
+                              style={staffAppointmentStatusBadgeStyle(appointment.status)}
+                              onClick={(e) => {
+                                if (user?.role?.toLowerCase() !== "nurse" && user?.role?.toLowerCase() !== "doctor") return;
+                                e.stopPropagation();
+                                setEditingStatusAppointmentId(Number(appointment.id));
+                                setStatusDraft(String(appointment.status || "scheduled"));
+                              }}
+                              data-testid={`badge-status-week-${appointment.id}`}
+                            >
+                              {String(appointment.status || "scheduled").toUpperCase()}
+                              {(user?.role?.toLowerCase() === "nurse" || user?.role?.toLowerCase() === "doctor") && (
+                                <Edit className="h-3 w-3 ml-1 opacity-70" />
+                              )}
+                            </Badge>
+                          )}
                         </div>
                       </div>
 
                       {/* Two Column Grid Layout */}
-                      <div className="grid grid-cols-2 gap-6">
-                        {/* Left Column */}
-                        <div className="space-y-2">
-                          <div className="flex items-center gap-2 text-sm text-gray-700 dark:text-gray-300">
-                            <Calendar className="h-4 w-4 text-gray-400" />
-                            <span>{format(new Date(appointment.scheduledAt), "EEEE, MMMM d, yyyy")}</span>
-                          </div>
-                          <div className="flex items-center gap-2 text-sm text-gray-700 dark:text-gray-300">
-                            <Clock className="h-4 w-4 text-gray-400" />
-                            <span className="font-semibold">{formatAppointmentTimeRange(appointment)}</span>
-                          </div>
-                          <div className="flex items-center gap-2 text-sm text-gray-700 dark:text-gray-300">
-                            <User className="h-4 w-4 text-gray-400" />
-                            <span>{patient ? `${patient.firstName} ${patient.lastName}` : getPatientName(appointment.patientId)}</span>
-                          </div>
-                          {patient && (
-                            <>
-                              {patient.patientId && (
-                                <div className="flex items-center gap-2 text-xs text-gray-500 dark:text-gray-400">
-                                  <span>Patient ID: {patient.patientId}</span>
-                                </div>
-                              )}
-                              {patient.email && (
-                                <div className="flex items-center gap-2 text-xs text-gray-500 dark:text-gray-400">
-                                  <span>Email: {patient.email}</span>
-                                </div>
-                              )}
-                              {patient.contactNumber && (
-                                <div className="flex items-center gap-2 text-xs text-gray-500 dark:text-gray-400">
-                                  <span>Contact: {patient.contactNumber}</span>
-                                </div>
-                              )}
-                            </>
-                          )}
-                          <div className="space-y-1">
-                            <div className="flex items-center gap-2 text-sm text-gray-700 dark:text-gray-300">
-                              <FileText className="h-4 w-4 text-gray-400" />
-                              <span className="font-semibold">Appointment Type:</span>
-                              <span>{appointment.appointmentType || appointment.type || 'N/A'}</span>
+                      {(user?.role?.toLowerCase() === "nurse" || user?.role?.toLowerCase() === "doctor") ? (
+                        <div className="flex flex-col gap-1.5">
+                          <div className="grid grid-cols-2 gap-x-6 items-start">
+                            <div className="flex min-h-[1.5rem] items-start justify-start">
+                              {appointment.appointmentId ? (
+                                <Badge
+                                  variant="outline"
+                                  className="max-w-full bg-blue-50 text-left text-xs font-medium leading-snug text-blue-700 border-blue-200"
+                                >
+                                  Appointment ID: {appointment.appointmentId}
+                                </Badge>
+                              ) : null}
                             </div>
-                            {appointmentServiceInfo && (
-                              <div className="flex items-center gap-2 text-sm text-gray-700 dark:text-gray-300">
+                            <div className="flex min-h-[1.5rem] items-center gap-2 text-sm text-gray-700 dark:text-gray-300">
+                              <User className="h-4 w-4 shrink-0 text-gray-400" />
+                              <span className="font-bold">
+                                {patient ? `${patient.firstName} ${patient.lastName}` : getPatientName(appointment.patientId)}
+                              </span>
+                            </div>
+                          </div>
+                          <div className="grid grid-cols-2 gap-x-6 items-center">
+                            <div className="flex min-h-[1.5rem] flex-wrap items-center gap-x-2 gap-y-0.5 text-sm font-bold text-gray-900 dark:text-gray-100">
+                              <Stethoscope className="h-4 w-4 shrink-0 text-gray-400" />
+                              <span>Provider:</span>
+                              <span className="min-w-0 break-words">
+                                {doctor
+                                  ? (() => {
+                                      if (isDoctorLike(user?.role || "") && doctor.id === user?.id) {
+                                        const rolePrefix = user?.role?.toLowerCase() === "nurse" ? "Nurse." : "Dr.";
+                                        return `${rolePrefix} ${user?.firstName || ""} ${user?.lastName || ""}`.trim();
+                                      }
+                                      return `Dr. ${doctor.firstName} ${doctor.lastName}`;
+                                    })()
+                                  : "N/A"}
+                              </span>
+                            </div>
+                            <div className="min-h-[1.5rem] text-xs text-gray-500 dark:text-gray-400">
+                              {patient?.patientId ? <>Patient ID: {patient.patientId}</> : null}
+                            </div>
+                          </div>
+                          <div className="grid grid-cols-2 gap-x-6 items-start">
+                            <div className="flex min-h-[1.5rem] items-center gap-2 text-sm text-gray-700 dark:text-gray-300">
+                              <Calendar className="h-4 w-4 shrink-0 text-gray-400" />
+                              <span>{format(new Date(appointment.scheduledAt), "EEEE, MMMM d, yyyy")}</span>
+                            </div>
+                            <div className="min-h-[1.5rem] text-xs text-gray-500 dark:text-gray-400">
+                              {patient?.email ? <>Email: {patient.email}</> : null}
+                            </div>
+                          </div>
+                          <div className="grid grid-cols-2 gap-x-6 items-start">
+                            <div className="flex items-center gap-1.5 text-sm leading-snug text-gray-600 dark:text-gray-400">
+                              <Clock className="h-4 w-4 shrink-0 text-gray-400" />
+                              <span>{formatAppointmentTimeRange(appointment)}</span>
+                            </div>
+                            <div className="flex min-w-0 flex-col gap-1.5 text-sm leading-snug text-gray-700 dark:text-gray-300 sm:flex-row sm:flex-wrap sm:items-center sm:gap-x-2 sm:gap-y-1">
+                              <div className="flex flex-wrap items-center gap-2">
+                                <FileText className="h-4 w-4 shrink-0 text-gray-400" />
+                                <span className="font-semibold">Appointment Type:</span>
+                                <span>{appointment.appointmentType || appointment.type || "N/A"}</span>
+                              </div>
+                              {appointmentTypeBadge ? (
+                                <Badge style={{ backgroundColor: appointmentTypeBadge.color, color: "white" }}>
+                                  {appointmentTypeBadge.label}
+                                </Badge>
+                              ) : null}
+                            </div>
+                          </div>
+                          {patient?.contactNumber ? (
+                            <div className="grid grid-cols-2 gap-x-6 items-start">
+                              <div className="col-start-2 text-xs leading-snug text-gray-500 dark:text-gray-400">
+                                Contact: {patient.contactNumber}
+                              </div>
+                            </div>
+                          ) : null}
+                          {appointmentServiceInfo && (
+                            <div className="grid grid-cols-2 gap-x-6 items-center gap-y-0 py-0">
+                              <div className="col-start-2 flex min-w-0 items-center gap-2 py-0 text-sm leading-snug text-gray-700 dark:text-gray-300">
                                 <span
-                                  className="inline-flex h-2 w-2 rounded-full border border-gray-300"
+                                  className="inline-flex h-2 w-2 shrink-0 rounded-full border border-gray-300"
                                   style={{ backgroundColor: appointmentServiceInfo.color }}
                                 />
                                 <span>Service: {appointmentServiceInfo.name}</span>
                               </div>
+                            </div>
+                          )}
+                          {appointment.description != null && String(appointment.description).trim() !== "" && (
+                            <div className="flex w-full items-start gap-2 border-t border-gray-100 pt-2.5 text-sm text-gray-700 dark:border-gray-700 dark:text-gray-300">
+                              <FileText className="mt-0.5 h-4 w-4 shrink-0 text-gray-400" />
+                              <span className="min-w-0">
+                                <span className="font-semibold">Description: </span>
+                                {String(appointment.description).trim()}
+                              </span>
+                            </div>
+                          )}
+                        </div>
+                      ) : (
+                        <div className="grid grid-cols-2 gap-6">
+                          {/* Left Column */}
+                          <div className="space-y-2">
+                            <div className="flex items-center gap-2 text-sm text-gray-700 dark:text-gray-300">
+                              <Calendar className="h-4 w-4 text-gray-400" />
+                              <span>{format(new Date(appointment.scheduledAt), "EEEE, MMMM d, yyyy")}</span>
+                            </div>
+                            <div className="flex items-center gap-2 text-sm text-gray-700 dark:text-gray-300">
+                              <Clock className="h-4 w-4 text-gray-400" />
+                              <span className="font-semibold">{formatAppointmentTimeRange(appointment)}</span>
+                            </div>
+                            <div className="flex items-center gap-2 text-sm text-gray-700 dark:text-gray-300">
+                              <User className="h-4 w-4 text-gray-400" />
+                              <span>{patient ? `${patient.firstName} ${patient.lastName}` : getPatientName(appointment.patientId)}</span>
+                            </div>
+                            {patient && (
+                              <>
+                                {patient.patientId && (
+                                  <div className="flex items-center gap-2 text-xs text-gray-500 dark:text-gray-400">
+                                    <span>Patient ID: {patient.patientId}</span>
+                                  </div>
+                                )}
+                                {patient.email && (
+                                  <div className="flex items-center gap-2 text-xs text-gray-500 dark:text-gray-400">
+                                    <span>Email: {patient.email}</span>
+                                  </div>
+                                )}
+                                {patient.contactNumber && (
+                                  <div className="flex items-center gap-2 text-xs text-gray-500 dark:text-gray-400">
+                                    <span>Contact: {patient.contactNumber}</span>
+                                  </div>
+                                )}
+                              </>
+                            )}
+                            <div className="space-y-1">
+                              <div className="flex items-center gap-2 text-sm text-gray-700 dark:text-gray-300">
+                                <FileText className="h-4 w-4 text-gray-400" />
+                                <span className="font-semibold">Appointment Type:</span>
+                                <span>{appointment.appointmentType || appointment.type || "N/A"}</span>
+                              </div>
+                              {appointmentServiceInfo && (
+                                <div className="flex items-center gap-2 text-sm text-gray-700 dark:text-gray-300">
+                                  <span
+                                    className="inline-flex h-2 w-2 rounded-full border border-gray-300"
+                                    style={{ backgroundColor: appointmentServiceInfo.color }}
+                                  />
+                                  <span>Service: {appointmentServiceInfo.name}</span>
+                                </div>
+                              )}
+                            </div>
+                            {user?.role !== "nurse" && user?.role !== "doctor" && (
+                              <div className="flex items-center gap-2 text-sm text-gray-700 dark:text-gray-300">
+                                <MapPin className="h-4 w-4 text-gray-400" />
+                                <span>{appointment.location || "N/A"}</span>
+                              </div>
                             )}
                           </div>
-                          {user?.role !== 'nurse' && user?.role !== 'doctor' && (
-                            <div className="flex items-center gap-2 text-sm text-gray-700 dark:text-gray-300">
-                              <MapPin className="h-4 w-4 text-gray-400" />
-                              <span>{appointment.location || 'N/A'}</span>
-                            </div>
-                          )}
-                        </div>
 
-                        {/* Right Column */}
-                        <div className="space-y-2">
-                          <div className="flex items-center gap-2 text-sm text-gray-700 dark:text-gray-300">
-                            <Stethoscope className="h-4 w-4 text-gray-400" />
-                            <span className="font-semibold">Provider:</span>
-                            <span>{doctor ? (() => {
-                              // For nurse/doctor roles, show the logged-in user's role and name
-                              if (isDoctorLike(user?.role || '') && doctor.id === user?.id) {
-                                const rolePrefix = user?.role?.toLowerCase() === 'nurse' ? 'Nurse.' : 'Dr.';
-                                return `${rolePrefix} ${user?.firstName || ''} ${user?.lastName || ''}`.trim();
-                              }
-                              // For other cases, show doctor's name with Dr. prefix
-                              return `Dr. ${doctor.firstName} ${doctor.lastName}`;
-                            })() : 'N/A'}</span>
+                          {/* Right Column */}
+                          <div className="space-y-2">
+                            <div className="flex items-center gap-2 text-sm text-gray-700 dark:text-gray-300">
+                              <Stethoscope className="h-4 w-4 text-gray-400" />
+                              <span className="font-semibold">Provider:</span>
+                              <span>
+                                {doctor
+                                  ? (() => {
+                                      if (isDoctorLike(user?.role || "") && doctor.id === user?.id) {
+                                        const rolePrefix = user?.role?.toLowerCase() === "nurse" ? "Nurse." : "Dr.";
+                                        return `${rolePrefix} ${user?.firstName || ""} ${user?.lastName || ""}`.trim();
+                                      }
+                                      return `Dr. ${doctor.firstName} ${doctor.lastName}`;
+                                    })()
+                                  : "N/A"}
+                              </span>
+                            </div>
+                            {doctor && appointment.providerId && user?.role?.toLowerCase() !== "nurse" && user?.role?.toLowerCase() !== "doctor" && (
+                              <div className="pt-2">
+                                <Button
+                                  variant="outline"
+                                  size="sm"
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    const subdomain = getActiveSubdomain();
+                                    setLocation(`/${subdomain}/staff/${appointment.providerId}`);
+                                  }}
+                                  className="text-xs"
+                                >
+                                  View Profile
+                                </Button>
+                              </div>
+                            )}
+                            {appointmentTypeBadge && (
+                              <div className="flex items-center gap-2">
+                                <Badge style={{ backgroundColor: appointmentTypeBadge.color, color: "white" }}>
+                                  {appointmentTypeBadge.label}
+                                </Badge>
+                              </div>
+                            )}
+                            {isDoctorLike(user?.role || "") && appointment.appointmentId && (
+                              <div className="flex items-center gap-2">
+                                <Badge variant="outline" className="bg-blue-50 text-blue-700 border-blue-200 text-xs font-medium">
+                                  Appointment ID: {appointment.appointmentId}
+                                </Badge>
+                              </div>
+                            )}
                           </div>
-                          {doctor && appointment.providerId && (
-                            <div className="pt-2">
-                              <Button
-                                variant="outline"
-                                size="sm"
-                                onClick={(e) => {
-                                  e.stopPropagation();
-                                  const subdomain = getActiveSubdomain();
-                                  setLocation(`/${subdomain}/staff/${appointment.providerId}`);
-                                }}
-                                className="text-xs"
-                              >
-                                View Profile
-                              </Button>
-                            </div>
-                          )}
-                          {appointmentTypeBadge && (
-                            <div className="flex items-center gap-2">
-                              <Badge 
-                                style={{ backgroundColor: appointmentTypeBadge.color, color: "white" }}
-                              >
-                                {appointmentTypeBadge.label}
-                              </Badge>
-                            </div>
-                          )}
-                          {isDoctorLike(user?.role || '') && appointment.appointmentId && (
-                            <div className="flex items-center gap-2">
-                              <Badge 
-                                variant="outline" 
-                                className="bg-blue-50 text-blue-700 border-blue-200 text-xs font-medium"
-                              >
-                                Appointment ID: {appointment.appointmentId}
-                              </Badge>
-                            </div>
-                          )}
                         </div>
-                      </div>
+                      )}
 
                       {isDoctorLike(user?.role || "") && (patientAllergies.length > 0 || patientSpecialRequirements.length > 0) && (
                         <div className="mt-3 flex w-full flex-wrap gap-2">
                           {patientAllergies.length > 0 && (
-                            <Badge className="bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-200 whitespace-normal">
+                            <Badge className="bg-white border border-yellow-400 text-amber-800 dark:bg-transparent dark:border-yellow-500/60 dark:text-amber-200 whitespace-normal">
                               Allergies: {patientAllergies.join(", ")}
                             </Badge>
                           )}
                           {patientSpecialRequirements.length > 0 && (
-                            <Badge className="bg-indigo-100 text-indigo-800 dark:bg-indigo-900/40 dark:text-indigo-200 whitespace-normal">
+                            <Badge className="bg-white border border-gray-300 text-gray-700 dark:bg-transparent dark:border-gray-600 dark:text-gray-200 whitespace-normal">
                               Special Requirements: {patientSpecialRequirements.join(", ")}
                             </Badge>
                           )}
@@ -1825,8 +2087,10 @@ export default function DoctorAppointments({ onNewAppointment }: { onNewAppointm
                         <AppointmentInvoiceInfo appointmentId={appointment.appointmentId ?? (appointment as any).appointment_id} />
                       </div>
 
-                      {/* Description if available */}
-                      {appointment.description && (
+                      {/* Description if available (not nurse/doctor — they see it after Service above) */}
+                      {appointment.description &&
+                        user?.role?.toLowerCase() !== "nurse" &&
+                        user?.role?.toLowerCase() !== "doctor" && (
                         <div className="mt-3 pt-3 border-t">
                           <p className="text-xs font-medium text-gray-500 dark:text-gray-400 mb-1">Description:</p>
                           <p className="text-sm text-gray-600 dark:text-gray-400">
@@ -1837,7 +2101,8 @@ export default function DoctorAppointments({ onNewAppointment }: { onNewAppointm
                     </CardContent>
                   </Card>
                 );
-              })}
+              });
+              })()}
               {getAppointmentsForDate(selectedDate).length === 0 && (
                 <div className="text-center py-8 text-gray-500 dark:text-gray-400">
                   <Calendar className="h-12 w-12 mx-auto mb-4 text-gray-300 dark:text-gray-600" />
@@ -1898,7 +2163,7 @@ export default function DoctorAppointments({ onNewAppointment }: { onNewAppointm
           </CardHeader>
           <CardContent>
             <div className="flex items-start justify-between mb-4">
-              <h3 className="text-lg font-semibold text-gray-900 dark:text-gray-100">
+              <h3 className="text-lg font-semibold text-gray-900 dark:text-gray-100 flex flex-wrap items-baseline gap-x-2 gap-y-1">
                 {(() => {
                   // For nurse/doctor roles, ALWAYS show computed heading (ignore nextAppointment.title)
                   if (isDoctorLike(user?.role || "")) {
@@ -1910,7 +2175,17 @@ export default function DoctorAppointments({ onNewAppointment }: { onNewAppointm
                         ? getPatientName(nextAppointment.patientId)
                         : "";
                     const duration = nextAppointment?.duration || 30;
-                    return `Appointment with ${loggedInUserName} - Patient ${patientName || "Patient"} (${duration} min)`;
+                    const label = (patientName || "Patient").trim() || "Patient";
+                    return (
+                      <>
+                        <span className="font-semibold text-gray-600 dark:text-gray-400">
+                          Patient: {label}&apos;s{" "}
+                          <span className="text-xs font-normal">
+                            appointment ({duration} min)
+                          </span>
+                        </span>
+                      </>
+                    );
                   }
 
                   // For other roles, keep existing behavior
@@ -1920,11 +2195,68 @@ export default function DoctorAppointments({ onNewAppointment }: { onNewAppointm
                   );
                 })()}
               </h3>
-              <Badge 
-                style={staffAppointmentStatusBadgeStyle(nextAppointment.status)}
-              >
-                {nextAppointment.status.toUpperCase()}
-              </Badge>
+              {(user?.role?.toLowerCase() === "nurse" || user?.role?.toLowerCase() === "doctor") &&
+              editingStatusAppointmentId === Number(nextAppointment.id) ? (
+                <div className="flex flex-col items-start gap-1">
+                  <div className="flex items-center gap-2">
+                    <Select
+                      value={statusDraft || String(nextAppointment.status || "scheduled")}
+                      onValueChange={async (value) => {
+                        const next = String(value || "").toLowerCase();
+                        setStatusDraft(next);
+                        await updateAppointmentStatusMutation.mutateAsync({
+                          appointmentId: Number(nextAppointment.id),
+                          status: next,
+                        });
+                        setEditingStatusAppointmentId(null);
+                      }}
+                    >
+                      <SelectTrigger className="h-7 w-[160px]" data-testid={`select-status-next-${nextAppointment.id}`}>
+                        <SelectValue placeholder="Select status" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="scheduled">Scheduled</SelectItem>
+                        <SelectItem value="confirmed">Confirmed</SelectItem>
+                        <SelectItem value="in_progress">In Progress</SelectItem>
+                        <SelectItem value="completed">Completed</SelectItem>
+                        <SelectItem value="cancelled">Cancelled</SelectItem>
+                        <SelectItem value="no_show">No Show</SelectItem>
+                      </SelectContent>
+                    </Select>
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      className="h-7 px-2"
+                      onClick={() => setEditingStatusAppointmentId(null)}
+                      data-testid={`button-cancel-status-next-${nextAppointment.id}`}
+                    >
+                      <X className="h-4 w-4" />
+                    </Button>
+                  </div>
+                  {updatingStatusAppointmentId === Number(nextAppointment.id) && (
+                    <span className="text-[10px] text-gray-500 dark:text-gray-400">
+                      Updating status...
+                    </span>
+                  )}
+                </div>
+              ) : (
+                <Badge
+                  className={((user?.role?.toLowerCase() === "nurse" || user?.role?.toLowerCase() === "doctor") ? "cursor-pointer select-none inline-flex items-center" : undefined)}
+                  style={staffAppointmentStatusBadgeStyle(nextAppointment.status)}
+                  onClick={(e) => {
+                    if (user?.role?.toLowerCase() !== "nurse" && user?.role?.toLowerCase() !== "doctor") return;
+                    e.stopPropagation();
+                    setEditingStatusAppointmentId(Number(nextAppointment.id));
+                    setStatusDraft(String(nextAppointment.status || "scheduled"));
+                  }}
+                  data-testid={`badge-status-next-${nextAppointment.id}`}
+                >
+                  {String(nextAppointment.status || "scheduled").toUpperCase()}
+                  {(user?.role?.toLowerCase() === "nurse" || user?.role?.toLowerCase() === "doctor") && (
+                    <Edit className="h-3 w-3 ml-1 opacity-70" />
+                  )}
+                </Badge>
+              )}
             </div>
 
             {/* Two Column Grid Layout */}
@@ -1954,9 +2286,20 @@ export default function DoctorAppointments({ onNewAppointment }: { onNewAppointm
                         <span>Service: {nextAppointmentServiceInfo.name}</span>
                       </div>
                     )}
+                    {(user?.role?.toLowerCase() === "nurse" || user?.role?.toLowerCase() === "doctor") &&
+                      nextAppointment.description != null &&
+                      String(nextAppointment.description).trim() !== "" && (
+                      <div className="flex items-start gap-2 text-sm text-gray-700 dark:text-gray-300 mt-1">
+                        <FileText className="h-4 w-4 text-blue-600 shrink-0 mt-0.5" />
+                        <span>
+                          <span className="font-semibold">Description: </span>
+                          {String(nextAppointment.description).trim()}
+                        </span>
+                      </div>
+                    )}
                     {isDoctorLike(user?.role || "") && nextAppointmentAllergies.length > 0 && (
                       <div className="w-full mt-2">
-                        <Badge className="bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-200 whitespace-normal">
+                        <Badge className="bg-white border border-yellow-400 text-amber-800 dark:bg-transparent dark:border-yellow-500/60 dark:text-amber-200 whitespace-normal">
                           Allergies: {nextAppointmentAllergies.join(", ")}
                         </Badge>
                       </div>
@@ -2005,8 +2348,10 @@ export default function DoctorAppointments({ onNewAppointment }: { onNewAppointm
               <AppointmentInvoiceInfo appointmentId={nextAppointment.appointmentId ?? (nextAppointment as any).appointment_id} />
             </div>
 
-            {/* Description if available */}
-            {nextAppointment.description && (
+            {/* Description if available (not nurse/doctor — shown after Service above) */}
+            {nextAppointment.description &&
+              user?.role?.toLowerCase() !== "nurse" &&
+              user?.role?.toLowerCase() !== "doctor" && (
               <div className="mt-3 pt-3 border-t">
                 <p className="text-xs font-medium text-gray-500 dark:text-gray-400 mb-1">Description:</p>
                 <p className="text-sm text-gray-600 dark:text-gray-400">
@@ -2060,6 +2405,7 @@ export default function DoctorAppointments({ onNewAppointment }: { onNewAppointm
               const patientSpecialRequirements = getPatientSpecialRequirements(patient);
               
             const appointmentServiceInfo = getAppointmentServiceInfo(appointment);
+            const appointmentTypeBadge = getAppointmentTypeBadgeInfo(appointment);
             const cardTimeKind = getAppointmentCardTimeKind(
               appointment,
               nowForCardStyle,
@@ -2083,7 +2429,7 @@ export default function DoctorAppointments({ onNewAppointment }: { onNewAppointm
                   <CardContent className="p-4">
                     {/* Header with Title and Actions */}
                     <div className="flex items-start justify-between mb-4">
-                      <h3 className="text-lg font-semibold text-gray-900 dark:text-gray-100">
+                      <h3 className="text-lg font-semibold text-gray-900 dark:text-gray-100 flex flex-wrap items-baseline gap-x-2 gap-y-1">
                         {(() => {
                           // For nurse/doctor roles, ALWAYS show computed heading (ignore appointment.title)
                           if (isDoctorLike(user?.role || "")) {
@@ -2093,7 +2439,17 @@ export default function DoctorAppointments({ onNewAppointment }: { onNewAppointm
                               ? `${patient.firstName} ${patient.lastName}`.trim()
                               : getPatientName(appointment.patientId);
                             const duration = appointment.duration || 30;
-                            return `Appointment with ${loggedInUserName} - Patient ${patientName || "Patient"} (${duration} min)`;
+                            const label = (patientName || "Patient").trim() || "Patient";
+                            return (
+                              <>
+                                <span className="font-semibold text-gray-600 dark:text-gray-400">
+                                  Patient: {label}&apos;s{" "}
+                                  <span className="text-xs font-normal">
+                                    appointment ({duration} min)
+                                  </span>
+                                </span>
+                              </>
+                            );
                           }
 
                           // For other roles, keep existing behavior
@@ -2132,98 +2488,249 @@ export default function DoctorAppointments({ onNewAppointment }: { onNewAppointm
                             Cancel Appointment
                           </Button>
                         )}
-                        <Badge 
-                          style={staffAppointmentStatusBadgeStyle(appointment.status)}
-                        >
-                          {appointment.status.toUpperCase()}
-                        </Badge>
+                        {(user?.role?.toLowerCase() === "nurse" || user?.role?.toLowerCase() === "doctor") &&
+                        editingStatusAppointmentId === Number(appointment.id) ? (
+                          <div className="flex flex-col items-start gap-1">
+                            <div className="flex items-center gap-2">
+                              <Select
+                                value={statusDraft || String(appointment.status || "scheduled")}
+                                onValueChange={async (value) => {
+                                  const next = String(value || "").toLowerCase();
+                                  setStatusDraft(next);
+                                  await updateAppointmentStatusMutation.mutateAsync({
+                                    appointmentId: Number(appointment.id),
+                                    status: next,
+                                  });
+                                  setEditingStatusAppointmentId(null);
+                                }}
+                              >
+                                <SelectTrigger className="h-7 w-[160px]" data-testid={`select-status-day-${appointment.id}`}>
+                                  <SelectValue placeholder="Select status" />
+                                </SelectTrigger>
+                                <SelectContent>
+                                  <SelectItem value="scheduled">Scheduled</SelectItem>
+                                  <SelectItem value="confirmed">Confirmed</SelectItem>
+                                  <SelectItem value="in_progress">In Progress</SelectItem>
+                                  <SelectItem value="completed">Completed</SelectItem>
+                                  <SelectItem value="cancelled">Cancelled</SelectItem>
+                                  <SelectItem value="no_show">No Show</SelectItem>
+                                </SelectContent>
+                              </Select>
+                              <Button
+                                variant="ghost"
+                                size="sm"
+                                className="h-7 px-2"
+                                onClick={() => setEditingStatusAppointmentId(null)}
+                                data-testid={`button-cancel-status-day-${appointment.id}`}
+                              >
+                                <X className="h-4 w-4" />
+                              </Button>
+                            </div>
+                            {updatingStatusAppointmentId === Number(appointment.id) && (
+                              <span className="text-[10px] text-gray-500 dark:text-gray-400">
+                                Updating status...
+                              </span>
+                            )}
+                          </div>
+                        ) : (
+                          <Badge
+                            className={((user?.role?.toLowerCase() === "nurse" || user?.role?.toLowerCase() === "doctor") ? "cursor-pointer select-none inline-flex items-center" : undefined)}
+                            style={staffAppointmentStatusBadgeStyle(appointment.status)}
+                            onClick={(e) => {
+                              if (user?.role?.toLowerCase() !== "nurse" && user?.role?.toLowerCase() !== "doctor") return;
+                              e.stopPropagation();
+                              setEditingStatusAppointmentId(Number(appointment.id));
+                              setStatusDraft(String(appointment.status || "scheduled"));
+                            }}
+                            data-testid={`badge-status-day-${appointment.id}`}
+                          >
+                            {String(appointment.status || "scheduled").toUpperCase()}
+                            {(user?.role?.toLowerCase() === "nurse" || user?.role?.toLowerCase() === "doctor") && (
+                              <Edit className="h-3 w-3 ml-1 opacity-70" />
+                            )}
+                          </Badge>
+                        )}
                       </div>
                     </div>
 
                     {/* Two Column Grid Layout */}
-                    <div className="grid grid-cols-2 gap-6">
-                      {/* Left Column */}
-                      <div className="space-y-2">
-                        <div className="flex items-center gap-2 text-sm text-gray-700 dark:text-gray-300">
-                          <Calendar className="h-4 w-4 text-gray-400" />
-                          <span>{format(new Date(appointment.scheduledAt), "EEEE, MMMM d, yyyy")}</span>
-                        </div>
-                        <div className="flex items-center gap-2 text-sm text-gray-700 dark:text-gray-300">
-                          <User className="h-4 w-4 text-gray-400" />
-                          <span>{patient ? `${patient.firstName} ${patient.lastName}` : getPatientName(appointment.patientId)}</span>
-                        </div>
-                        <div className="space-y-1">
-                          <div className="flex items-center gap-2 text-sm text-gray-700 dark:text-gray-300">
-                            <FileText className="h-4 w-4 text-gray-400" />
-                            <span className="font-semibold">Appointment Type:</span>
-                            <span>{appointment.appointmentType || appointment.type || 'N/A'}</span>
+                    {(user?.role?.toLowerCase() === "nurse" || user?.role?.toLowerCase() === "doctor") ? (
+                      <div className="flex flex-col gap-1.5">
+                        <div className="grid grid-cols-2 gap-x-6 items-start">
+                          <div className="flex min-h-[1.5rem] items-start justify-start">
+                            {appointment.appointmentId ? (
+                              <Badge
+                                variant="outline"
+                                className="max-w-full bg-blue-50 text-left text-xs font-medium leading-snug text-blue-700 border-blue-200"
+                              >
+                                Appointment ID: {appointment.appointmentId}
+                              </Badge>
+                            ) : null}
                           </div>
-                          {appointmentServiceInfo && (
-                            <div className="flex items-center gap-2 text-sm text-gray-700 dark:text-gray-300">
+                          <div className="flex min-h-[1.5rem] items-center gap-2 text-sm text-gray-700 dark:text-gray-300">
+                            <User className="h-4 w-4 shrink-0 text-gray-400" />
+                            <span className="font-bold">
+                              {patient ? `${patient.firstName} ${patient.lastName}` : getPatientName(appointment.patientId)}
+                            </span>
+                          </div>
+                        </div>
+                        <div className="grid grid-cols-2 gap-x-6 items-center">
+                          <div className="flex min-h-[1.5rem] flex-wrap items-center gap-x-2 gap-y-0.5 text-sm font-bold text-gray-900 dark:text-gray-100">
+                            <Stethoscope className="h-4 w-4 shrink-0 text-gray-400" />
+                            <span>Provider:</span>
+                            <span className="min-w-0 break-words">
+                              {doctor
+                                ? (() => {
+                                    if (isDoctorLike(user?.role || "") && doctor.id === user?.id) {
+                                      const rolePrefix = user?.role?.toLowerCase() === "nurse" ? "Nurse." : "Dr.";
+                                      return `${rolePrefix} ${user?.firstName || ""} ${user?.lastName || ""}`.trim();
+                                    }
+                                    return `Dr. ${doctor.firstName} ${doctor.lastName}`;
+                                  })()
+                                : "N/A"}
+                            </span>
+                          </div>
+                          <div className="min-h-[1.5rem] text-xs text-gray-500 dark:text-gray-400">
+                            {patient?.patientId ? <>Patient ID: {patient.patientId}</> : null}
+                          </div>
+                        </div>
+                        <div className="grid grid-cols-2 gap-x-6 items-start">
+                          <div className="flex min-h-[1.5rem] items-center gap-2 text-sm text-gray-700 dark:text-gray-300">
+                            <Calendar className="h-4 w-4 shrink-0 text-gray-400" />
+                            <span>{format(new Date(appointment.scheduledAt), "EEEE, MMMM d, yyyy")}</span>
+                          </div>
+                          <div className="min-h-[1.5rem] text-xs text-gray-500 dark:text-gray-400">
+                            {patient?.email ? <>Email: {patient.email}</> : null}
+                          </div>
+                        </div>
+                        <div className="grid grid-cols-2 gap-x-6 items-start">
+                          <div className="flex items-center gap-1.5 text-sm leading-snug text-gray-600 dark:text-gray-400">
+                            <Clock className="h-4 w-4 shrink-0 text-gray-400" />
+                            <span>{formatAppointmentTimeRange(appointment)}</span>
+                          </div>
+                          <div className="flex min-w-0 flex-col gap-1.5 text-sm leading-snug text-gray-700 dark:text-gray-300 sm:flex-row sm:flex-wrap sm:items-center sm:gap-x-2 sm:gap-y-1">
+                            <div className="flex flex-wrap items-center gap-2">
+                              <FileText className="h-4 w-4 shrink-0 text-gray-400" />
+                              <span className="font-semibold">Appointment Type:</span>
+                              <span>{appointment.appointmentType || appointment.type || "N/A"}</span>
+                            </div>
+                            {appointmentTypeBadge ? (
+                              <Badge style={{ backgroundColor: appointmentTypeBadge.color, color: "white" }}>
+                                {appointmentTypeBadge.label}
+                              </Badge>
+                            ) : null}
+                          </div>
+                        </div>
+                        {patient?.contactNumber ? (
+                          <div className="grid grid-cols-2 gap-x-6 items-start">
+                            <div className="col-start-2 text-xs leading-snug text-gray-500 dark:text-gray-400">
+                              Contact: {patient.contactNumber}
+                            </div>
+                          </div>
+                        ) : null}
+                        {appointmentServiceInfo && (
+                          <div className="grid grid-cols-2 gap-x-6 items-center gap-y-0 py-0">
+                            <div className="col-start-2 flex min-w-0 items-center gap-2 py-0 text-sm leading-snug text-gray-700 dark:text-gray-300">
                               <span
-                                className="inline-flex h-2 w-2 rounded-full border border-gray-300"
+                                className="inline-flex h-2 w-2 shrink-0 rounded-full border border-gray-300"
                                 style={{ backgroundColor: appointmentServiceInfo.color }}
                               />
                               <span>Service: {appointmentServiceInfo.name}</span>
                             </div>
+                          </div>
+                        )}
+                        {appointment.description != null && String(appointment.description).trim() !== "" && (
+                          <div className="flex w-full items-start gap-2 border-t border-gray-100 pt-2.5 text-sm text-gray-700 dark:border-gray-700 dark:text-gray-300">
+                            <FileText className="mt-0.5 h-4 w-4 shrink-0 text-gray-400" />
+                            <span className="min-w-0">
+                              <span className="font-semibold">Description: </span>
+                              {String(appointment.description).trim()}
+                            </span>
+                          </div>
+                        )}
+                      </div>
+                    ) : (
+                      <div className="grid grid-cols-2 gap-6">
+                        {/* Left Column */}
+                        <div className="space-y-2">
+                          <div className="flex items-center gap-2 text-sm text-gray-700 dark:text-gray-300">
+                            <Calendar className="h-4 w-4 text-gray-400" />
+                            <span>{format(new Date(appointment.scheduledAt), "EEEE, MMMM d, yyyy")}</span>
+                          </div>
+                          <div className="flex items-center gap-2 text-sm text-gray-700 dark:text-gray-300">
+                            <User className="h-4 w-4 text-gray-400" />
+                            <span>{patient ? `${patient.firstName} ${patient.lastName}` : getPatientName(appointment.patientId)}</span>
+                          </div>
+                          <div className="space-y-1">
+                            <div className="flex items-center gap-2 text-sm text-gray-700 dark:text-gray-300">
+                              <FileText className="h-4 w-4 text-gray-400" />
+                              <span className="font-semibold">Appointment Type:</span>
+                              <span>{appointment.appointmentType || appointment.type || "N/A"}</span>
+                            </div>
+                            {appointmentServiceInfo && (
+                              <div className="flex items-center gap-2 text-sm text-gray-700 dark:text-gray-300">
+                                <span
+                                  className="inline-flex h-2 w-2 rounded-full border border-gray-300"
+                                  style={{ backgroundColor: appointmentServiceInfo.color }}
+                                />
+                                <span>Service: {appointmentServiceInfo.name}</span>
+                              </div>
+                            )}
+                          </div>
+                          {user?.role !== "nurse" && user?.role !== "doctor" && (
+                            <div className="flex items-center gap-2 text-sm text-gray-700 dark:text-gray-300">
+                              <MapPin className="h-4 w-4 text-gray-400" />
+                              <span>{appointment.location || "N/A"}</span>
+                            </div>
                           )}
                         </div>
-                        {user?.role !== 'nurse' && user?.role !== 'doctor' && (
-                          <div className="flex items-center gap-2 text-sm text-gray-700 dark:text-gray-300">
-                            <MapPin className="h-4 w-4 text-gray-400" />
-                            <span>{appointment.location || 'N/A'}</span>
-                          </div>
-                        )}
-                      </div>
 
-                      {/* Right Column */}
-                      <div className="space-y-2">
-                        <div className="flex items-center gap-2 text-sm text-gray-700 dark:text-gray-300">
-                          <Clock className="h-4 w-4 text-gray-400" />
-                          <span>{formatAppointmentTimeRange(appointment)}</span>
-                        </div>
-                        <div className="flex items-center gap-2 text-sm text-gray-700 dark:text-gray-300">
-                          <User className="h-4 w-4 text-gray-400" />
-                          <span>{doctor ? `${doctor.firstName} ${doctor.lastName}` : 'N/A'}</span>
-                        </div>
-                        {doctor && appointment.providerId && (
-                          <div className="pt-2">
-                            <Button
-                              variant="outline"
-                              size="sm"
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                const subdomain = getActiveSubdomain();
-                                setLocation(`/${subdomain}/staff/${appointment.providerId}`);
-                              }}
-                              className="text-xs"
-                            >
-                              View Profile
-                            </Button>
+                        {/* Right Column */}
+                        <div className="space-y-2">
+                          <div className="flex items-center gap-2 text-sm text-gray-700 dark:text-gray-300">
+                            <Clock className="h-4 w-4 text-gray-400" />
+                            <span>{formatAppointmentTimeRange(appointment)}</span>
                           </div>
-                        )}
-                        {isDoctorLike(user?.role || '') && appointment.appointmentId && (
-                          <div className="flex items-center gap-2">
-                            <Badge 
-                              variant="outline" 
-                              className="bg-blue-50 text-blue-700 border-blue-200 text-xs font-medium"
-                            >
-                              {appointment.appointmentId}
-                            </Badge>
+                          <div className="flex items-center gap-2 text-sm text-gray-700 dark:text-gray-300">
+                            <User className="h-4 w-4 text-gray-400" />
+                            <span>{doctor ? `${doctor.firstName} ${doctor.lastName}` : "N/A"}</span>
                           </div>
-                        )}
+                          {doctor && appointment.providerId && user?.role?.toLowerCase() !== "nurse" && user?.role?.toLowerCase() !== "doctor" && (
+                            <div className="pt-2">
+                              <Button
+                                variant="outline"
+                                size="sm"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  const subdomain = getActiveSubdomain();
+                                  setLocation(`/${subdomain}/staff/${appointment.providerId}`);
+                                }}
+                                className="text-xs"
+                              >
+                                View Profile
+                              </Button>
+                            </div>
+                          )}
+                          {isDoctorLike(user?.role || "") && appointment.appointmentId && (
+                            <div className="flex items-center gap-2">
+                              <Badge variant="outline" className="bg-blue-50 text-blue-700 border-blue-200 text-xs font-medium">
+                                {appointment.appointmentId}
+                              </Badge>
+                            </div>
+                          )}
+                        </div>
                       </div>
-                    </div>
+                    )}
 
                     {isDoctorLike(user?.role || "") && (patientAllergies.length > 0 || patientSpecialRequirements.length > 0) && (
                       <div className="mt-3 flex w-full flex-wrap gap-2">
                         {patientAllergies.length > 0 && (
-                          <Badge className="bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-200 whitespace-normal">
+                          <Badge className="bg-white border border-yellow-400 text-amber-800 dark:bg-transparent dark:border-yellow-500/60 dark:text-amber-200 whitespace-normal">
                             Allergies: {patientAllergies.join(", ")}
                           </Badge>
                         )}
                         {patientSpecialRequirements.length > 0 && (
-                          <Badge className="bg-indigo-100 text-indigo-800 dark:bg-indigo-900/40 dark:text-indigo-200 whitespace-normal">
+                          <Badge className="bg-white border border-gray-300 text-gray-700 dark:bg-transparent dark:border-gray-600 dark:text-gray-200 whitespace-normal">
                             Special Requirements: {patientSpecialRequirements.join(", ")}
                           </Badge>
                         )}
@@ -2243,8 +2750,10 @@ export default function DoctorAppointments({ onNewAppointment }: { onNewAppointm
                       <AppointmentInvoiceInfo appointmentId={appointment.appointmentId ?? (appointment as any).appointment_id} />
                     </div>
 
-                    {/* Description if available */}
-                    {appointment.description && (
+                    {/* Description if available (not nurse/doctor — they see it after Service above) */}
+                    {appointment.description &&
+                      user?.role?.toLowerCase() !== "nurse" &&
+                      user?.role?.toLowerCase() !== "doctor" && (
                       <div className="mt-3 pt-3 border-t">
                         <p className="text-xs font-medium text-gray-500 dark:text-gray-400 mb-1">Description:</p>
                         <p className="text-sm text-gray-600 dark:text-gray-400">
@@ -3026,6 +3535,13 @@ export default function DoctorAppointments({ onNewAppointment }: { onNewAppointm
                   {serviceInfo && (
                     <p className="text-sm text-gray-600 dark:text-gray-300">Service: {serviceInfo.name}</p>
                   )}
+                  {(user?.role?.toLowerCase() === "nurse" || user?.role?.toLowerCase() === "doctor") &&
+                    detailsAppointment.description != null &&
+                    String(detailsAppointment.description).trim() !== "" && (
+                    <p className="text-sm text-gray-600 dark:text-gray-300">
+                      Description: {String(detailsAppointment.description).trim()}
+                    </p>
+                  )}
 
                   <div className="pt-2">
                     <p className="text-xs text-gray-500 dark:text-gray-400">Provider</p>
@@ -3100,7 +3616,7 @@ export default function DoctorAppointments({ onNewAppointment }: { onNewAppointm
         <DialogContent className="max-h-[min(90vh,90dvh)] max-w-[min(32rem,calc(100vw-2rem))] w-full overflow-y-auto overflow-x-hidden dark:border-gray-700 dark:bg-slate-800">
           <DialogHeader>
             <DialogTitle className="text-xl font-bold text-red-600 dark:text-red-400">
-              Scheduling conflict
+              Patient has Already an appointment with another doctor
             </DialogTitle>
             <DialogDescription asChild>
               <p className="text-left text-sm text-gray-700 dark:text-gray-300 pt-1 leading-relaxed">

@@ -6512,6 +6512,27 @@ This treatment plan should be reviewed and adjusted based on individual patient 
       const { start, end, doctorId, patientId, providerId, date } = req.query;
       const userRole = req.user!.role;
       const userId = req.user!.id;
+      const organizationId = req.tenant!.id;
+
+      // IMPORTANT:
+      // Some environments use DB enums for status; writing "in_progress" can fail silently or be disallowed.
+      // To keep UI consistent, we compute ongoing appointments dynamically in the response.
+      const computeDynamicInProgress = (apt: any) => {
+        const st = String(apt?.status ?? "")
+          .trim()
+          .toLowerCase()
+          .replace(/\s+/g, "_");
+        if (st !== "scheduled" && st !== "confirmed") return apt;
+        const startAt = new Date(apt?.scheduledAt);
+        if (Number.isNaN(startAt.getTime())) return apt;
+        const dur = apt?.duration != null && Number(apt.duration) > 0 ? Number(apt.duration) : 30;
+        const endAt = new Date(startAt.getTime() + dur * 60 * 1000);
+        const now = new Date();
+        if (startAt <= now && now < endAt) {
+          return { ...apt, status: "in_progress" };
+        }
+        return apt;
+      };
 
       let appointments: Appointment[] = [];
 
@@ -6520,7 +6541,7 @@ This treatment plan should be reviewed and adjusted based on individual patient 
       if (providerId && date) {
         appointments = await storage.getAppointmentsByProvider(
           parseInt(providerId as string),
-          req.tenant!.id
+          organizationId
         );
 
         // Filter by date
@@ -6531,6 +6552,9 @@ This treatment plan should be reviewed and adjusted based on individual patient 
             : apt.scheduledAt.substring(0, 10);
           return aptDate === dateStr;
         });
+
+        // Dynamic in_progress for ongoing appointments (response-only)
+        appointments = appointments.map(computeDynamicInProgress) as any;
 
         // Return minimal data for availability checking (no sensitive patient info)
         const availabilityData = appointments.map(apt => ({
@@ -6550,16 +6574,16 @@ This treatment plan should be reviewed and adjusted based on individual patient 
         if (doctorId) {
           appointments = await storage.getAppointmentsByProvider(
             parseInt(doctorId as string),
-            req.tenant!.id
+            organizationId
           );
         } else if (patientId) {
           appointments = await storage.getAppointmentsByPatient(
             parseInt(patientId as string),
-            req.tenant!.id
+            organizationId
           );
         } else {
           // Get all appointments for organization
-          appointments = await storage.getAppointmentsByOrganization(req.tenant!.id);
+          appointments = await storage.getAppointmentsByOrganization(organizationId);
         }
       } else if (userRole === 'doctor') {
         // Doctors can only see their own appointments unless they have read_all permission
@@ -6570,29 +6594,29 @@ This treatment plan should be reviewed and adjusted based on individual patient 
           // Doctor with read_all permission can see other doctors' appointments
           appointments = await storage.getAppointmentsByProvider(
             parseInt(doctorId as string),
-            req.tenant!.id
+            organizationId
           );
         } else {
           // Restrict to doctor's own appointments
-          appointments = await storage.getAppointmentsByProvider(userId, req.tenant!.id);
+          appointments = await storage.getAppointmentsByProvider(userId, organizationId);
         }
       } else if (userRole === 'patient') {
         // Patients can only see their own appointments
         // Find the patient record by email (since userId may be null)
-        const patients = await storage.getPatientsByOrganization(req.tenant!.id, 100);
+        const patients = await storage.getPatientsByOrganization(organizationId, 100);
         const user = req.user! as any; // Cast to access firstName/lastName properties
 
         // Match by email first (primary method), fallback to userId
         const patient = patients.find(p => p.email === user.email) || patients.find(p => p.userId === userId);
 
         if (patient) {
-          appointments = await storage.getAppointmentsByPatient(patient.id, req.tenant!.id);
+          appointments = await storage.getAppointmentsByPatient(patient.id, organizationId);
         } else {
           appointments = [];
         }
       } else if (userRole === 'nurse') {
         // Nurses see only their own appointments (where they are the provider)
-        appointments = await storage.getAppointmentsByProvider(userId, req.tenant!.id);
+        appointments = await storage.getAppointmentsByProvider(userId, organizationId);
       } else {
         // Default: no access for other roles
         return res.status(403).json({ error: "Access denied" });
@@ -6609,15 +6633,18 @@ This treatment plan should be reviewed and adjusted based on individual patient 
         });
       }
 
+      // Dynamic in_progress for ongoing appointments (response-only)
+      appointments = appointments.map(computeDynamicInProgress) as any;
+
       // Enrich appointments with patient names (similar to lab results)
       // Get unique patient IDs from appointments
       const uniquePatientIds = [...new Set(appointments.map(apt => apt.patientId))];
 
       // Fetch all patients for the organization to enable matching by both id and userId
-      const allPatients = await storage.getPatientsByOrganization(req.tenant!.id, 1000);
+      const allPatients = await storage.getPatientsByOrganization(organizationId, 1000);
 
       // Also fetch all users in case patientId is actually a userId
-      const allUsers = await storage.getUsersByOrganization(req.tenant!.id);
+      const allUsers = await storage.getUsersByOrganization(organizationId);
 
       // Create maps for quick lookup
       const patientMapById = new Map();
@@ -6983,6 +7010,9 @@ This treatment plan should be reviewed and adjusted based on individual patient 
 
       console.log(`[CONFLICT CHECK] Checking for conflicts: patientId=${patientId}, providerId=${providerId}, date=${dateStr}, time=${timeStr}`);
 
+      const normalizeStatusSql = (col: any) =>
+        sql`LOWER(REPLACE(TRIM(COALESCE(${col}::text, '')), ' ', '_'))`;
+
       // Check for patient conflicts (patient has appointment at same date/time with any doctor)
       const patientConflicts = await db.select()
         .from(schema.appointments)
@@ -6991,7 +7021,7 @@ This treatment plan should be reviewed and adjusted based on individual patient 
           eq(schema.appointments.patientId, patientId),
           sql`DATE(${schema.appointments.scheduledAt}) = ${dateStr}`,
           sql`TO_CHAR(${schema.appointments.scheduledAt}, 'HH24:MI') = ${timeStr}`,
-          ne(schema.appointments.status, 'cancelled')
+          sql`${normalizeStatusSql(schema.appointments.status)} NOT IN ('cancelled','canceled','completed','rescheduled')`
         ));
 
       // Check for provider conflicts (doctor has appointment at same date/time with any patient)
@@ -7002,7 +7032,7 @@ This treatment plan should be reviewed and adjusted based on individual patient 
           eq(schema.appointments.providerId, providerId),
           sql`DATE(${schema.appointments.scheduledAt}) = ${dateStr}`,
           sql`TO_CHAR(${schema.appointments.scheduledAt}, 'HH24:MI') = ${timeStr}`,
-          ne(schema.appointments.status, 'cancelled')
+          sql`${normalizeStatusSql(schema.appointments.status)} NOT IN ('cancelled','canceled','completed','rescheduled')`
         ));
 
       console.log(`[CONFLICT CHECK] Found ${patientConflicts.length} patient conflicts, ${providerConflicts.length} provider conflicts`);
@@ -7326,14 +7356,10 @@ This treatment plan should be reviewed and adjusted based on individual patient 
           ? Number(appointmentData.consultationId)
           : null;
       const scheduledRaw = appointmentToCreate.scheduledAt;
-      const dateOnlyMatch = scheduledRaw ? String(scheduledRaw).match(/^(\d{4}-\d{2}-\d{2})/) : null;
-      const appointmentDateOnly = dateOnlyMatch
-        ? dateOnlyMatch[1]
-        : scheduledRaw
-          ? String(scheduledRaw).split("T")[0].split(" ")[0]
-          : null;
 
-      if (appointmentDateOnly && appointmentTypeValue === "treatment" && tidForDup != null && !Number.isNaN(tidForDup)) {
+      // Duplicate service: exact same doctor + patient + timestamp + same treatment_id/consultation_id
+      // (Do NOT block for other times on the same day.)
+      if (scheduledRaw && appointmentTypeValue === "treatment" && tidForDup != null && !Number.isNaN(tidForDup)) {
         const dup = await pool.query(
           `SELECT a.id,
                   a.status AS dup_status,
@@ -7353,11 +7379,11 @@ This treatment plan should be reviewed and adjusted based on individual patient 
              AND a.patient_id = $2
              AND a.provider_id = $3
              AND LOWER(TRIM(COALESCE(a.status::text, ''))) IN ('scheduled', 'confirmed')
-             AND DATE(a.scheduled_at::timestamp) = $4::date
+             AND a.scheduled_at::timestamp = $4::timestamp
              AND a.appointment_type = 'treatment'
              AND a.treatment_id = $5
            LIMIT 1`,
-          [organizationId, numericPatientId, appointmentData.providerId, appointmentDateOnly, tidForDup]
+          [organizationId, numericPatientId, appointmentData.providerId, scheduledRaw, tidForDup]
         );
         if (dup.rows.length > 0) {
           const row = dup.rows[0] as any;
@@ -7383,7 +7409,7 @@ This treatment plan should be reviewed and adjusted based on individual patient 
             existingAppointment: row,
           });
         }
-      } else if (appointmentDateOnly && appointmentTypeValue === "consultation" && cidForDup != null && !Number.isNaN(cidForDup)) {
+      } else if (scheduledRaw && appointmentTypeValue === "consultation" && cidForDup != null && !Number.isNaN(cidForDup)) {
         const dup = await pool.query(
           `SELECT a.id,
                   a.status AS dup_status,
@@ -7403,11 +7429,11 @@ This treatment plan should be reviewed and adjusted based on individual patient 
              AND a.patient_id = $2
              AND a.provider_id = $3
              AND LOWER(TRIM(COALESCE(a.status::text, ''))) IN ('scheduled', 'confirmed')
-             AND DATE(a.scheduled_at::timestamp) = $4::date
+             AND a.scheduled_at::timestamp = $4::timestamp
              AND a.appointment_type = 'consultation'
              AND a.consultation_id = $5
            LIMIT 1`,
-          [organizationId, numericPatientId, appointmentData.providerId, appointmentDateOnly, cidForDup]
+          [organizationId, numericPatientId, appointmentData.providerId, scheduledRaw, cidForDup]
         );
         if (dup.rows.length > 0) {
           const row = dup.rows[0] as any;
@@ -7498,8 +7524,124 @@ This treatment plan should be reviewed and adjusted based on individual patient 
 
       // Handle scheduling conflicts specifically
       if (error instanceof Error && error.message.includes("already scheduled at this time")) {
-        return res.status(400).json({
-          error: error.message
+        // Keep a consistent conflict shape for the UI (and use 409 Conflict).
+        // Also return conflict details when possible.
+        try {
+          const providerId = Number((appointmentData as any)?.providerId);
+          const scheduledAt = String((appointmentData as any)?.scheduledAt || "");
+          const duration = Number((appointmentData as any)?.duration || 30);
+          if (providerId && scheduledAt) {
+            // Fetch appointments for the correct local day (scheduledAt is stored as timestamp w/o timezone).
+            const dayStr = scheduledAt.substring(0, 10);
+            const day = dayStr ? new Date(`${dayStr}T00:00:00`) : new Date(scheduledAt);
+            const existingAppointments = await storage.getAppointmentsByProvider(
+              providerId,
+              req.tenant!.id,
+              day,
+            );
+
+            const start = new Date(scheduledAt);
+            const end = new Date(start.getTime() + (duration || 30) * 60 * 1000);
+            const now = new Date();
+
+            const normalizeStatus = (raw: any) =>
+              String(raw || "")
+                .trim()
+                .toLowerCase()
+                .replace(/\s+/g, "_");
+            const conflicts = (existingAppointments || []).filter((existing: any) => {
+              const st = normalizeStatus(existing.status);
+              if (st === "cancelled" || st === "canceled" || st === "completed" || st === "rescheduled") return false;
+              const existingStart = new Date(existing.scheduledAt);
+              const existingEnd = new Date(existingStart.getTime() + (Number(existing.duration) || 30) * 60 * 1000);
+              if (existingStart <= now && now < existingEnd) return false; // don't block ongoing
+              return start < existingEnd && end > existingStart;
+            });
+
+            return res.status(409).json({
+              code: "PROVIDER_TIME_CONFLICT",
+              error: error.message,
+              conflicts: conflicts.map((c: any) => ({
+                id: c.id,
+                appointmentId: c.appointmentId,
+                scheduledAt: c.scheduledAt,
+                duration: c.duration,
+                status: c.status,
+                title: c.title,
+                patientId: c.patientId,
+                providerId: c.providerId,
+                createdBy: c.createdBy,
+              })),
+            });
+          }
+        } catch (e) {
+          console.error("Failed to build conflict details:", e);
+        }
+        return res.status(409).json({
+          code: "PROVIDER_TIME_CONFLICT",
+          error: error.message,
+          conflicts: [],
+        });
+      }
+
+      // Provider time overlap conflict: return conflicting appointment details
+      if (error instanceof Error && error.message.includes("Doctor is already scheduled at this time")) {
+        try {
+          const providerId = Number((appointmentData as any)?.providerId);
+          const scheduledAt = String((appointmentData as any)?.scheduledAt || "");
+          const duration = Number((appointmentData as any)?.duration || 30);
+          if (providerId && scheduledAt) {
+            // Fetch appointments for the correct local day (scheduledAt is stored as timestamp w/o timezone).
+            const dayStr = scheduledAt.substring(0, 10);
+            const day = dayStr ? new Date(`${dayStr}T00:00:00`) : new Date(scheduledAt);
+            const existingAppointments = await storage.getAppointmentsByProvider(
+              providerId,
+              req.tenant!.id,
+              day,
+            );
+
+            const start = new Date(scheduledAt);
+            const end = new Date(start.getTime() + (duration || 30) * 60 * 1000);
+            const now = new Date();
+
+            const normalizeStatus = (raw: any) =>
+              String(raw || "")
+                .trim()
+                .toLowerCase()
+                .replace(/\s+/g, "_");
+            const conflicts = (existingAppointments || []).filter((existing: any) => {
+              const st = normalizeStatus(existing.status);
+              if (st === "cancelled" || st === "canceled" || st === "completed" || st === "rescheduled") return false;
+              const existingStart = new Date(existing.scheduledAt);
+              const existingEnd = new Date(existingStart.getTime() + (Number(existing.duration) || 30) * 60 * 1000);
+              // Do not block booking if the existing appointment is currently ongoing.
+              if (existingStart <= now && now < existingEnd) return false;
+              return start < existingEnd && end > existingStart;
+            });
+
+            return res.status(409).json({
+              code: "PROVIDER_TIME_CONFLICT",
+              error: error.message,
+              conflicts: conflicts.map((c: any) => ({
+                id: c.id,
+                appointmentId: c.appointmentId,
+                scheduledAt: c.scheduledAt,
+                duration: c.duration,
+                status: c.status,
+                title: c.title,
+                patientId: c.patientId,
+                providerId: c.providerId,
+                createdBy: c.createdBy,
+              })),
+            });
+          }
+        } catch (e) {
+          console.error("Failed to build conflict details:", e);
+        }
+        return res.status(409).json({
+          code: "PROVIDER_TIME_CONFLICT",
+          error: error.message,
+          conflicts: [],
         });
       }
 
@@ -7637,7 +7779,7 @@ This treatment plan should be reviewed and adjusted based on individual patient 
       const updateData = z.object({
         title: z.string().optional(),
         type: z.enum(["consultation", "follow_up", "procedure"]).optional(),
-        status: z.enum(["scheduled", "completed", "cancelled", "no_show"]).optional(),
+        status: z.enum(["scheduled", "in_progress", "rescheduled", "completed", "cancelled", "no_show"]).optional(),
         scheduledAt: z.string().optional(),
         description: z.string().optional(),
         duration: z.number().optional(),

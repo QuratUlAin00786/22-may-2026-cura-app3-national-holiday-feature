@@ -7,7 +7,7 @@ export const PATIENT_OVERLAP_MESSAGE =
   "This patient already has an appointment scheduled during this time. Please choose a different time slot.";
 
 /**
- * Paragraph for the "Scheduling conflict" modal: names the provider the user is
+ * Paragraph for the "Patient has Already an appointment with another doctor" modal: names the provider the user is
  * booking with and explains the conflict. When the overlapping appointment is with
  * the same provider, uses "already booked with" that doctor; otherwise explains
  * patient overlap with another provider's appointment.

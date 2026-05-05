@@ -1576,7 +1576,7 @@ export function DoctorList({
 
       // Get doctor/provider ID from appointmentData - ensure we get it from multiple sources
       const doctorId = appointmentData?.providerId ||
-        appointmentData?.doctorId ||
+        (appointmentData as any)?.doctorId ||
         selectedBookingDoctor?.id ||
         null;
 
@@ -2659,12 +2659,12 @@ export function DoctorList({
                       </div>
                       <div className="text-sm text-gray-600 dark:text-gray-400 mb-1">
                         {isDoctorLike(user?.role)
-                          ? (user?.medicalSpecialtyCategory || user?.department || 'General & Primary Care')
+                          ? ((user as any)?.medicalSpecialtyCategory || (user as any)?.department || 'General & Primary Care')
                           : (selectedBookingDoctor?.medicalSpecialtyCategory || 'General & Primary Care')}
                       </div>
                       <div className="text-sm text-gray-600 dark:text-gray-400 mb-1">
                         {isDoctorLike(user?.role)
-                          ? (user?.subSpecialty || 'General Practitioner (GP) / Family Physician')
+                          ? ((user as any)?.subSpecialty || 'General Practitioner (GP) / Family Physician')
                           : (selectedBookingDoctor?.subSpecialty || 'General Practitioner (GP) / Family Physician')}
                       </div>
                       <div className="space-y-1">
@@ -3513,7 +3513,7 @@ export function DoctorList({
         <DialogContent className="max-h-[min(90vh,90dvh)] max-w-[min(32rem,calc(100vw-2rem))] w-full overflow-y-auto overflow-x-hidden dark:border-gray-700 dark:bg-slate-800">
           <DialogHeader>
             <DialogTitle className="text-xl font-bold text-red-600 dark:text-red-400">
-              Scheduling conflict
+              Patient has Already an appointment with another doctor
             </DialogTitle>
             <DialogDescription asChild>
               <p className="text-left text-sm text-gray-700 dark:text-gray-300 pt-1 leading-relaxed">

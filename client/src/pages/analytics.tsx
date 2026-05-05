@@ -4087,22 +4087,12 @@ export default function AnalyticsPage() {
   const { canView } = useRolePermissions();
   const [showAppointmentsDialog, setShowAppointmentsDialog] = useState(false);
   const [completedAppointments, setCompletedAppointments] = useState<any[]>([]);
-  // Admin-style Filters (ported from appointments page)
-  const [filterRole, setFilterRole] = useState<string>("");
-  const [filterProvider, setFilterProvider] = useState<string>("");
-  const [filterStartDate, setFilterStartDate] = useState<Date | undefined>(undefined);
-  const [filterEndDate, setFilterEndDate] = useState<Date | undefined>(undefined);
-  const [filterAppointmentId, setFilterAppointmentId] = useState<string>("");
-  // Manual search trigger (appointments filters) - only fetch when user clicks "Search"
-  const [searchRunId, setSearchRunId] = useState(0);
-  const [appointmentIdPopoverOpen, setAppointmentIdPopoverOpen] = useState(false);
   const [filters, setFilters] = useState({
     dateRange: '30',
     department: 'all',
     provider: 'all',
     patientType: 'all'
   });
-  const [filteredAppointments, setFilteredAppointments] = useState<any[]>([]);
 
   // ── All Appointments tab ──────────────────────────────────────────────────
   const [apptPage, setApptPage] = useState(1);
@@ -4179,102 +4169,6 @@ export default function AnalyticsPage() {
     if (tdQuery.isError) setTdShowError(true);
   }, [tdQuery.isError]);
 
-  // Shallow array equality helper to avoid infinite re-render loops on identical data
-  const areAppointmentsShallowEqual = (a: any[] | undefined, b: any[] | undefined): boolean => {
-    if (a === b) return true;
-    if (!Array.isArray(a) || !Array.isArray(b)) return false;
-    if (a.length !== b.length) return false;
-    for (let i = 0; i < a.length; i++) {
-      const ai = a[i];
-      const bi = b[i];
-      // Compare by stable identifiers and a couple of frequently changing fields
-      const aid = ai?.id ?? ai?.appointmentId ?? ai?.appointment_id;
-      const bid = bi?.id ?? bi?.appointmentId ?? bi?.appointment_id;
-      if (aid !== bid) return false;
-      const at = ai?.scheduledAt ?? ai?.scheduled_at;
-      const bt = bi?.scheduledAt ?? bi?.scheduled_at;
-      if (at !== bt) return false;
-      const ap = ai?.providerId ?? ai?.provider_id;
-      const bp = bi?.providerId ?? bi?.provider_id;
-      if (ap !== bp) return false;
-    }
-    return true;
-  };
-
-  // Date normalization helpers to defensively handle unexpected formats
-  const normalizeToDate = (value: any): Date | undefined => {
-    if (!value) return undefined;
-    if (value instanceof Date && !Number.isNaN(value.getTime())) return value;
-    const parsed = new Date(String(value));
-    return Number.isNaN(parsed.getTime()) ? undefined : parsed;
-  };
-  const ensureStartEndOrder = (start?: Date, end?: Date): { start?: Date; end?: Date } => {
-    if (start && end && end < start) {
-      return { start: end, end: start }; // swap if reversed
-    }
-    return { start, end };
-  };
-  // New: Simple date-range-only appointments fetch (defaults to today)
-  const todayStr = useMemo(() => format(new Date(), 'yyyy-MM-dd'), []);
-  const [rangeStart, setRangeStart] = useState<string>(todayStr);
-  const [rangeEnd, setRangeEnd] = useState<string>(todayStr);
-  // Applied range is only updated when user clicks "Search" (prevents auto-refetch on date picker changes)
-  const [appliedRangeStart, setAppliedRangeStart] = useState<string>(todayStr);
-  const [appliedRangeEnd, setAppliedRangeEnd] = useState<string>(todayStr);
-  // On initial load, reflect today's range into the visible date pickers
-  useEffect(() => {
-    if (!filterStartDate && !filterEndDate) {
-      const today = new Date();
-      setFilterStartDate(today);
-      setFilterEndDate(today);
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-  // Sync with existing date pickers: if either changes, refetch using updated range
-  useEffect(() => {
-    const rawStart = normalizeToDate(filterStartDate);
-    const rawEnd = normalizeToDate(filterEndDate);
-    const { start, end } = ensureStartEndOrder(rawStart, rawEnd);
-    const s = start ? format(start, 'yyyy-MM-dd') : null;
-    const e = end ? format(end, 'yyyy-MM-dd') : null;
-    if (s && e) {
-      setRangeStart(s);
-      setRangeEnd(e);
-    } else if (s && !e) {
-      setRangeStart(s);
-      setRangeEnd(s);
-    } else if (!s && e) {
-      setRangeStart(e);
-      setRangeEnd(e);
-    } else {
-      // default to today on initial load or when cleared
-      setRangeStart(todayStr);
-      setRangeEnd(todayStr);
-    }
-  }, [filterStartDate, filterEndDate, todayStr]);
-  // Removed legacy single-call by-date-range query; Search now uses per-day chunked requests only.
-
-  // Support data for filters
-  const { data: rolesData = [] } = useQuery({
-    queryKey: ["/api/roles"],
-    queryFn: async () => {
-      const res = await apiRequest("GET", "/api/roles");
-      const json = await res.json();
-      return Array.isArray(json) ? json : [];
-    },
-    enabled: !!user,
-    staleTime: 60000,
-  });
-  const { data: usersData = [] } = useQuery({
-    queryKey: ["/api/users", "all"],
-    queryFn: async () => {
-      const res = await apiRequest("GET", "/api/users");
-      const json = await res.json();
-      return Array.isArray(json) ? json : [];
-    },
-    enabled: !!user,
-    staleTime: 60000,
-  });
   const { data: allAppointments = [] } = useQuery({
     queryKey: ["/api/appointments", "all"],
     queryFn: async () => {
@@ -4285,46 +4179,6 @@ export default function AnalyticsPage() {
     enabled: !!user,
     staleTime: 60000,
   });
-  const availableRoles: Array<{ name: string; displayName: string }> = useMemo(() => {
-    if (!rolesData || !Array.isArray(rolesData)) return [];
-    const filtered = rolesData
-      .filter((role: any) => {
-        const roleName = String(role.name || "").toLowerCase();
-        if (user?.role === "patient") {
-          return roleName !== "patient" && roleName !== "admin" && roleName !== "administrator";
-        }
-        return roleName !== "patient";
-      })
-      .map((role: any) => ({ name: role.name, displayName: role.displayName || role.name }));
-    if (user?.role === "patient") {
-      return filtered.sort((a, b) => a.displayName.localeCompare(b.displayName, undefined, { sensitivity: "base" }));
-    }
-    return filtered;
-  }, [rolesData, user?.role]);
-  const filteredUsersByFilterRole = useMemo(() => {
-    if (!filterRole || !usersData || !Array.isArray(usersData)) return [];
-    const roleLc = String(filterRole).toLowerCase();
-    // Doctor-like roles can be stored with variations; include all doctor-like when role is 'doctor'
-    if (roleLc === "doctor") {
-      return usersData.filter((u: any) => isDoctorLike(String(u.role || "").toLowerCase()));
-    }
-    return usersData.filter((u: any) => String(u.role || "").toLowerCase() === roleLc);
-  }, [filterRole, usersData]);
-  // If no role is selected, fall back to all providers; if a role yields 0, gracefully fall back to all as well
-  const providersForDropdown = useMemo(() => {
-    if (!usersData || !Array.isArray(usersData)) return [];
-    if (!filterRole) return usersData;
-    const list = filteredUsersByFilterRole;
-    return Array.isArray(list) && list.length > 0 ? list : usersData;
-  }, [usersData, filterRole, filteredUsersByFilterRole]);
-  const handleRefreshFilters = () => {
-    setFilterRole("");
-    setFilterProvider("");
-    setFilterStartDate(undefined);
-    setFilterEndDate(undefined);
-    setFilterAppointmentId("");
-    setFilteredAppointments([]);
-  };
 
   const { data: analyticsData, isLoading } = useQuery({
     queryKey: ['/api/analytics', user?.id, isDoctorLike(user?.role)],
@@ -4347,38 +4201,10 @@ export default function AnalyticsPage() {
     enabled: !!user
   });
 
-  // Server-side filtered appointments (NEW window endpoint) - runs on Search click
-  const { data: serverFilteredAppointments = [], isFetching: isFetchingServerFiltered, error: windowError } = useQuery({
-    queryKey: ["/api/appointments", "analytics-filtered", "range-fast-chunked", {
-      providerId: filterProvider || null,
-      startDate: appliedRangeStart || null,
-      endDate: appliedRangeEnd || null,
-      role: filterRole || null,
-      searchRunId,
-    }],
-    enabled: !!user && searchRunId > 0 && (!!appliedRangeStart && !!appliedRangeEnd),
-    queryFn: async () => {
-      // Single request to the dedicated analytics filter endpoint (queries scheduled_at column)
-      const qs = new URLSearchParams({ startDate: appliedRangeStart, endDate: appliedRangeEnd });
-      const url = `/api/analytics/appointments-filter?${qs.toString()}`;
-      try {
-        const r = await apiRequest("GET", url, undefined, { timeoutMs: 15000 });
-        const data = await r.json();
-        console.log("[ANALYTICS FILTER] Fetched:", Array.isArray(data) ? data.length : 0, "appointments for range:", appliedRangeStart, "→", appliedRangeEnd);
-        return Array.isArray(data) ? data : [];
-      } catch (e) {
-        console.error("[ANALYTICS FILTER] Error:", e);
-        return [];
-      }
-    },
-    staleTime: 30000,
-    retry: 0,
-  });
-
-  // Compute counts from the already-fetched Search dataset.
-  const appointmentsForCounts: any[] = useMemo(() => {
-    return Array.isArray(serverFilteredAppointments) ? serverFilteredAppointments : [];
-  }, [serverFilteredAppointments]);
+  const appointmentsForCounts: any[] = useMemo(
+    () => (Array.isArray(allAppointments) ? allAppointments : []),
+    [allAppointments],
+  );
 
   const { futureAndCurrentList, completedCount, futureAndCurrentCount } = useMemo(() => {
     const now = new Date();
@@ -4398,58 +4224,6 @@ export default function AnalyticsPage() {
       futureAndCurrentCount: futureAndCurrent.length,
     };
   }, [appointmentsForCounts]);
-
-  // Appointment IDs contextual to current filters (like appointments page)
-  const uniqueAppointmentIds = useMemo(() => {
-    const source = Array.isArray(serverFilteredAppointments) ? serverFilteredAppointments : [];
-    const ids = source
-      .map((apt: any) => apt.appointmentId || apt.appointment_id)
-      .filter((id: string | undefined) => id != null && String(id).trim() !== "");
-    return Array.from(new Set(ids.map((s: any) => String(s)))).sort();
-  }, [serverFilteredAppointments]);
-
-  // Apply filters to appointments (all roles)
-  useEffect(() => {
-    const hasSearchDates = searchRunId > 0 && !!appliedRangeStart && !!appliedRangeEnd;
-    let base: any[] = [];
-    if (hasSearchDates || !!filterProvider) {
-      base = Array.isArray(serverFilteredAppointments) ? serverFilteredAppointments : [];
-    } else {
-      base = [];
-    }
-    if (!Array.isArray(base)) {
-      setFilteredAppointments([]);
-      return;
-    }
-    let filtered = [...base];
-    if (filterProvider) {
-      const providerIdNum = parseInt(filterProvider);
-      filtered = filtered.filter((a: any) => {
-        const id = a.providerId ?? a.provider_id ?? a.doctorId ?? a.doctor_id;
-        return Number(id) === providerIdNum;
-      });
-    }
-    // Date filtering should reflect the applied (Search-time) date range, not live date picker values.
-    if (hasSearchDates) {
-      const startDay = appliedRangeStart || null;
-      const endDay = appliedRangeEnd || null;
-      filtered = filtered.filter((a: any) => {
-        const raw = a.scheduledAt || a.scheduled_at || a.date;
-        if (!raw) return false;
-        const d = String(raw).slice(0, 10);
-        if (startDay && d < startDay) return false;
-        if (endDay && d > endDay) return false;
-        return true;
-      });
-    }
-    if (filterAppointmentId) {
-      filtered = filtered.filter((a: any) => {
-        const id = a.appointmentId ?? a.appointment_id;
-        return String(id || '').trim() === String(filterAppointmentId).trim();
-      });
-    }
-    setFilteredAppointments((prev) => (areAppointmentsShallowEqual(prev, filtered) ? prev : filtered));
-  }, [user?.role, serverFilteredAppointments, filterProvider, filterAppointmentId, searchRunId, appliedRangeStart, appliedRangeEnd]);
 
   // Fetch daily, monthly, yearly analytics
   const [timeframe, setTimeframe] = useState<'daily' | 'monthly' | 'yearly'>('monthly');
@@ -5100,125 +4874,8 @@ export default function AnalyticsPage() {
           */}
 
           <TabsContent value="overview" className="space-y-4">
-            {/* Date Range Filter (Overview) */}
-            <Card className="border-gray-200 dark:border-slate-700">
-              <CardHeader className="pb-2">
-                <CardTitle className="text-base">Filter Appointments by Date</CardTitle>
-              </CardHeader>
-              <CardContent>
-                <div className="flex flex-wrap items-end gap-3">
-                  {/* Start Date */}
-                  <div className="min-w-[200px]">
-                    <Label>Start date</Label>
-                    <Popover>
-                      <PopoverTrigger asChild>
-                        <Button
-                          variant="outline"
-                          className="w-full justify-start text-left font-normal mt-1"
-                        >
-                          <Calendar className="mr-2 h-4 w-4" />
-                          {filterStartDate ? format(filterStartDate, "PPP") : "Pick a date"}
-                        </Button>
-                      </PopoverTrigger>
-                      <PopoverContent className="w-auto p-0" align="start">
-                        <CalendarComponent
-                          mode="single"
-                          selected={filterStartDate}
-                          onSelect={setFilterStartDate}
-                          disabled={() => false}
-                          initialFocus
-                        />
-                      </PopoverContent>
-                    </Popover>
-                  </div>
-
-                  {/* End Date */}
-                  <div className="min-w-[200px]">
-                    <Label>End date</Label>
-                    <Popover>
-                      <PopoverTrigger asChild>
-                        <Button
-                          variant="outline"
-                          className="w-full justify-start text-left font-normal mt-1"
-                        >
-                          <Calendar className="mr-2 h-4 w-4" />
-                          {filterEndDate ? format(filterEndDate, "PPP") : "Pick a date"}
-                        </Button>
-                      </PopoverTrigger>
-                      <PopoverContent className="w-auto p-0" align="start">
-                        <CalendarComponent
-                          mode="single"
-                          selected={filterEndDate}
-                          onSelect={setFilterEndDate}
-                          disabled={() => false}
-                          initialFocus
-                        />
-                      </PopoverContent>
-                    </Popover>
-                  </div>
-
-                  <div className="flex items-end gap-2">
-                    <Button
-                      size="sm"
-                      onClick={() => {
-                        // Apply the currently selected dates and trigger a single server fetch.
-                        const rawStart = normalizeToDate(filterStartDate || filterEndDate);
-                        const rawEnd = normalizeToDate(filterEndDate || filterStartDate);
-                        const { start, end } = ensureStartEndOrder(rawStart, rawEnd);
-                        const s = start ? format(start, "yyyy-MM-dd") : "";
-                        const e = end ? format(end, "yyyy-MM-dd") : "";
-                        setAppliedRangeStart(s);
-                        setAppliedRangeEnd(e);
-                        setSearchRunId((v) => v + 1);
-                      }}
-                      disabled={!filterStartDate || !filterEndDate}
-                      title="Search"
-                    >
-                      Search
-                    </Button>
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      onClick={() => { setFilterStartDate(undefined); setFilterEndDate(undefined); }}
-                      title="Clear"
-                    >
-                      Clear
-                    </Button>
-                  </div>
-                </div>
-                {/* Result count (shows how many rows were fetched from appointments for the applied start/end) */}
-                <div className="mt-2 text-xs text-gray-600 dark:text-gray-400">
-                  {searchRunId > 0 && appliedRangeStart && appliedRangeEnd ? (
-                    <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
-                      <span className="font-medium text-gray-700 dark:text-gray-300">
-                        Appointments fetched:
-                      </span>
-                      <span>
-                        {Array.isArray(serverFilteredAppointments) ? serverFilteredAppointments.length : 0}
-                      </span>
-                      <span className="text-gray-500 dark:text-gray-500">
-                        (from {appliedRangeStart} to {appliedRangeEnd})
-                      </span>
-                      {isFetchingServerFiltered ? (
-                        <span className="text-gray-500 dark:text-gray-500">Loading…</span>
-                      ) : null}
-                      {/* Suppress verbose fetch error display per requirement */}
-                    </div>
-                  ) : (
-                    <span className="text-gray-500 dark:text-gray-500">
-                      Click Search to fetch appointments and show row count.
-                    </span>
-                  )}
-                </div>
-                {/* Debug trace for user to verify steps */}
-                <div className="sr-only" aria-hidden="true">
-                  {/* a11y-hidden container; we rely on console traces instead of UI text */}
-                </div>
-              </CardContent>
-            </Card>
-
             {/* Compact Analytics Grid */}
-            <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 gap-3 sm:gap-4 auto-rows-fr mt-[70px]">
+            <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 gap-3 sm:gap-4 auto-rows-fr">
               {/* Patients This Month */}
               <div className="min-w-0 flex flex-col">
                 <div className="text-xs font-medium text-gray-500 dark:text-gray-400 mb-1.5 uppercase tracking-wide truncate">Patients</div>
@@ -5415,79 +5072,6 @@ export default function AnalyticsPage() {
             </CardContent>
           </Card>
 
-          {/* Filtered Appointments (Overview) */}
-          {(searchRunId > 0 && appliedRangeStart && appliedRangeEnd) && (
-            <Card className="mb-4">
-              <CardHeader className="py-3">
-                <CardTitle className="text-base">
-                  Filtered Appointments ({filteredAppointments.length} found)
-                </CardTitle>
-              </CardHeader>
-              <CardContent>
-                {filteredAppointments.length === 0 ? (
-                  <div className="text-sm text-gray-500">
-                    No appointments match the selected dates ({appliedRangeStart} to {appliedRangeEnd}).
-                  </div>
-                ) : (
-                  <div className="border rounded-md bg-white dark:bg-slate-900 overflow-hidden">
-                    <div className="max-h-[420px] overflow-auto">
-                      <table className="w-full text-sm">
-                        <thead className="sticky top-0 bg-gray-50 dark:bg-slate-800 border-b">
-                          <tr className="text-left">
-                            <th className="px-3 py-2 font-medium text-gray-700 dark:text-gray-200">Date</th>
-                            <th className="px-3 py-2 font-medium text-gray-700 dark:text-gray-200">Time</th>
-                            <th className="px-3 py-2 font-medium text-gray-700 dark:text-gray-200">Title</th>
-                            <th className="px-3 py-2 font-medium text-gray-700 dark:text-gray-200">Provider</th>
-                            <th className="px-3 py-2 font-medium text-gray-700 dark:text-gray-200">Status</th>
-                            <th className="px-3 py-2 font-medium text-gray-700 dark:text-gray-200">Appointment ID</th>
-                          </tr>
-                        </thead>
-                        <tbody>
-                          {filteredAppointments.slice(0, 50).map((a: any) => {
-                            const scheduled = String(a.scheduledAt || a.scheduled_at || "").replace("T", " ");
-                            const dateOnly = scheduled.slice(0, 10) || "-";
-                            const timeOnly = scheduled.slice(11, 16) || "-";
-                            const provider = usersData?.find?.(
-                              (u: any) => u.id?.toString() === (a.providerId ?? a.provider_id)?.toString(),
-                            );
-                            const providerName = provider ? `${provider.firstName || ""} ${provider.lastName || ""}`.trim() : "Unknown";
-                            const title = a.title || a.service_name || `Appointment with ${providerName}`;
-                            const status = String(a.status || "scheduled");
-                            const statusLc = status.toLowerCase();
-                            const badge =
-                              statusLc === "scheduled"
-                                ? "bg-blue-100 text-blue-700"
-                                : statusLc === "completed"
-                                  ? "bg-green-100 text-green-700"
-                                  : "bg-gray-100 text-gray-700";
-                            return (
-                              <tr key={a.id ?? a.appointmentId ?? a.appointment_id} className="border-b last:border-b-0">
-                                <td className="px-3 py-2 text-gray-700 dark:text-gray-200 whitespace-nowrap">{dateOnly}</td>
-                                <td className="px-3 py-2 text-gray-700 dark:text-gray-200 whitespace-nowrap">{timeOnly}</td>
-                                <td className="px-3 py-2 text-gray-900 dark:text-gray-100">{title}</td>
-                                <td className="px-3 py-2 text-gray-700 dark:text-gray-200 whitespace-nowrap">{providerName}</td>
-                                <td className="px-3 py-2">
-                                  <span className={`text-xs px-2 py-1 rounded ${badge}`}>{status}</span>
-                                </td>
-                                <td className="px-3 py-2 text-gray-700 dark:text-gray-200 whitespace-nowrap">
-                                  {a.appointmentId || a.appointment_id || "-"}
-                                </td>
-                              </tr>
-                            );
-                          })}
-                        </tbody>
-                      </table>
-                    </div>
-                    {filteredAppointments.length > 50 ? (
-                      <div className="px-3 py-2 text-xs text-gray-500 border-t bg-gray-50 dark:bg-slate-800">
-                        Showing first 50 of {filteredAppointments.length} appointments.
-                      </div>
-                    ) : null}
-                  </div>
-                )}
-              </CardContent>
-            </Card>
-          )}
           </TabsContent>
 
           <TabsContent value="patients" className="space-y-4 lg:space-y-6">
@@ -6239,6 +5823,10 @@ export default function AnalyticsPage() {
               <CardContent className="pt-4 pb-4">
                 <div className="flex flex-wrap gap-3 items-end">
                   <div className="flex flex-col gap-1">
+                    <label className="text-xs font-medium text-gray-500 dark:text-gray-400">Treatment Analytics Title</label>
+                    <input type="text" placeholder="e.g. Q1 Treatment Summary" value={tdChartTitle} onChange={e => setTdChartTitle(e.target.value)} className="h-9 px-3 rounded-md border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-900 text-sm w-52" />
+                  </div>
+                  <div className="flex flex-col gap-1">
                     <label className="text-xs font-medium text-gray-500 dark:text-gray-400">Start Date</label>
                     <input type="date" value={tdStartDate} onChange={e => setTdStartDate(e.target.value)} className="h-9 px-3 rounded-md border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-900 text-sm" />
                   </div>
@@ -6256,10 +5844,6 @@ export default function AnalyticsPage() {
                       <option value="treatment">Treatment</option>
                       <option value="procedure">Procedure</option>
                     </select>
-                  </div>
-                  <div className="flex flex-col gap-1">
-                    <label className="text-xs font-medium text-gray-500 dark:text-gray-400">Treatment Analytics Title</label>
-                    <input type="text" placeholder="e.g. Q1 Treatment Summary" value={tdChartTitle} onChange={e => setTdChartTitle(e.target.value)} className="h-9 px-3 rounded-md border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-900 text-sm w-52" />
                   </div>
                   <div className="flex flex-col gap-1">
                     <label className="text-xs font-medium text-gray-500 dark:text-gray-400">Chart Type</label>

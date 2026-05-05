@@ -1618,14 +1618,24 @@ export class DatabaseStorage implements IStorage {
       // Check for time conflicts
       const appointmentStart = new Date(appointment.scheduledAt);
       const appointmentEnd = new Date(appointmentStart.getTime() + (appointment.duration || 30) * 60 * 1000);
+      const now = new Date();
       const conflicts = existingAppointments.filter(existing => {
-        // Exclude cancelled appointments - they are available for rebooking
-        if (existing.status === 'cancelled') {
+        const st = String(existing.status ?? "")
+          .toLowerCase()
+          .trim()
+          .replace(/\s+/g, "_");
+        // Exclude cancelled/completed appointments - they should not block rebooking
+        if (st === 'cancelled' || st === 'canceled' || st === 'completed' || st === "rescheduled") {
           return false;
         }
         
         const existingStart = new Date(existing.scheduledAt);
         const existingEnd = new Date(existingStart.getTime() + (existing.duration || 30) * 60 * 1000);
+        // Do not block booking if the existing appointment is currently ongoing.
+        // Its status will typically be updated after it finishes.
+        if (existingStart <= now && now < existingEnd) {
+          return false;
+        }
         // Check if the time ranges overlap
         return (appointmentStart < existingEnd && appointmentEnd > existingStart);
       });

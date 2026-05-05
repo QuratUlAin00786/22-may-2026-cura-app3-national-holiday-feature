@@ -55,6 +55,12 @@ function formatAppointmentStatusLabel(status: unknown): string {
     .join(" ");
 }
 
+function isNonBlockingForRebook(status: unknown): boolean {
+  const s = normalizeAppointmentStatusForDup(status)
+    .replace(/\s+/g, "_");
+  return s === "completed" || s === "cancelled" || s === "canceled" || s === "rescheduled";
+}
+
 import { useToast } from "@/hooks/use-toast";
 import { useQuery } from "@tanstack/react-query";
 import { apiRequest, getTenantSubdomain } from "@/lib/queryClient";
@@ -153,16 +159,20 @@ function parseScheduledAtAsLocal(value: string | Date): Date {
 
 const statusColors = {
   scheduled: "text-white",
-  completed: "text-white", 
+  completed: "text-white",
   cancelled: "text-white",
-  no_show: "text-white"
+  no_show: "text-white",
+  in_progress: "text-emerald-700"
+  ,rescheduled: "text-black"
 };
 
 const statusBgColors = {
   scheduled: "#4A7DFF",  // Bluewave
-  completed: "#6CFFEB",  // Mint Drift
+  completed: "#BBF7D0",  // Light Green
+  in_progress: "#DCFCE7", // Lighter Green
   cancelled: "#162B61",  // Midnight
-  no_show: "#9B9EAF"     // Steel
+  no_show: "#9B9EAF",     // Steel
+  rescheduled: "#F3F4F6"  // Light gray
 };
 
 const typeColors = {
@@ -283,6 +293,15 @@ export default function AppointmentCalendar({ onNewAppointment }: { onNewAppoint
   const [viewMode, setViewMode] = useState<"month" | "week" | "day">("month");
   const [selectedAppointment, setSelectedAppointment] = useState<any>(null);
   const [showAppointmentDetails, setShowAppointmentDetails] = useState(false);
+  const [isEditingAppointmentStatus, setIsEditingAppointmentStatus] = useState(false);
+  const [appointmentStatusDraft, setAppointmentStatusDraft] = useState<string>("");
+  const [editingListAppointmentId, setEditingListAppointmentId] = useState<number | null>(null);
+  const [listAppointmentStatusDraft, setListAppointmentStatusDraft] = useState<string>("");
+  const [updatingStatusAppointmentId, setUpdatingStatusAppointmentId] = useState<number | null>(null);
+  const [showProviderTimeConflict, setShowProviderTimeConflict] = useState(false);
+  const [providerTimeConflicts, setProviderTimeConflicts] = useState<any[]>([]);
+  const [pendingCreateAppointmentPayload, setPendingCreateAppointmentPayload] = useState<any | null>(null);
+  const [updatingConflictAppointmentId, setUpdatingConflictAppointmentId] = useState<number | null>(null);
   const [showShareBookingDialog, setShowShareBookingDialog] = useState(false);
   const [shareBookingEmail, setShareBookingEmail] = useState("");
   const [shareBookingDoctorId, setShareBookingDoctorId] = useState<string>("");
@@ -374,6 +393,7 @@ export default function AppointmentCalendar({ onNewAppointment }: { onNewAppoint
   const [showPatientOverlapConflict, setShowPatientOverlapConflict] = useState(false);
   const [patientOverlapConflictRecord, setPatientOverlapConflictRecord] = useState<any | null>(null);
   const [duplicateResolveStatus, setDuplicateResolveStatus] = useState<string>("completed");
+  const [pendingDuplicateCreatePayload, setPendingDuplicateCreatePayload] = useState<any | null>(null);
   const [newAppointmentDate, setNewAppointmentDate] = useState<Date | undefined>(undefined);
   const [newSelectedTimeSlot, setNewSelectedTimeSlot] = useState<string>("");
   const [selectedRole, setSelectedRole] = useState<string>("");
@@ -482,6 +502,11 @@ export default function AppointmentCalendar({ onNewAppointment }: { onNewAppoint
   // State for appointment ID filter (admin only)
   const [appointmentIdFilter, setAppointmentIdFilter] = useState<string>("all");
   const [appointmentIdPopoverOpen, setAppointmentIdPopoverOpen] = useState(false);
+
+  // Admin: default show only active appointments (scheduled/in_progress)
+  const [adminStatusFilter, setAdminStatusFilter] = useState<
+    "active" | "scheduled" | "in_progress" | "completed" | "cancelled" | "rescheduled" | "no_show" | "all"
+  >("active");
 
 
   // Convert time slot string to 24-hour format
@@ -756,18 +781,36 @@ const parseShiftTimeToMinutes = (time?: string): number => {
         return false;
       }
       
-      // Exclude cancelled appointments - treat them as available slots
-      if (apt.status === 'cancelled') {
-        console.log('[Availability Check] Excluding cancelled appointment:', apt.id);
+      const st = String(apt.status ?? "")
+        .toLowerCase()
+        .trim()
+        .replace(/\s+/g, "_");
+
+      // Exclude cancelled/completed appointments - treat them as available slots
+      if (st === 'cancelled' || st === 'canceled' || st === 'completed' || st === "rescheduled") {
+        console.log('[Availability Check] Excluding non-blocking appointment:', apt.id, st);
         return false;
       }
       
       // Determine which provider to check: editing appointment's provider or selected provider for new appointments
-      const providerToCheck = editingAppointment ? editingAppointment.providerId : (selectedProviderId ? parseInt(selectedProviderId) : null);
+      const providerToCheck = editingAppointment
+        ? Number(editingAppointment.providerId ?? (editingAppointment as any).provider_id)
+        : (selectedProviderId ? Number(selectedProviderId) : null);
+      // IMPORTANT UX RULE:
+      // - While booking (admin/nurse/doctor), time slots should reflect provider availability only.
+      // - Patient conflicts are handled on confirmation/server-side (and via conflict modal).
+      // - Only patient-self booking should disable slots by patient overlaps.
+      const patientToCheck =
+        user?.role === "patient"
+          ? (editingAppointment
+              ? (editingAppointment.patientId ?? (editingAppointment as any).patient_id ?? null)
+              : (newAppointmentData?.patientId ? parseInt(newAppointmentData.patientId) : null))
+          : null;
+      const aptProviderId = Number(apt?.providerId ?? (apt as any).provider_id);
       
       // Only check appointments for the relevant provider
-      if (providerToCheck && apt.providerId !== providerToCheck) {
-        return false;
+      if (providerToCheck && aptProviderId !== providerToCheck) {
+        // still may conflict by patient; don't early-return yet
       }
       
       // Parse scheduledAt as local time (handles ISO and PostgreSQL timestamp formats)
@@ -788,21 +831,32 @@ const parseShiftTimeToMinutes = (time?: string): number => {
       const hasConflict = slotStartMinutes < aptEndMinutes && slotEndMinutes > aptStartMinutes;
       
       if (hasConflict) {
+        const isProviderConflict = providerToCheck && aptProviderId === providerToCheck;
+        const isPatientConflict =
+          patientToCheck != null &&
+          (Number(apt.patientId ?? (apt as any).patient_id) === Number(patientToCheck));
+
+        if (!isProviderConflict && !isPatientConflict) {
+          return false;
+        }
         console.log('[Availability Check] ❌ CONFLICT DETECTED:', {
           slot: timeSlot,
           slotRange: `${slotStartMinutes}-${slotEndMinutes} mins`,
           providerChecking: providerToCheck,
+          patientChecking: patientToCheck,
           conflictingAppointment: {
             id: apt.id,
-            providerId: apt.providerId,
+            providerId: aptProviderId,
+            patientId: apt.patientId ?? (apt as any).patient_id,
             time: `${aptDate.getHours().toString().padStart(2, "0")}:${aptDate.getMinutes().toString().padStart(2, "0")}`,
             range: `${aptStartMinutes}-${aptEndMinutes} mins`,
             duration: aptDuration
           }
         });
+        return true;
       }
       
-      return hasConflict;
+      return false;
     });
     
     return !isBooked;
@@ -1024,10 +1078,11 @@ const parseShiftTimeToMinutes = (time?: string): number => {
       await queryClient.invalidateQueries({ queryKey: ["/api/appointments"] });
       await queryClient.refetchQueries({ queryKey: ["/api/appointments"] });
       const st = normalizeAppointmentStatusForDup(variables.status);
-      if (st === "completed" || st === "cancelled") {
+      if (st === "completed" || st === "cancelled" || st === "rescheduled") {
         setShowDuplicateWarning(false);
         setDuplicateAppointment(null);
         setDuplicateAppointmentDetails("");
+        setPendingDuplicateCreatePayload(null);
         setShowConfirmationDialog(true);
         toast({
           title: "Status updated",
@@ -1068,8 +1123,163 @@ const parseShiftTimeToMinutes = (time?: string): number => {
     },
   });
 
+  const updateAppointmentStatusMutation = useMutation({
+    mutationFn: async ({ appointmentId, status }: { appointmentId: number; status: string }) => {
+      const response = await apiRequest("PATCH", `/api/appointments/${appointmentId}`, { status });
+      if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(errorText || "Failed to update appointment status");
+      }
+      return response.json();
+    },
+    onMutate: ({ appointmentId }) => {
+      setUpdatingStatusAppointmentId(Number(appointmentId));
+    },
+    onSuccess: async (data) => {
+      await queryClient.invalidateQueries({ queryKey: ["/api/appointments"] });
+      await queryClient.refetchQueries({ queryKey: ["/api/appointments"] });
+      setSelectedAppointment((prev: any) => ({ ...(prev ?? {}), ...(data ?? {}) }));
+      toast({ title: "Status updated", description: "Appointment status has been updated." });
+    },
+    onError: (error: any) => {
+      toast({
+        title: "Update failed",
+        description: error?.message || "Could not update appointment status.",
+        variant: "destructive",
+      });
+    },
+    onSettled: () => {
+      setUpdatingStatusAppointmentId(null);
+    },
+  });
+
+  const updateConflictAppointmentStatusMutation = useMutation({
+    mutationFn: async ({ id, status }: { id: number; status: string }) => {
+      const response = await apiRequest("PATCH", `/api/appointments/${id}`, { status });
+      if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(errorText || "Failed to update appointment status");
+      }
+      return response.json();
+    },
+    onMutate: ({ id }) => setUpdatingConflictAppointmentId(Number(id)),
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: ["/api/appointments"] });
+      await queryClient.refetchQueries({ queryKey: ["/api/appointments"] });
+    },
+    onError: (error: any) => {
+      toast({
+        title: "Update failed",
+        description: error?.message || "Could not update appointment status.",
+        variant: "destructive",
+      });
+    },
+    onSettled: () => setUpdatingConflictAppointmentId(null),
+  });
+
+  const fetchConflictDetailsFromServer = useCallback(async (payload: any) => {
+    const patientId = Number(payload?.patientId);
+    const providerId = Number(payload?.providerId);
+    const scheduledAt = String(payload?.scheduledAt || "");
+    if (!patientId || !providerId || !scheduledAt) return [];
+
+    try {
+      const res = await apiRequest("POST", "/api/appointments/check-conflicts", {
+        patientId,
+        providerId,
+        scheduledAt,
+      });
+      const data = await res.json();
+      const providerConflict = Array.isArray(data?.providerConflict) ? data.providerConflict : [];
+      // Map server rows to our conflict shape
+      return providerConflict.map((c: any) => ({
+        id: c.id ?? c.appointment_id,
+        appointmentId: c.appointmentId ?? c.appointment_id,
+        scheduledAt: c.scheduledAt ?? c.scheduled_at,
+        duration: c.duration,
+        status: c.status,
+        title: c.title,
+        patientId: c.patientId ?? c.patient_id,
+        providerId: c.providerId ?? c.provider_id,
+        createdBy: c.createdBy ?? c.created_by,
+      }));
+    } catch {
+      return [];
+    }
+  }, []);
+
+  const buildLocalProviderConflicts = useCallback(
+    (opts: {
+      providerId: number;
+      scheduledAt: string;
+      duration?: number | string | null;
+      appointmentsList?: any[] | null;
+    }) => {
+      const providerId = Number(opts.providerId);
+      if (!providerId || !opts.scheduledAt) return [];
+      const newStart = parseScheduledAtAsLocal(opts.scheduledAt);
+      const newDur = opts.duration != null && Number(opts.duration) > 0 ? Number(opts.duration) : 30;
+      const newEnd = new Date(newStart.getTime() + newDur * 60 * 1000);
+      if (Number.isNaN(newStart.getTime()) || Number.isNaN(newEnd.getTime())) return [];
+
+      const getProviderId = (a: any) =>
+        Number(
+          a?.providerId ??
+            a?.provider_id ??
+            a?.doctorId ??
+            a?.doctor_id ??
+            a?.staffId ??
+            a?.staff_id ??
+            a?.userId ??
+            a?.user_id,
+        );
+      const getPatientId = (a: any) => Number(a?.patientId ?? a?.patient_id);
+
+      const cached = queryClient.getQueryData<any[]>(["/api/appointments"]);
+      const list = Array.isArray(opts.appointmentsList) ? opts.appointmentsList : (Array.isArray(cached) ? cached : []);
+      const now = new Date();
+      const normalizeStatus = (raw: any) =>
+        String(raw || "")
+          .trim()
+          .toLowerCase()
+          .replace(/\s+/g, "_");
+      return list
+        .filter((a: any) => getProviderId(a) === providerId)
+        .filter((a: any) => {
+          const st = normalizeStatus(a?.status);
+          return st !== "completed" && st !== "cancelled" && st !== "canceled" && st !== "rescheduled";
+        })
+        .map((a: any) => {
+          const at = a?.scheduledAt ?? a?.scheduled_at;
+          const start = at ? parseScheduledAtAsLocal(at) : new Date(NaN);
+          const dur = a?.duration != null && Number(a.duration) > 0 ? Number(a.duration) : 30;
+          const end = new Date(start.getTime() + dur * 60 * 1000);
+          return { a, start, end };
+        })
+        .filter(({ start, end }) => !Number.isNaN(start.getTime()) && !Number.isNaN(end.getTime()))
+        .filter(({ start, end }) => !(start <= now && now < end))
+        .filter(({ start, end }) => newStart < end && newEnd > start)
+        .map(({ a }) => ({
+          id: a.id ?? a.appointment_id,
+          appointmentId: a.appointmentId ?? a.appointment_id,
+          scheduledAt: a.scheduledAt ?? a.scheduled_at,
+          duration: a.duration,
+          status: a.status,
+          title: a.title,
+          patientId: getPatientId(a),
+          providerId: getProviderId(a),
+          createdBy: a.createdBy ?? a.created_by,
+        }));
+    },
+    [queryClient],
+  );
+
   // Check for appointment conflicts before creation
-  const checkAppointmentConflicts = async (patientId: number, providerId: number, scheduledAt: string): Promise<{ hasConflict: boolean; message: string }> => {
+  const checkAppointmentConflicts = async (
+    patientId: number,
+    providerId: number,
+    scheduledAt: string,
+  ): Promise<{ hasConflict: boolean; message: string; patientConflict?: any[]; providerConflict?: any[] }> => {
     try {
       const response = await apiRequest("POST", "/api/appointments/check-conflicts", {
         patientId,
@@ -1082,21 +1292,25 @@ const parseShiftTimeToMinutes = (time?: string): number => {
         if (result.patientConflict?.length > 0) {
           return {
             hasConflict: true,
-            message: "This patient already has an appointment at this date and time with another doctor."
+            message: "This patient already has an appointment at this date and time with another doctor.",
+            patientConflict: Array.isArray(result.patientConflict) ? result.patientConflict : [],
+            providerConflict: Array.isArray(result.providerConflict) ? result.providerConflict : [],
           };
         }
         if (result.providerConflict?.length > 0) {
           return {
             hasConflict: true,
-            message: "This doctor already has an appointment at this date and time with another patient."
+            message: "This doctor already has an appointment at this date and time with another patient.",
+            patientConflict: Array.isArray(result.patientConflict) ? result.patientConflict : [],
+            providerConflict: Array.isArray(result.providerConflict) ? result.providerConflict : [],
           };
         }
       }
       
-      return { hasConflict: false, message: "" };
+      return { hasConflict: false, message: "", patientConflict: [], providerConflict: [] };
     } catch (error) {
       console.error("Error checking appointment conflicts:", error);
-      return { hasConflict: false, message: "" };
+      return { hasConflict: false, message: "", patientConflict: [], providerConflict: [] };
     }
   };
 
@@ -2345,6 +2559,39 @@ Medical License: [License Number]
   
   console.log("[Calendar] Final processed appointments count:", appointments.length);
   console.log("[Calendar] All appointments:", appointments.map((apt: any) => ({ id: apt.id, title: apt.title, scheduledAt: apt.scheduledAt })));
+
+  useEffect(() => {
+    if (!showProviderTimeConflict) return;
+    if (providerTimeConflicts.length > 0) return;
+    if (!pendingCreateAppointmentPayload?.providerId || !pendingCreateAppointmentPayload?.scheduledAt) return;
+
+    const inferred = buildLocalProviderConflicts({
+      providerId: Number(pendingCreateAppointmentPayload.providerId),
+      scheduledAt: String(pendingCreateAppointmentPayload.scheduledAt || ""),
+      duration: pendingCreateAppointmentPayload.duration,
+      appointmentsList: appointments,
+    });
+    if (inferred.length > 0) {
+      setProviderTimeConflicts(inferred);
+      return;
+    }
+
+    // If we couldn't infer locally (even though we have appointments loaded),
+    // ask the backend check-conflicts endpoint for the exact conflicting appointment(s).
+    (async () => {
+      const serverConflicts = await fetchConflictDetailsFromServer(pendingCreateAppointmentPayload);
+      if (serverConflicts.length > 0) {
+        setProviderTimeConflicts(serverConflicts);
+      }
+    })();
+  }, [
+    showProviderTimeConflict,
+    providerTimeConflicts.length,
+    pendingCreateAppointmentPayload,
+    buildLocalProviderConflicts,
+    appointments,
+    fetchConflictDetailsFromServer,
+  ]);
   
   // Compute unique appointment IDs for the filter dropdown (admin only)
   const uniqueAppointmentIds = useMemo(() => {
@@ -2424,9 +2671,26 @@ Medical License: [License Number]
   };
 
   const selectedDateAppointments = getAppointmentsForDate(selectedDate).filter((apt: any) => {
+    const st = String(apt?.status ?? "")
+      .toLowerCase()
+      .trim()
+      .replace(/\s+/g, "_");
+
     // Apply appointment ID filter for admin users
     const matchesAppointmentId = appointmentIdFilter === "all" || apt.appointmentId === appointmentIdFilter;
-    return matchesAppointmentId;
+    if (!matchesAppointmentId) return false;
+
+    // Admin default: show only active statuses unless user selects otherwise
+    if (user?.role === "admin") {
+      if (adminStatusFilter === "all") return true;
+      if (adminStatusFilter === "active") {
+        return st === "scheduled" || st === "confirmed" || st === "in_progress";
+      }
+      if (adminStatusFilter === "scheduled") return st === "scheduled" || st === "confirmed";
+      return st === adminStatusFilter;
+    }
+
+    return true;
   });
 
   const appointmentTimeTick = useAppointmentTimeTick();
@@ -2440,6 +2704,46 @@ Medical License: [License Number]
       ),
     [selectedDateAppointments, nowForCardStyle],
   );
+
+  const nextUpcomingAppointmentId = useMemo(() => {
+    if (!Array.isArray(sortedSelectedDateAppointments) || sortedSelectedDateAppointments.length === 0) return null;
+    const toStartEnd = (apt: any) => {
+      const start = apt?.scheduledAt ? parseScheduledAtAsLocal(apt.scheduledAt) : new Date(NaN);
+      const dur = apt?.duration != null && Number(apt.duration) > 0 ? Number(apt.duration) : 30;
+      const end = new Date(start.getTime() + dur * 60 * 1000);
+      return { start, end };
+    };
+
+    const isActiveForOngoing = (apt: any) => {
+      const st = String(apt?.status ?? "")
+        .toLowerCase()
+        .trim()
+        .replace(/\s+/g, "_");
+      return st === "scheduled" || st === "confirmed" || st === "in_progress";
+    };
+
+    const ongoing = sortedSelectedDateAppointments
+      .map((apt: any) => ({ apt, ...toStartEnd(apt) }))
+      .filter(({ apt }) => isActiveForOngoing(apt))
+      .filter(({ start, end }) => !Number.isNaN(start.getTime()) && start <= nowForCardStyle && end > nowForCardStyle);
+
+    const all = sortedSelectedDateAppointments
+      .map((apt: any) => ({ apt, ...toStartEnd(apt) }))
+      .filter(({ apt }) => isActiveForOngoing(apt))
+      .filter(({ start }) => !Number.isNaN(start.getTime()))
+      .sort((a, b) => a.start.getTime() - b.start.getTime());
+
+    // Preferred: if something is ongoing, "Next" means first appointment after the last ongoing ends.
+    if (ongoing.length > 0) {
+      const maxOngoingEnd = ongoing.reduce((acc, cur) => (cur.end > acc ? cur.end : acc), ongoing[0].end);
+      const afterOngoing = all.filter(({ start }) => start > maxOngoingEnd);
+      if (afterOngoing.length > 0) return Number(afterOngoing[0].apt.id);
+    }
+
+    // Fallback: first upcoming after now.
+    const upcoming = all.filter(({ start }) => start > nowForCardStyle);
+    return upcoming.length > 0 ? Number(upcoming[0].apt.id) : null;
+  }, [sortedSelectedDateAppointments, nowForCardStyle]);
 
   if (isLoading) {
     return (
@@ -2689,10 +2993,32 @@ Medical License: [License Number]
       {/* Selected Date Appointments */}
       <Card>
         <CardHeader>
-          <CardTitle className="flex items-center text-blue-800 dark:text-blue-200">
-            <Calendar className="h-5 w-5 mr-2" />
-            Appointments for {format(selectedDate, "EEEE, MMMM d, yyyy")}
-          </CardTitle>
+          <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+            <CardTitle className="flex items-center text-blue-800 dark:text-blue-200">
+              <Calendar className="h-5 w-5 mr-2" />
+              Appointments for {format(selectedDate, "EEEE, MMMM d, yyyy")}
+            </CardTitle>
+            {user?.role === "admin" && (
+              <div className="flex items-center gap-2">
+                <span className="text-xs font-medium text-gray-600 dark:text-gray-300">Status</span>
+                <Select value={adminStatusFilter} onValueChange={(v) => setAdminStatusFilter(v as any)}>
+                  <SelectTrigger className="h-8 w-[220px]" data-testid="select-admin-status-filter">
+                    <SelectValue placeholder="Filter by status" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="active">Scheduled / In Progress</SelectItem>
+                    <SelectItem value="scheduled">Scheduled</SelectItem>
+                    <SelectItem value="in_progress">In Progress</SelectItem>
+                    <SelectItem value="completed">Completed</SelectItem>
+                    <SelectItem value="cancelled">Cancelled</SelectItem>
+                    <SelectItem value="rescheduled">Rescheduled</SelectItem>
+                    <SelectItem value="no_show">No Show</SelectItem>
+                    <SelectItem value="all">All</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+            )}
+          </div>
         </CardHeader>
         <CardContent>
           {selectedDateAppointments.length === 0 ? (
@@ -2716,7 +3042,15 @@ Medical License: [License Number]
                     )}
                     onMouseDown={(e) => e.preventDefault()}
                   >
-                    {cardTimeKind === "ongoing" && (
+                    {(() => {
+                      const st = String(appointment?.status ?? "")
+                        .toLowerCase()
+                        .trim()
+                        .replace(/\s+/g, "_");
+                      const allowOngoing =
+                        st === "scheduled" || st === "confirmed" || st === "in_progress";
+                      return allowOngoing && cardTimeKind === "ongoing";
+                    })() && (
                       <Badge
                         className={cn(
                           appointmentOngoingBadgeClassName,
@@ -2726,6 +3060,35 @@ Medical License: [License Number]
                         Ongoing
                       </Badge>
                     )}
+                    {(() => {
+                      if (cardTimeKind !== "past") return false;
+                      const st = String(appointment?.status ?? "")
+                        .toLowerCase()
+                        .trim()
+                        .replace(/\s+/g, "_");
+                      // Show "Completed" badge for past appointments (grey background) unless explicitly non-completed outcomes.
+                      return st !== "cancelled" && st !== "canceled" && st !== "rescheduled" && st !== "no_show";
+                    })() && (
+                      <Badge
+                        className={cn(
+                          appointmentOngoingBadgePositionClassName,
+                          "bg-gray-100 text-gray-700 border border-gray-300 dark:bg-slate-700/40 dark:text-gray-200 dark:border-slate-600 text-xs",
+                        )}
+                      >
+                        Completed
+                      </Badge>
+                    )}
+                    {nextUpcomingAppointmentId != null &&
+                      Number(appointment.id) === Number(nextUpcomingAppointmentId) && (
+                        <Badge
+                          className={cn(
+                            appointmentOngoingBadgePositionClassName,
+                            "bg-indigo-100 text-indigo-800 dark:bg-indigo-900/40 dark:text-indigo-200 text-xs",
+                          )}
+                        >
+                          Next
+                        </Badge>
+                      )}
                     {user?.role === 'admin' && appointment.appointmentId && (
                       <Badge
                         className="absolute top-1.5 left-2 text-xs bg-blue-100 text-blue-800 dark:bg-blue-900 dark:text-blue-200"
@@ -2741,22 +3104,97 @@ Medical License: [License Number]
                       }}
                     >
                       <div className="flex flex-col">
-                        <Badge
-                          style={{
-                            backgroundColor:
-                              statusBgColors[appointment.status as keyof typeof statusBgColors] ||
-                              statusBgColors.scheduled,
-                            color:
+                        {user?.role === "admin" && editingListAppointmentId === Number(appointment.id) ? (
+                          <div className="flex flex-col items-start gap-1">
+                            <div className="flex items-center gap-2">
+                              <Select
+                                value={listAppointmentStatusDraft || String(appointment.status || "scheduled")}
+                                onValueChange={async (value) => {
+                                  const next = String(value || "").toLowerCase();
+                                  setListAppointmentStatusDraft(next);
+                                  await updateAppointmentStatusMutation.mutateAsync({
+                                    appointmentId: Number(appointment.id),
+                                    status: next,
+                                  });
+                                  setEditingListAppointmentId(null);
+                                }}
+                              >
+                                <SelectTrigger className="h-7 w-[160px]" data-testid={`select-status-${appointment.id}`}>
+                                  <SelectValue placeholder="Select status" />
+                                </SelectTrigger>
+                                <SelectContent>
+                                  <SelectItem value="scheduled">Scheduled</SelectItem>
+                                  <SelectItem value="confirmed">Confirmed</SelectItem>
+                                  <SelectItem value="in_progress">In Progress</SelectItem>
+                                  <SelectItem value="rescheduled">Rescheduled</SelectItem>
+                                  <SelectItem value="completed">Completed</SelectItem>
+                                  <SelectItem value="cancelled">Cancelled</SelectItem>
+                                  <SelectItem value="no_show">No Show</SelectItem>
+                                </SelectContent>
+                              </Select>
+                              <Button
+                                variant="ghost"
+                                size="sm"
+                                className="h-7 px-2"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  setEditingListAppointmentId(null);
+                                }}
+                                data-testid={`button-cancel-status-edit-${appointment.id}`}
+                              >
+                                <X className="h-4 w-4" />
+                              </Button>
+                            </div>
+                            {updatingStatusAppointmentId === Number(appointment.id) && (
+                              <span className="text-[10px] text-gray-500 dark:text-gray-400">
+                                Updating status...
+                              </span>
+                            )}
+                          </div>
+                        ) : (
+                          <Badge
+                            className={cn(
+                              user?.role === "admin" && "cursor-pointer select-none",
                               String(appointment.status || "")
                                 .toLowerCase()
                                 .trim()
-                                .replace(/\s+/g, "_") === "completed"
-                                ? "#000000"
-                                : "#ffffff",
-                          }}
-                        >
-                          {appointment.status.replace('_', ' ').toUpperCase()}
-                        </Badge>
+                                .replace(/\s+/g, "_") === "rescheduled" &&
+                                "border border-gray-600 bg-gray-100 text-black",
+                            )}
+                            style={{
+                              backgroundColor:
+                                statusBgColors[appointment.status as keyof typeof statusBgColors] ||
+                                statusBgColors.scheduled,
+                              color:
+                                String(appointment.status || "")
+                                  .toLowerCase()
+                                  .trim()
+                                  .replace(/\s+/g, "_") === "completed"
+                                  ? "#000000"
+                                  : String(appointment.status || "")
+                                        .toLowerCase()
+                                        .trim()
+                                        .replace(/\s+/g, "_") === "in_progress"
+                                    ? "#047857"
+                                  : String(appointment.status || "")
+                                        .toLowerCase()
+                                        .trim()
+                                        .replace(/\s+/g, "_") === "rescheduled"
+                                    ? "#000000"
+                                  : "#ffffff",
+                            }}
+                            onClick={(e) => {
+                              if (user?.role !== "admin") return;
+                              e.stopPropagation();
+                              setEditingListAppointmentId(Number(appointment.id));
+                              setListAppointmentStatusDraft(String(appointment.status || "scheduled"));
+                            }}
+                            data-testid={`badge-status-${appointment.id}`}
+                          >
+                            {String(appointment.status || "scheduled").replace("_", " ").toUpperCase()}
+                            {user?.role === "admin" && <Edit className="h-3 w-3 ml-1 opacity-70" />}
+                          </Badge>
+                        )}
                       </div>
                       <div>
                         <div className="flex items-center space-x-2">
@@ -2782,6 +3220,13 @@ Medical License: [License Number]
                           Service: {serviceInfo.label}
                         </p>
                       )}
+                      {user?.role === "admin" &&
+                        appointment.description != null &&
+                        String(appointment.description).trim() !== "" && (
+                          <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">
+                            Description: {String(appointment.description).trim()}
+                          </p>
+                        )}
                         {user?.role !== "admin" && (
                           <div className="flex items-center space-x-2 mt-1">
                             <Clock className="h-4 w-4 text-gray-400" />
@@ -2795,7 +3240,7 @@ Medical License: [License Number]
                             {(() => {
                               const allergies = getPatientAllergiesLabel(appointment.patientId);
                               return allergies ? (
-                                <Badge className="text-[10px] px-2 py-0.5 bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-200 whitespace-normal">
+                                <Badge className="text-[10px] px-2 py-0.5 bg-white border border-yellow-400 text-amber-800 dark:bg-transparent dark:border-yellow-500/60 dark:text-amber-200 whitespace-normal">
                                   Allergies: {allergies}
                                 </Badge>
                               ) : null;
@@ -2803,7 +3248,7 @@ Medical License: [License Number]
                             {(() => {
                               const specialRequirements = getPatientSpecialRequirementsLabel(appointment.patientId);
                               return specialRequirements ? (
-                                <Badge className="text-[10px] px-2 py-0.5 bg-indigo-100 text-indigo-800 dark:bg-indigo-900/40 dark:text-indigo-200 whitespace-normal">
+                                <Badge className="text-[10px] px-2 py-0.5 bg-white border border-gray-300 text-gray-700 dark:bg-transparent dark:border-gray-600 dark:text-gray-200 whitespace-normal">
                                   Special Requirements: {specialRequirements}
                                 </Badge>
                               ) : null;
@@ -2846,7 +3291,11 @@ Medical License: [License Number]
                             </div>
                           ) : null;
                         })()}
-                        {appointment.providerId && (() => {
+                        {user?.role !== "admin" &&
+                          user?.role?.toLowerCase() !== "nurse" &&
+                          user?.role?.toLowerCase() !== "doctor" &&
+                          appointment.providerId &&
+                          (() => {
                           const provider = usersData?.find((u: any) => u.id === appointment.providerId);
                           return provider ? (
                             <div className="mt-2">
@@ -2921,7 +3370,15 @@ Medical License: [License Number]
 
       {/* Appointment Details Dialog */}
         <Dialog open={showAppointmentDetails} onOpenChange={setShowAppointmentDetails}>
-        <DialogContent className="max-w-2xl">
+        <DialogContent
+          className="max-w-2xl"
+          onInteractOutside={(e) => {
+            if (user?.role === "admin") e.preventDefault();
+          }}
+          onEscapeKeyDown={(e) => {
+            if (user?.role === "admin") e.preventDefault();
+          }}
+        >
           {selectedAppointment && (
             <div>
               <DialogHeader>
@@ -2940,7 +3397,69 @@ Medical License: [License Number]
               
                 <div className="bg-white dark:bg-slate-800 border border-gray-200 dark:border-gray-700 rounded-xl px-4 py-3 mt-4 shadow-sm">
                   <div className="flex items-center justify-between text-xs uppercase tracking-wide text-gray-500 dark:text-gray-400">
-                    <span>{selectedAppointment.status?.toUpperCase() || "Scheduled"}</span>
+                    <div className="flex items-center gap-2">
+                      {!isEditingAppointmentStatus ? (
+                        <Badge
+                          variant="outline"
+                          className="px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide cursor-pointer select-none"
+                          onClick={() => {
+                            if (user?.role !== "admin") return;
+                            setAppointmentStatusDraft(String(selectedAppointment.status || "scheduled"));
+                            setIsEditingAppointmentStatus(true);
+                          }}
+                          data-testid="badge-appointment-status"
+                        >
+                          <span>{String(selectedAppointment.status || "scheduled").toUpperCase()}</span>
+                          {user?.role === "admin" && (
+                            <Edit className="h-3 w-3 ml-1 opacity-70" />
+                          )}
+                        </Badge>
+                      ) : (
+                        <div className="flex flex-col items-start gap-1">
+                          <div className="flex items-center gap-2">
+                            <Select
+                              value={appointmentStatusDraft || "scheduled"}
+                              onValueChange={async (value) => {
+                                const next = String(value || "").toLowerCase();
+                                setAppointmentStatusDraft(next);
+                                if (!selectedAppointment?.id) return;
+                                await updateAppointmentStatusMutation.mutateAsync({
+                                  appointmentId: Number(selectedAppointment.id),
+                                  status: next,
+                                });
+                                setIsEditingAppointmentStatus(false);
+                              }}
+                            >
+                              <SelectTrigger className="h-7 w-[160px]" data-testid="select-appointment-status">
+                                <SelectValue placeholder="Select status" />
+                              </SelectTrigger>
+                              <SelectContent>
+                                <SelectItem value="scheduled">Scheduled</SelectItem>
+                                <SelectItem value="confirmed">Confirmed</SelectItem>
+                                <SelectItem value="in_progress">In Progress</SelectItem>
+                                <SelectItem value="completed">Completed</SelectItem>
+                                <SelectItem value="cancelled">Cancelled</SelectItem>
+                                <SelectItem value="no_show">No Show</SelectItem>
+                              </SelectContent>
+                            </Select>
+                            <Button
+                              variant="ghost"
+                              size="sm"
+                              className="h-7 px-2"
+                              onClick={() => setIsEditingAppointmentStatus(false)}
+                              data-testid="button-cancel-status-edit"
+                            >
+                              <X className="h-4 w-4" />
+                            </Button>
+                          </div>
+                          {updatingStatusAppointmentId === Number(selectedAppointment.id) && (
+                            <span className="text-[10px] text-gray-500 dark:text-gray-400">
+                              Updating status...
+                            </span>
+                          )}
+                        </div>
+                      )}
+                    </div>
                     <span>
                       {user?.role === "admin" && selectedAppointment.scheduledAt
                         ? formatAppointmentTimeRange(selectedAppointment)
@@ -2971,6 +3490,13 @@ Medical License: [License Number]
                       <p className="text-xs text-gray-500 dark:text-gray-400">
                         Service: {selectedAppointment.service || selectedAppointment.appointmentType || "N/A"}
                       </p>
+                      {user?.role === "admin" &&
+                        selectedAppointment.description != null &&
+                        String(selectedAppointment.description).trim() !== "" && (
+                          <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">
+                            Description: {String(selectedAppointment.description).trim()}
+                          </p>
+                        )}
                     {user?.role !== "admin" && (
                       <p className="text-xs text-gray-500 dark:text-gray-400">
                         {selectedAppointment.duration || 30} minutes
@@ -4500,6 +5026,29 @@ Medical License: [License Number]
                     <p className="font-medium text-gray-900 dark:text-gray-100">{selectedDuration} minutes</p>
                   </div>
                 </div>
+
+                <div className="grid grid-cols-2 gap-4">
+                  <div>
+                    <p className="text-gray-500 dark:text-gray-400 text-xs">Appointment Type</p>
+                    <p className="font-medium text-gray-900 dark:text-gray-100">
+                      {appointmentType
+                        ? appointmentType.charAt(0).toUpperCase() + appointmentType.slice(1)
+                        : "Not selected"}
+                    </p>
+                  </div>
+                  <div>
+                    <p className="text-gray-500 dark:text-gray-400 text-xs">
+                      {appointmentType === "treatment"
+                        ? "Treatment"
+                        : appointmentType === "consultation"
+                          ? "Consultation"
+                          : "Service"}
+                    </p>
+                    <p className="font-medium text-gray-900 dark:text-gray-100">
+                      {appointmentServicePreview?.name || "Not selected"}
+                    </p>
+                  </div>
+                </div>
                 
                 <div>
                   <p className="text-gray-500 dark:text-gray-400 text-xs">Provider</p>
@@ -4617,9 +5166,13 @@ Medical License: [License Number]
                     {},
                   );
                   if (overlapConfirm.conflict) {
+                    if (isNonBlockingForRebook(overlapConfirm.conflict?.status)) {
+                      // allow rebooking over completed/cancelled/canceled appointments
+                    } else {
                     setPatientOverlapConflictRecord(overlapConfirm.conflict);
                     setShowPatientOverlapConflict(true);
                     return;
+                    }
                   }
 
                   const conflictResult = await checkAppointmentConflicts(
@@ -4629,12 +5182,51 @@ Medical License: [License Number]
                   );
                   
                   if (conflictResult.hasConflict) {
-                    toast({
-                      title: "Appointment Conflict",
-                      description: conflictResult.message,
-                      variant: "destructive",
-                    });
-                    return;
+                    const patientConflict = Array.isArray(conflictResult.patientConflict)
+                      ? conflictResult.patientConflict
+                      : [];
+                    const providerConflict = Array.isArray(conflictResult.providerConflict)
+                      ? conflictResult.providerConflict
+                      : [];
+                    if (patientConflict.length > 0) {
+                      const first = patientConflict[0];
+                      if (isNonBlockingForRebook(first?.status)) {
+                        // allow rebooking over completed/cancelled/canceled/rescheduled appointments
+                        // keep going and create the new appointment
+                      } else {
+                        setPatientOverlapConflictRecord({
+                          ...first,
+                          id: first.id ?? first.appointment_id,
+                          appointmentId: first.appointmentId ?? first.appointment_id,
+                          providerId: first.providerId ?? first.provider_id,
+                          patientId: first.patientId ?? first.patient_id,
+                          scheduledAt: first.scheduledAt ?? first.scheduled_at,
+                        });
+                        setShowPatientOverlapConflict(true);
+                        return;
+                      }
+                    } else if (providerConflict.length > 0) {
+                      // Provider overlap is handled by the 409 conflict modal in the create mutation;
+                      // keep the existing toast here as a fallback for this pre-check.
+                      toast({
+                        title: "Appointment Conflict",
+                        description: conflictResult.message,
+                        variant: "destructive",
+                      });
+                    } else {
+                      toast({
+                        title: "Appointment Conflict",
+                        description: conflictResult.message,
+                        variant: "destructive",
+                      });
+                    }
+                    // If patientConflict existed but was non-blocking (e.g. rescheduled), we intentionally continue.
+                    if (
+                      patientConflict.length === 0 ||
+                      !isNonBlockingForRebook((patientConflict[0] as any)?.status)
+                    ) {
+                      return;
+                    }
                   }
                   
                   // Generate title from patient and provider names
@@ -4698,8 +5290,87 @@ Medical License: [License Number]
                       if (m) {
                         try {
                           const payload = JSON.parse(m[1]);
+                          // Some server branches incorrectly return a raw array of appointments on 409.
+                          // Normalize it into our conflict modal shape.
+                          if (Array.isArray(payload)) {
+                            const providerIdNum = parseInt(selectedProviderId);
+                            const durationNum = Number(selectedDuration || 30);
+                            const inferred = buildLocalProviderConflicts({
+                              providerId: providerIdNum,
+                              scheduledAt: newScheduledAt,
+                              duration: durationNum,
+                              appointmentsList: payload,
+                            });
+                            setPendingCreateAppointmentPayload({
+                              patientId: parseInt(newAppointmentData.patientId),
+                              providerId: parseInt(selectedProviderId),
+                              assignedRole: selectedRole,
+                              title: generatedTitle,
+                              type: normalizedAppointmentType === "treatment" ? "procedure" : "consultation",
+                              appointmentType: normalizedAppointmentType,
+                              treatmentId,
+                              treatment_id: treatmentId,
+                              consultationId,
+                              consultation_id: consultationId,
+                              status: "scheduled",
+                              scheduledAt: newScheduledAt,
+                              duration: selectedDuration,
+                              description: "",
+                              createdBy: user?.id,
+                            });
+                            setProviderTimeConflicts(inferred);
+                            setShowProviderTimeConflict(true);
+                            setShowConfirmationDialog(false);
+                            return;
+                          }
+                          if (payload.code === "PROVIDER_TIME_CONFLICT" && Array.isArray(payload.conflicts)) {
+                            setPendingCreateAppointmentPayload({
+                              patientId: parseInt(newAppointmentData.patientId),
+                              providerId: parseInt(selectedProviderId),
+                              assignedRole: selectedRole,
+                              title: generatedTitle,
+                              type: normalizedAppointmentType === "treatment" ? "procedure" : "consultation",
+                              appointmentType: normalizedAppointmentType,
+                              treatmentId,
+                              treatment_id: treatmentId,
+                              consultationId,
+                              consultation_id: consultationId,
+                              status: "scheduled",
+                              scheduledAt: newScheduledAt,
+                              duration: selectedDuration,
+                              description: "",
+                              createdBy: user?.id,
+                            });
+                            const fallback = buildLocalProviderConflicts({
+                              providerId: parseInt(selectedProviderId),
+                              scheduledAt: newScheduledAt,
+                              duration: selectedDuration,
+                              appointmentsList: appointments,
+                            });
+                            setProviderTimeConflicts(payload.conflicts.length > 0 ? payload.conflicts : fallback);
+                            setShowProviderTimeConflict(true);
+                            setShowConfirmationDialog(false);
+                            return;
+                          }
                           if (payload.code === "DUPLICATE_APPOINTMENT_SERVICE" && payload.message) {
                             const ex = payload.existingAppointment;
+                            setPendingDuplicateCreatePayload({
+                              patientId: parseInt(newAppointmentData.patientId),
+                              providerId: parseInt(selectedProviderId),
+                              assignedRole: selectedRole,
+                              title: generatedTitle,
+                              type: normalizedAppointmentType === "treatment" ? "procedure" : "consultation",
+                              appointmentType: normalizedAppointmentType,
+                              treatmentId,
+                              treatment_id: treatmentId,
+                              consultationId,
+                              consultation_id: consultationId,
+                              status: "scheduled",
+                              scheduledAt: newScheduledAt,
+                              duration: selectedDuration,
+                              description: "",
+                              createdBy: user?.id,
+                            });
                             setDuplicateAppointment(
                               ex
                                 ? {
@@ -4737,6 +5408,234 @@ Medical License: [License Number]
                 {createAppointmentMutation.isPending ? "Confirming..." : "Confirm"}
               </Button>
           </div>
+        </DialogContent>
+      </Dialog>
+
+      {/* Provider Time Conflict Dialog */}
+      <Dialog open={showProviderTimeConflict} onOpenChange={setShowProviderTimeConflict}>
+        <DialogContent className="max-w-2xl" onInteractOutside={(e) => e.preventDefault()}>
+          <DialogHeader>
+            <DialogTitle className="text-xl font-bold text-red-600 dark:text-red-400">
+              Unable to book
+            </DialogTitle>
+            <DialogDescription>
+              The selected provider already has overlapping appointment(s) at this time. Update each overlapping
+              appointment to <span className="font-medium">Completed</span> or <span className="font-medium">Cancelled</span> to continue.
+            </DialogDescription>
+          </DialogHeader>
+
+          <div className="space-y-3 max-h-[55vh] overflow-y-auto">
+            {providerTimeConflicts.length === 0 ? (
+              <div className="space-y-2">
+                {(() => {
+                  const inferred =
+                    pendingCreateAppointmentPayload?.providerId && pendingCreateAppointmentPayload?.scheduledAt
+                      ? buildLocalProviderConflicts({
+                          providerId: Number(pendingCreateAppointmentPayload?.providerId),
+                          scheduledAt: String(pendingCreateAppointmentPayload?.scheduledAt || ""),
+                          duration: pendingCreateAppointmentPayload?.duration,
+                          appointmentsList: appointments,
+                        })
+                      : [];
+                  if (!inferred || inferred.length === 0) return null;
+                  return (
+                    <div className="space-y-2">
+                      <div className="text-sm font-medium text-gray-800 dark:text-gray-200">
+                        Overlapping appointment(s)
+                      </div>
+                      {inferred.map((c: any) => {
+                        const start = c?.scheduledAt ? parseScheduledAtAsLocal(c.scheduledAt) : null;
+                        const dur = c?.duration != null && Number(c.duration) > 0 ? Number(c.duration) : 30;
+                        const end = start ? new Date(start.getTime() + dur * 60 * 1000) : null;
+                        const timeLabel =
+                          start && end && !Number.isNaN(start.getTime()) && !Number.isNaN(end.getTime())
+                            ? `${format(start, "h:mm a")} – ${format(end, "h:mm a")} · ${dur} min`
+                            : "Time unavailable";
+                        const apptId = c?.appointmentId || `#${c?.id ?? "—"}`;
+                        const patient = patientsData?.find((p: any) => Number(p.id) === Number(c?.patientId));
+                        const patientName = patient
+                          ? `${patient.firstName || ""} ${patient.lastName || ""}`.trim()
+                          : (c?.patientId ? `Patient ID: ${c.patientId}` : "Patient");
+                        const provider = usersData?.find((u: any) => Number(u.id) === Number(c?.providerId));
+                        const providerName = provider
+                          ? `${provider.firstName || ""} ${provider.lastName || ""}`.trim()
+                          : (c?.providerId ? `Provider ID: ${c.providerId}` : "Provider");
+                        return (
+                          <div
+                            key={String(c?.id ?? apptId)}
+                            className="border rounded-md p-3 bg-gray-50 dark:bg-slate-800/40"
+                          >
+                            <div className="flex items-start justify-between gap-4">
+                              <div className="min-w-0">
+                                <div className="text-sm font-semibold text-gray-900 dark:text-gray-100">{apptId}</div>
+                                <div className="text-xs text-gray-700 dark:text-gray-300">{timeLabel}</div>
+                                <div className="text-xs text-gray-700 dark:text-gray-300">Patient: {patientName}</div>
+                                <div className="text-xs text-gray-700 dark:text-gray-300">Provider: {providerName}</div>
+                              </div>
+                              <div className="w-[200px]">
+                                <div className="text-[11px] text-gray-600 dark:text-gray-400 mb-1">Status</div>
+                                <Select
+                                  value={String(c?.status || "scheduled")}
+                                  onValueChange={async (value) => {
+                                    const next = String(value || "").toLowerCase();
+                                    const idNum = Number(c?.id);
+                                    if (!idNum) return;
+                                    await updateConflictAppointmentStatusMutation.mutateAsync({ id: idNum, status: next });
+                                    setProviderTimeConflicts((prev) =>
+                                      prev.map((x: any) => (Number(x?.id) === idNum ? { ...x, status: next } : x)),
+                                    );
+                                  }}
+                                >
+                                  <SelectTrigger className="h-8" data-testid={`select-admin-conflict-status-${c?.id}`}>
+                                    <SelectValue placeholder="Select status" />
+                                  </SelectTrigger>
+                                  <SelectContent>
+                                    <SelectItem value="scheduled">Scheduled</SelectItem>
+                                    <SelectItem value="confirmed">Confirmed</SelectItem>
+                                    <SelectItem value="in_progress">In Progress</SelectItem>
+                                    <SelectItem value="completed">Completed</SelectItem>
+                                    <SelectItem value="cancelled">Cancelled</SelectItem>
+                                    <SelectItem value="no_show">No Show</SelectItem>
+                                  </SelectContent>
+                                </Select>
+                              </div>
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  );
+                })()}
+                <div className="text-sm text-gray-600 dark:text-gray-300">
+                  {pendingCreateAppointmentPayload
+                    ? "No conflict details were returned by the server."
+                    : "No conflict details were returned by the server (missing booking payload)."}
+                </div>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={async () => {
+                    if (!pendingCreateAppointmentPayload) return;
+                    await queryClient.refetchQueries({ queryKey: ["/api/appointments"] });
+                    const fallback = buildLocalProviderConflicts({
+                      providerId: Number(pendingCreateAppointmentPayload?.providerId),
+                      scheduledAt: String(pendingCreateAppointmentPayload?.scheduledAt || ""),
+                      duration: pendingCreateAppointmentPayload?.duration,
+                      appointmentsList: appointments,
+                    });
+                    setProviderTimeConflicts(fallback);
+                  }}
+                >
+                  Refresh & detect conflicts
+                </Button>
+                <div className="text-[11px] text-gray-500 dark:text-gray-400">
+                  Debug: providerId={String(pendingCreateAppointmentPayload?.providerId ?? "—")}, scheduledAt=
+                  {String(pendingCreateAppointmentPayload?.scheduledAt ?? "—")}, duration=
+                  {String(pendingCreateAppointmentPayload?.duration ?? "—")}, loadedAppointments=
+                  {Array.isArray(appointments) ? appointments.length : 0}.
+                </div>
+              </div>
+            ) : (
+              providerTimeConflicts.map((c: any) => {
+                const start = c?.scheduledAt ? parseScheduledAtAsLocal(c.scheduledAt) : null;
+                const dur = c?.duration != null && Number(c.duration) > 0 ? Number(c.duration) : 30;
+                const end = start ? new Date(start.getTime() + dur * 60 * 1000) : null;
+                const timeLabel =
+                  start && end && !Number.isNaN(start.getTime()) && !Number.isNaN(end.getTime())
+                    ? `${format(start, "h:mm a")} – ${format(end, "h:mm a")} · ${dur} min`
+                    : "Time unavailable";
+                const resolved = ["completed", "cancelled"].includes(String(c?.status || "").toLowerCase());
+                const apptId = c?.appointmentId || `#${c?.id ?? "—"}`;
+                const patient = patientsData?.find((p: any) => Number(p.id) === Number(c?.patientId));
+                const patientName = patient ? `${patient.firstName || ""} ${patient.lastName || ""}`.trim() : (c?.patientId ? `Patient ID: ${c.patientId}` : "Patient");
+                const provider = usersData?.find((u: any) => Number(u.id) === Number(c?.providerId));
+                const providerName = provider ? `${provider.firstName || ""} ${provider.lastName || ""}`.trim() : (c?.providerId ? `Provider ID: ${c.providerId}` : "Provider");
+
+                return (
+                  <div key={String(c?.id ?? apptId)} className="border rounded-md p-3 bg-gray-50 dark:bg-slate-800/40">
+                    <div className="flex items-start justify-between gap-4">
+                      <div className="min-w-0">
+                        <div className="text-sm font-semibold text-gray-900 dark:text-gray-100">{apptId}</div>
+                        <div className="text-xs text-gray-700 dark:text-gray-300">{timeLabel}</div>
+                        <div className="text-xs text-gray-700 dark:text-gray-300">Patient: {patientName}</div>
+                        <div className="text-xs text-gray-700 dark:text-gray-300">Provider: {providerName}</div>
+                      </div>
+                      <div className="w-[200px]">
+                        <div className="text-[11px] text-gray-600 dark:text-gray-400 mb-1">Status</div>
+                        <Select
+                          value={String(c?.status || "scheduled")}
+                          onValueChange={async (value) => {
+                            const next = String(value || "").toLowerCase();
+                            const idNum = Number(c?.id);
+                            if (!idNum) return;
+                            await updateConflictAppointmentStatusMutation.mutateAsync({ id: idNum, status: next });
+                            setProviderTimeConflicts((prev) =>
+                              prev.map((x: any) => (Number(x?.id) === idNum ? { ...x, status: next } : x)),
+                            );
+                          }}
+                        >
+                          <SelectTrigger className="h-8" data-testid={`select-admin-conflict-status-${c?.id}`}>
+                            <SelectValue placeholder="Select status" />
+                          </SelectTrigger>
+                          <SelectContent>
+                            <SelectItem value="scheduled">Scheduled</SelectItem>
+                            <SelectItem value="confirmed">Confirmed</SelectItem>
+                            <SelectItem value="in_progress">In Progress</SelectItem>
+                            <SelectItem value="completed">Completed</SelectItem>
+                            <SelectItem value="cancelled">Cancelled</SelectItem>
+                            <SelectItem value="no_show">No Show</SelectItem>
+                          </SelectContent>
+                        </Select>
+                        {updatingConflictAppointmentId === Number(c?.id) && (
+                          <div className="text-[10px] text-gray-500 mt-1">Updating status...</div>
+                        )}
+                        {!resolved && (
+                          <div className="text-[10px] text-rose-600 mt-1">
+                            Must be completed/cancelled to proceed
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                );
+              })
+            )}
+          </div>
+
+          <DialogFooter className="gap-2">
+            <Button
+              variant="outline"
+              onClick={() => {
+                setShowProviderTimeConflict(false);
+                setProviderTimeConflicts([]);
+                setPendingCreateAppointmentPayload(null);
+              }}
+            >
+              Cancel
+            </Button>
+            <Button
+              onClick={() => {
+                const allResolved = providerTimeConflicts.every((c: any) =>
+                  ["completed", "cancelled"].includes(String(c?.status || "").toLowerCase()),
+                );
+                if (!pendingCreateAppointmentPayload) return;
+                if (providerTimeConflicts.length > 0 && !allResolved) return;
+                setShowProviderTimeConflict(false);
+                createAppointmentMutation.mutate(pendingCreateAppointmentPayload);
+              }}
+              disabled={
+                updatingConflictAppointmentId != null ||
+                !pendingCreateAppointmentPayload ||
+                (providerTimeConflicts.length > 0 &&
+                  !providerTimeConflicts.every((c: any) =>
+                    ["completed", "cancelled"].includes(String(c?.status || "").toLowerCase()),
+                  ))
+              }
+              className="bg-blue-600 hover:bg-blue-700 text-white disabled:opacity-60"
+            >
+              Continue Booking
+            </Button>
+          </DialogFooter>
         </DialogContent>
       </Dialog>
 
@@ -4879,63 +5778,16 @@ Medical License: [License Number]
           if (!open) {
             setDuplicateAppointment(null);
             setDuplicateAppointmentDetails("");
+            setPendingDuplicateCreatePayload(null);
           }
         }}
       >
-        <DialogContent className="max-h-[min(90vh,90dvh)] max-w-[min(32rem,calc(100vw-2rem))] w-full overflow-y-auto overflow-x-hidden dark:border-gray-700 dark:bg-slate-800">
+        <DialogContent className="max-h-[min(90vh,90dvh)] max-w-5xl w-full overflow-y-auto overflow-x-hidden dark:border-gray-700 dark:bg-slate-800">
           <DialogHeader>
             <DialogTitle className="text-xl font-bold text-red-600 dark:text-red-400">
-              Duplicate Appointment
+              Rescheduled Appointment
             </DialogTitle>
-            {duplicateAppointment ? (
-              <DialogDescription asChild>
-                <div className="text-left text-sm text-gray-700 dark:text-gray-300 pt-1 space-y-3 leading-relaxed">
-                  {(() => {
-                    const d = duplicateAppointment;
-                    const pid = d.patientId ?? d.patient_id;
-                    const patient = patientsData?.find(
-                      (p: any) =>
-                        String(p.id) === String(pid) ||
-                        String(p.userId) === String(pid) ||
-                        String(p.patientId) === String(pid),
-                    );
-                    const patientName = patient
-                      ? `${patient.firstName || ""} ${patient.lastName || ""}`.trim()
-                      : "This patient";
-                    const provId = d.providerId ?? d.provider_id;
-                    const providerLine = formatDuplicateProviderDisplayName(provId);
-                    const atLocal = parseScheduledAtAsLocal(d.scheduledAt);
-                    const formattedDate = format(atLocal, "PPP");
-                    const formattedTime = format(atLocal, "p");
-                    const kind = String(d.appointmentType || d.appointment_type || "").toLowerCase();
-                    const svc = getDuplicateAppointmentServiceLabel(d);
-                    const kindPhrase =
-                      kind === "treatment" ? `for treatment ${svc}` : `for consultation ${svc}`;
-                    const statusLabel = formatAppointmentStatusLabel(d.status ?? d.dup_status);
-                    return (
-                      <>
-                        <p>
-                          You have already created an appointment with{" "}
-                          <span className="font-medium">{providerLine}</span>, patient{" "}
-                          <span className="font-medium">{patientName}</span>, on{" "}
-                          <span className="font-medium">{formattedDate}</span> at{" "}
-                          <span className="font-medium">{formattedTime}</span>, status{" "}
-                          <span className="font-medium">{statusLabel}</span>, {kindPhrase}.
-                        </p>
-                        <p>
-                          Patient <span className="font-medium">{patientName}</span> already has an appointment with{" "}
-                          <span className="font-medium">{providerLine}</span> on {formattedDate} at {formattedTime},
-                          status <span className="font-medium">{statusLabel}</span>, {kindPhrase}.
-                        </p>
-                        <p className="text-gray-600 dark:text-gray-400">
-                          Please select another treatment, another date, or update the existing appointment.
-                        </p>
-                      </>
-                    );
-                  })()}
-                </div>
-              </DialogDescription>
-            ) : duplicateAppointmentDetails ? (
+            {duplicateAppointmentDetails ? (
               <DialogDescription asChild>
                 <div className="text-left text-sm text-gray-700 dark:text-gray-300 pt-1 space-y-3">
                   {duplicateAppointmentDetails.split(/\n\n+/).map((block, idx) => (
@@ -4955,85 +5807,175 @@ Medical License: [License Number]
           </DialogHeader>
 
           {duplicateAppointment && (
-            <div className="rounded-md border border-amber-200 bg-amber-50/80 p-4 text-sm text-amber-950 dark:border-amber-900/50 dark:bg-amber-950/30 dark:text-amber-100">
-              <p className="mb-2 font-semibold text-amber-900 dark:text-amber-200">Existing appointment</p>
-              <ul className="list-none space-y-1.5">
-                {(() => {
-                  const c = duplicateAppointment;
-                  const patientRowPid = c.patientId ?? c.patient_id;
-                  const patientRow = patientsData?.find(
-                    (p: any) =>
-                      String(p.id) === String(patientRowPid) ||
-                      String(p.userId) === String(patientRowPid) ||
-                      String(p.patientId) === String(patientRowPid),
-                  );
-                  const patientRowName = patientRow
-                    ? `${patientRow.firstName || ""} ${patientRow.lastName || ""}`.trim()
-                    : "Unknown patient";
-                  const pid = c.providerId ?? c.provider_id;
-                  const prov = usersData?.find((u: any) => Number(u.id) === Number(pid));
-                  const provDisplay = formatDuplicateProviderDisplayName(pid);
-                  const roleLabel = c.assignedRole
-                    ? String(c.assignedRole).charAt(0).toUpperCase() + String(c.assignedRole).slice(1)
-                    : prov?.role
-                      ? String(prov.role)
-                      : null;
-                  const atLocal = parseScheduledAtAsLocal(c.scheduledAt);
-                  const dur = c.duration != null && Number(c.duration) > 0 ? Number(c.duration) : 30;
-                  const endAt = new Date(atLocal.getTime() + dur * 60 * 1000);
-                  const st = formatAppointmentStatusLabel(c.status ?? c.dup_status);
-                  const aptId = c.appointmentId ?? c.appointment_id;
-                  const aptKind = String(c.appointmentType || c.appointment_type || "").toLowerCase();
-                  const svcLabel = getDuplicateAppointmentServiceLabel(c);
-                  const typeLine =
-                    aptKind === "treatment"
-                      ? `treatment — ${svcLabel}`
-                      : aptKind === "consultation"
-                        ? `consultation — ${svcLabel}`
-                        : aptKind || "N/A";
-                  return (
-                    <>
-                      <li>
-                        <span className="font-medium text-amber-950 dark:text-amber-200">Patient: </span>
-                        {patientRowName}
-                      </li>
-                      <li>
-                        <span className="font-medium text-amber-950 dark:text-amber-200">Provider: </span>
-                        {provDisplay}
-                        {roleLabel ? ` (${roleLabel})` : ""}
-                      </li>
-                      <li>
-                        <span className="font-medium text-amber-950 dark:text-amber-200">Date: </span>
-                        {format(atLocal, "EEEE, MMM d, yyyy")}
-                      </li>
-                      <li>
-                        <span className="font-medium text-amber-950 dark:text-amber-200">Time: </span>
-                        {format(atLocal, "h:mm a")} – {format(endAt, "h:mm a")} ({dur} min)
-                      </li>
-                      <li>
-                        <span className="font-medium text-amber-950 dark:text-amber-200">Status: </span>
-                        {st}
-                      </li>
-                      {aptId ? (
-                        <li>
-                          <span className="font-medium text-amber-950 dark:text-amber-200">Appointment ID: </span>
-                          {aptId}
-                        </li>
-                      ) : null}
-                      {c.title ? (
-                        <li>
-                          <span className="font-medium text-amber-950 dark:text-amber-200">Title: </span>
-                          {c.title}
-                        </li>
-                      ) : null}
-                      <li>
-                        <span className="font-medium text-amber-950 dark:text-amber-200">Type: </span>
-                        {typeLine}
-                      </li>
-                    </>
-                  );
-                })()}
-              </ul>
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+              {duplicateAppointment && (
+                <div className="rounded-md border border-amber-200 bg-amber-50/80 p-4 text-sm text-amber-950 dark:border-amber-900/50 dark:bg-amber-950/30 dark:text-amber-100">
+                  <p className="mb-2 font-semibold text-amber-900 dark:text-amber-200">Existing appointment</p>
+                  <ul className="list-none space-y-1.5">
+                    {(() => {
+                      const c = duplicateAppointment;
+                      const patientRowPid = c.patientId ?? c.patient_id;
+                      const patientRow = patientsData?.find(
+                        (p: any) =>
+                          String(p.id) === String(patientRowPid) ||
+                          String(p.userId) === String(patientRowPid) ||
+                          String(p.patientId) === String(patientRowPid),
+                      );
+                      const patientRowName = patientRow
+                        ? `${patientRow.firstName || ""} ${patientRow.lastName || ""}`.trim()
+                        : "Unknown patient";
+                      const pid = c.providerId ?? c.provider_id;
+                      const prov = usersData?.find((u: any) => Number(u.id) === Number(pid));
+                      const provDisplay = formatDuplicateProviderDisplayName(pid);
+                      const roleLabel = c.assignedRole
+                        ? String(c.assignedRole).charAt(0).toUpperCase() + String(c.assignedRole).slice(1)
+                        : prov?.role
+                          ? String(prov.role)
+                          : null;
+                      const atLocal = parseScheduledAtAsLocal(c.scheduledAt);
+                      const dur = c.duration != null && Number(c.duration) > 0 ? Number(c.duration) : 30;
+                      const endAt = new Date(atLocal.getTime() + dur * 60 * 1000);
+                      const st = formatAppointmentStatusLabel(c.status ?? c.dup_status);
+                      const aptId = c.appointmentId ?? c.appointment_id;
+                      const aptKind = String(c.appointmentType || c.appointment_type || "").toLowerCase();
+                      const svcLabel = getDuplicateAppointmentServiceLabel(c);
+                      const typeLine =
+                        aptKind === "treatment"
+                          ? `treatment — ${svcLabel}`
+                          : aptKind === "consultation"
+                            ? `consultation — ${svcLabel}`
+                            : aptKind || "N/A";
+                      return (
+                        <>
+                          <li>
+                            <span className="font-medium text-amber-950 dark:text-amber-200">Patient: </span>
+                            {patientRowName}
+                          </li>
+                          <li>
+                            <span className="font-medium text-amber-950 dark:text-amber-200">Provider: </span>
+                            {provDisplay}
+                            {roleLabel ? ` (${roleLabel})` : ""}
+                          </li>
+                          <li>
+                            <span className="font-medium text-amber-950 dark:text-amber-200">Date: </span>
+                            {format(atLocal, "EEEE, MMM d, yyyy")}
+                          </li>
+                          <li>
+                            <span className="font-medium text-amber-950 dark:text-amber-200">Time: </span>
+                            {format(atLocal, "h:mm a")} – {format(endAt, "h:mm a")} ({dur} min)
+                          </li>
+                          <li>
+                            <span className="font-medium text-amber-950 dark:text-amber-200">Status: </span>
+                            {st}
+                          </li>
+                          {aptId ? (
+                            <li>
+                              <span className="font-medium text-amber-950 dark:text-amber-200">Appointment ID: </span>
+                              {aptId}
+                            </li>
+                          ) : null}
+                          {c.title ? (
+                            <li>
+                              <span className="font-medium text-amber-950 dark:text-amber-200">Title: </span>
+                              {c.title}
+                            </li>
+                          ) : null}
+                          <li>
+                            <span className="font-medium text-amber-950 dark:text-amber-200">Type: </span>
+                            {typeLine}
+                          </li>
+                        </>
+                      );
+                    })()}
+                  </ul>
+                </div>
+              )}
+
+              {(() => {
+                const n =
+                  pendingDuplicateCreatePayload ||
+                  (() => {
+                    if (!newAppointmentDate || !newSelectedTimeSlot || !selectedProviderId || !newAppointmentData?.patientId) {
+                      return null;
+                    }
+                    const selectedDate = format(newAppointmentDate, "yyyy-MM-dd");
+                    const [time, period] = newSelectedTimeSlot.split(" ");
+                    const [hours, minutes] = time.split(":");
+                    let hour24 = parseInt(hours);
+                    if (period === "PM" && hour24 !== 12) hour24 += 12;
+                    else if (period === "AM" && hour24 === 12) hour24 = 0;
+                    const newScheduledAt = `${selectedDate}T${hour24.toString().padStart(2, "0")}:${minutes}:00`;
+                    const normalizedAppointmentType = appointmentType || "consultation";
+                    return {
+                      patientId: parseInt(newAppointmentData.patientId),
+                      providerId: parseInt(selectedProviderId),
+                      assignedRole: selectedRole,
+                      title: newAppointmentData?.title || "",
+                      appointmentType: normalizedAppointmentType,
+                      scheduledAt: newScheduledAt,
+                      duration: selectedDuration,
+                    };
+                  })();
+                if (!n) return null;
+                return (
+                <div className="rounded-md border border-slate-200 bg-slate-50/80 p-4 text-sm text-slate-900 dark:border-slate-700 dark:bg-slate-900/30 dark:text-slate-100">
+                  <p className="mb-2 font-semibold text-slate-800 dark:text-slate-200">New appointment (to be created)</p>
+                  <ul className="list-none space-y-1.5">
+                    {(() => {
+                      const patientRow = patientsData?.find((p: any) => String(p.id) === String(n.patientId));
+                      const patientRowName = patientRow
+                        ? `${patientRow.firstName || ""} ${patientRow.lastName || ""}`.trim()
+                        : `Patient ID: ${n.patientId}`;
+                      const provDisplay = formatDuplicateProviderDisplayName(n.providerId);
+                      const atLocal = parseScheduledAtAsLocal(n.scheduledAt);
+                      const dur = n.duration != null && Number(n.duration) > 0 ? Number(n.duration) : 30;
+                      const endAt = new Date(atLocal.getTime() + dur * 60 * 1000);
+                      const svcName = appointmentServicePreview?.name || "Selected service";
+                      const typeLine =
+                        String(n.appointmentType || "").toLowerCase() === "treatment"
+                          ? `treatment — ${svcName}`
+                          : String(n.appointmentType || "").toLowerCase() === "consultation"
+                            ? `consultation — ${svcName}`
+                            : String(n.appointmentType || "N/A");
+                      return (
+                        <>
+                          <li>
+                            <span className="font-medium">Patient: </span>
+                            {patientRowName}
+                          </li>
+                          <li>
+                            <span className="font-medium">Provider: </span>
+                            {provDisplay}
+                          </li>
+                          <li>
+                            <span className="font-medium">Date: </span>
+                            {format(atLocal, "EEEE, MMM d, yyyy")}
+                          </li>
+                          <li>
+                            <span className="font-medium">Time: </span>
+                            {format(atLocal, "h:mm a")} – {format(endAt, "h:mm a")} ({dur} min)
+                          </li>
+                          <li>
+                            <span className="font-medium">Status: </span>
+                            Scheduled
+                          </li>
+                          {n.title ? (
+                            <li>
+                              <span className="font-medium">Title: </span>
+                              {n.title}
+                            </li>
+                          ) : null}
+                          <li>
+                            <span className="font-medium">Type: </span>
+                            {typeLine}
+                          </li>
+                        </>
+                      );
+                    })()}
+                  </ul>
+                </div>
+                );
+              })()}
             </div>
           )}
 
@@ -5045,42 +5987,74 @@ Medical License: [License Number]
             ) && (
               <div className="mt-2 space-y-3 rounded-md border border-amber-200 bg-amber-50 p-4 dark:border-amber-900/50 dark:bg-amber-950/30">
                 <Label className="text-sm font-medium leading-snug text-amber-950 dark:text-amber-100">
-                  Please change the existing appointment&apos;s status to <strong>Completed</strong> or{" "}
-                  <strong>Cancelled</strong>. After updating, you can review and confirm the new appointment in the
-                  summary popup.
+                  Click <strong>Rescheduled</strong> to mark the existing appointment as rescheduled. After updating,
+                  you can review and confirm the new appointment in the summary popup.
                 </Label>
-                <Select value={duplicateResolveStatus} onValueChange={setDuplicateResolveStatus}>
-                  <SelectTrigger className="bg-white dark:bg-slate-900">
-                    <SelectValue placeholder="Select status" />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="scheduled">Scheduled</SelectItem>
-                    <SelectItem value="confirmed">Confirmed</SelectItem>
-                    <SelectItem value="completed">Completed</SelectItem>
-                    <SelectItem value="cancelled">Cancelled</SelectItem>
-                  </SelectContent>
-                </Select>
                 <Button
                   type="button"
                   className="w-full"
-                  disabled={
-                    resolveDuplicateStatusMutation.isPending ||
-                    !["completed", "cancelled"].includes(
-                      normalizeAppointmentStatusForDup(duplicateResolveStatus),
-                    )
-                  }
+                  disabled={resolveDuplicateStatusMutation.isPending}
                   onClick={() => {
                     const id = Number(duplicateAppointment.id);
                     if (!Number.isFinite(id)) return;
+                    // Ensure the new appointment confirmation has all required data (built from current selections).
+                    if (!pendingDuplicateCreatePayload) {
+                      const normalizedAppointmentType = appointmentType || "consultation";
+                      const treatmentId = normalizedAppointmentType === "treatment"
+                        ? appointmentSelectedTreatment?.id || null
+                        : null;
+                      const consultationId = normalizedAppointmentType === "consultation"
+                        ? appointmentSelectedConsultation?.id || null
+                        : null;
+
+                      // Build scheduledAt from currently selected date/time in the modal
+                      if (!newAppointmentDate || !newSelectedTimeSlot || !selectedProviderId || !newAppointmentData?.patientId) {
+                        toast({
+                          title: "Missing details",
+                          description: "Please select patient, provider, date, and time before rescheduling.",
+                          variant: "destructive",
+                        });
+                        return;
+                      }
+                      const selectedDate = format(newAppointmentDate, "yyyy-MM-dd");
+                      const [time, period] = newSelectedTimeSlot.split(" ");
+                      const [hours, minutes] = time.split(":");
+                      let hour24 = parseInt(hours);
+                      if (period === "PM" && hour24 !== 12) hour24 += 12;
+                      else if (period === "AM" && hour24 === 12) hour24 = 0;
+                      const newScheduledAt = `${selectedDate}T${hour24.toString().padStart(2, "0")}:${minutes}:00`;
+
+                      const patientName = patientsData?.find((p: any) => p.id.toString() === newAppointmentData.patientId);
+                      const generatedTitle = `${patientName?.firstName || 'Patient'} - ${selectedRole.charAt(0).toUpperCase() + selectedRole.slice(1)} Appointment`;
+
+                      setPendingDuplicateCreatePayload({
+                        patientId: parseInt(newAppointmentData.patientId),
+                        providerId: parseInt(selectedProviderId),
+                        assignedRole: selectedRole,
+                        title: generatedTitle,
+                        type: normalizedAppointmentType === "treatment" ? "procedure" : "consultation",
+                        appointmentType: normalizedAppointmentType,
+                        treatmentId,
+                        treatment_id: treatmentId,
+                        consultationId,
+                        consultation_id: consultationId,
+                        status: "scheduled",
+                        scheduledAt: newScheduledAt,
+                        duration: selectedDuration,
+                        description: "",
+                        createdBy: user?.id,
+                      });
+                    }
+                    setDuplicateResolveStatus("rescheduled");
                     resolveDuplicateStatusMutation.mutate({
                       id,
-                      status: duplicateResolveStatus,
+                      status: "rescheduled",
                     });
                   }}
                 >
                   {resolveDuplicateStatusMutation.isPending
-                    ? "Updating..."
-                    : "Update status & open appointment summary"}
+                    ? "Rescheduling..."
+                    : "Rescheduled"}
                 </Button>
               </div>
             )}
@@ -5125,7 +6099,7 @@ Medical License: [License Number]
         <DialogContent className="max-h-[min(90vh,90dvh)] max-w-[min(32rem,calc(100vw-2rem))] w-full overflow-y-auto overflow-x-hidden dark:border-gray-700 dark:bg-slate-800">
           <DialogHeader>
             <DialogTitle className="text-xl font-bold text-red-600 dark:text-red-400">
-              Scheduling conflict
+              Appointment Conflict: Patient Already Has an Appointment at This Time
             </DialogTitle>
             <DialogDescription asChild>
               <p className="text-left text-sm text-gray-700 dark:text-gray-300 pt-1 leading-relaxed">
