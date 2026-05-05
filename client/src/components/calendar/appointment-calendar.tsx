@@ -2676,6 +2676,18 @@ Medical License: [License Number]
       .trim()
       .replace(/\s+/g, "_");
 
+    // Never show "in_progress" appointments whose time window has already ended.
+    // (Keep list focused on scheduled + currently ongoing.)
+    if (st === "in_progress") {
+      const startAt = apt?.scheduledAt ? parseScheduledAtAsLocal(apt.scheduledAt) : new Date(NaN);
+      const dur = apt?.duration != null && Number(apt.duration) > 0 ? Number(apt.duration) : 30;
+      const endAt = new Date(startAt.getTime() + dur * 60 * 1000);
+      const now = new Date();
+      if (!Number.isNaN(endAt.getTime()) && now >= endAt) {
+        return false;
+      }
+    }
+
     // Apply appointment ID filter for admin users
     const matchesAppointmentId = appointmentIdFilter === "all" || apt.appointmentId === appointmentIdFilter;
     if (!matchesAppointmentId) return false;
@@ -3075,7 +3087,7 @@ Medical License: [License Number]
                           "bg-gray-100 text-gray-700 border border-gray-300 dark:bg-slate-700/40 dark:text-gray-200 dark:border-slate-600 text-xs",
                         )}
                       >
-                        Completed
+                        Passed
                       </Badge>
                     )}
                     {nextUpcomingAppointmentId != null &&

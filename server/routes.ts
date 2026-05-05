@@ -6636,6 +6636,36 @@ This treatment plan should be reviewed and adjusted based on individual patient 
       // Dynamic in_progress for ongoing appointments (response-only)
       appointments = appointments.map(computeDynamicInProgress) as any;
 
+      // Persist "in_progress" when an appointment becomes ongoing.
+      // Only promote scheduled/confirmed appointments, never touch terminal/non-active statuses.
+      try {
+        const now = new Date();
+        const toPromote = appointments
+          .filter((apt: any) => {
+            const st = String(apt?.status ?? "")
+              .trim()
+              .toLowerCase()
+              .replace(/\s+/g, "_");
+            if (st !== "scheduled" && st !== "confirmed") return false;
+            const startAt = new Date(apt?.scheduledAt);
+            if (Number.isNaN(startAt.getTime())) return false;
+            const dur = apt?.duration != null && Number(apt.duration) > 0 ? Number(apt.duration) : 30;
+            const endAt = new Date(startAt.getTime() + dur * 60 * 1000);
+            return startAt <= now && now < endAt;
+          })
+          .slice(0, 25); // safety cap per request
+
+        if (toPromote.length > 0) {
+          await Promise.allSettled(
+            toPromote.map((apt: any) =>
+              storage.updateAppointment(Number(apt.id), organizationId, { status: "in_progress" } as any),
+            ),
+          );
+        }
+      } catch (e) {
+        console.warn("[APPOINTMENTS] Failed to persist in_progress promotion:", e);
+      }
+
       // Enrich appointments with patient names (similar to lab results)
       // Get unique patient IDs from appointments
       const uniquePatientIds = [...new Set(appointments.map(apt => apt.patientId))];
