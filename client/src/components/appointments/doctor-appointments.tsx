@@ -1133,7 +1133,7 @@ export default function DoctorAppointments({ onNewAppointment }: { onNewAppointm
 
   const getAppointmentsForDate = (date: Date) => {
     const filtered = displayAppointments.filter((apt: any) => {
-      const appointmentDate = new Date(apt.scheduledAt);
+      const appointmentDate = parseScheduledAtAsLocal(apt.scheduledAt);
       return isSameDay(appointmentDate, date);
     });
     
@@ -1160,13 +1160,19 @@ export default function DoctorAppointments({ onNewAppointment }: { onNewAppointm
   const categorizedAppointments = React.useMemo(() => {
     const now = new Date();
     const upcoming = displayAppointments
-      .filter((apt: any) => new Date(apt.scheduledAt).getTime() > now.getTime())
-      .sort((a: any, b: any) => new Date(a.scheduledAt).getTime() - new Date(b.scheduledAt).getTime());
+      .filter((apt: any) => parseScheduledAtAsLocal(apt.scheduledAt).getTime() > now.getTime())
+      .sort(
+        (a: any, b: any) =>
+          parseScheduledAtAsLocal(a.scheduledAt).getTime() - parseScheduledAtAsLocal(b.scheduledAt).getTime(),
+      );
 
     const past = displayAppointments.filter((apt: any) => {
-      const aptDate = new Date(apt.scheduledAt);
+      const aptDate = parseScheduledAtAsLocal(apt.scheduledAt);
       return isPast(aptDate) && !isSameDay(aptDate, now);
-    }).sort((a: any, b: any) => new Date(b.scheduledAt).getTime() - new Date(a.scheduledAt).getTime());
+    }).sort(
+      (a: any, b: any) =>
+        parseScheduledAtAsLocal(b.scheduledAt).getTime() - parseScheduledAtAsLocal(a.scheduledAt).getTime(),
+    );
 
     console.log('📅 DOCTOR APPOINTMENTS: Categorized', {
       upcoming: upcoming.length,
@@ -1192,7 +1198,7 @@ export default function DoctorAppointments({ onNewAppointment }: { onNewAppointm
       result = result.filter((apt: any) => {
         // Filter by date
         if (filterDate) {
-          const aptDate = format(new Date(apt.scheduledAt), 'yyyy-MM-dd');
+          const aptDate = format(parseScheduledAtAsLocal(apt.scheduledAt), 'yyyy-MM-dd');
           if (aptDate !== filterDate) return false;
         }
 
@@ -2015,7 +2021,7 @@ export default function DoctorAppointments({ onNewAppointment }: { onNewAppointm
                           <div className="grid grid-cols-2 gap-x-6 items-start">
                             <div className="flex min-h-[1.5rem] items-center gap-2 text-sm text-gray-700 dark:text-gray-300">
                               <Calendar className="h-4 w-4 shrink-0 text-gray-400" />
-                              <span>{format(new Date(appointment.scheduledAt), "EEEE, MMMM d, yyyy")}</span>
+                              <span>{format(parseScheduledAtAsLocal(appointment.scheduledAt), "EEEE, MMMM d, yyyy")}</span>
                             </div>
                             <div className="min-h-[1.5rem] text-xs text-gray-500 dark:text-gray-400">
                               {patient?.email ? <>Email: {patient.email}</> : null}
@@ -2073,7 +2079,7 @@ export default function DoctorAppointments({ onNewAppointment }: { onNewAppointm
                           <div className="space-y-2">
                             <div className="flex items-center gap-2 text-sm text-gray-700 dark:text-gray-300">
                               <Calendar className="h-4 w-4 text-gray-400" />
-                              <span>{format(new Date(appointment.scheduledAt), "EEEE, MMMM d, yyyy")}</span>
+                              <span>{format(parseScheduledAtAsLocal(appointment.scheduledAt), "EEEE, MMMM d, yyyy")}</span>
                             </div>
                             <div className="flex items-center gap-2 text-sm text-gray-700 dark:text-gray-300">
                               <Clock className="h-4 w-4 text-gray-400" />
@@ -2383,7 +2389,9 @@ export default function DoctorAppointments({ onNewAppointment }: { onNewAppointm
               <div className="space-y-2">
                 <div className="flex items-center gap-2 text-sm text-gray-700 dark:text-gray-300">
                   <Calendar className="h-4 w-4 text-blue-600" />
-                  <span className="font-semibold">{format(new Date(nextAppointment.scheduledAt), "EEEE, MMMM d, yyyy")}</span>
+                  <span className="font-semibold">
+                    {format(parseScheduledAtAsLocal(nextAppointment.scheduledAt), "EEEE, MMMM d, yyyy")}
+                  </span>
                 </div>
                 <div className="flex items-center gap-2 text-sm text-gray-700 dark:text-gray-300">
                   <User className="h-4 w-4 text-blue-600" />
@@ -2715,7 +2723,7 @@ export default function DoctorAppointments({ onNewAppointment }: { onNewAppointm
                         <div className="grid grid-cols-2 gap-x-6 items-start">
                           <div className="flex min-h-[1.5rem] items-center gap-2 text-sm text-gray-700 dark:text-gray-300">
                             <Calendar className="h-4 w-4 shrink-0 text-gray-400" />
-                            <span>{format(new Date(appointment.scheduledAt), "EEEE, MMMM d, yyyy")}</span>
+                            <span>{format(parseScheduledAtAsLocal(appointment.scheduledAt), "EEEE, MMMM d, yyyy")}</span>
                           </div>
                           <div className="min-h-[1.5rem] text-xs text-gray-500 dark:text-gray-400">
                             {patient?.email ? <>Email: {patient.email}</> : null}
@@ -2773,7 +2781,7 @@ export default function DoctorAppointments({ onNewAppointment }: { onNewAppointm
                         <div className="space-y-2">
                           <div className="flex items-center gap-2 text-sm text-gray-700 dark:text-gray-300">
                             <Calendar className="h-4 w-4 text-gray-400" />
-                            <span>{format(new Date(appointment.scheduledAt), "EEEE, MMMM d, yyyy")}</span>
+                            <span>{format(parseScheduledAtAsLocal(appointment.scheduledAt), "EEEE, MMMM d, yyyy")}</span>
                           </div>
                           <div className="flex items-center gap-2 text-sm text-gray-700 dark:text-gray-300">
                             <User className="h-4 w-4 text-gray-400" />

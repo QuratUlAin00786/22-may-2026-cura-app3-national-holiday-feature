@@ -17,12 +17,15 @@ export function buildPatientOverlapDialogDescription(
   options?: {
     conflictProviderId?: number | string | null | undefined;
     selectedProviderId?: number | string | null | undefined;
+    conflictProviderDisplayName?: string | null | undefined;
   },
 ): string {
   const name =
     selectedProviderDisplayName.trim() || "the selected provider";
   const confPid = options?.conflictProviderId;
   const selPid = options?.selectedProviderId;
+  const conflictNameRaw = options?.conflictProviderDisplayName ?? "";
+  const conflictName = String(conflictNameRaw).trim();
   const sameDoctor =
     confPid != null &&
     selPid != null &&
@@ -30,6 +33,9 @@ export function buildPatientOverlapDialogDescription(
 
   if (sameDoctor) {
     return `You are trying to book an appointment with ${name}, but the selected date and time are already booked with ${name}. Please choose a different time slot.`;
+  }
+  if (conflictName) {
+    return `You are trying to book an appointment with ${name}, but the selected date and time overlap with another appointment already scheduled for this patient with ${conflictName}. Please choose a different time slot.`;
   }
   return `You are trying to book an appointment with ${name}, but the selected date and time overlap with another appointment already scheduled for this patient with a different provider. Please choose a different time slot.`;
 }

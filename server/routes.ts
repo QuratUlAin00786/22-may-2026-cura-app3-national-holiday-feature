@@ -7382,11 +7382,16 @@ This treatment plan should be reviewed and adjusted based on individual patient 
   // Check appointment conflicts before creation
   app.post("/api/appointments/check-conflicts", authMiddleware, async (req: TenantRequest, res) => {
     try {
-      const { patientId, providerId, scheduledAt } = req.body;
+      const { patientId, providerId, scheduledAt, duration } = req.body;
       const organizationId = req.tenant!.id;
 
       if (!patientId || !providerId || !scheduledAt) {
         return res.status(400).json({ error: "patientId, providerId, and scheduledAt are required" });
+      }
+
+      const durationMins = Number(duration ?? 30);
+      if (!Number.isFinite(durationMins) || durationMins <= 0) {
+        return res.status(400).json({ error: "duration must be a positive number (minutes)" });
       }
 
       // Parse the date/time directly from ISO string WITHOUT timezone conversion
@@ -7394,30 +7399,40 @@ This treatment plan should be reviewed and adjusted based on individual patient 
       const dateStr = scheduledAt.substring(0, 10); // "2025-12-12"
       const timeStr = scheduledAt.substring(11, 16); // "12:45"
 
-      console.log(`[CONFLICT CHECK] Checking for conflicts: patientId=${patientId}, providerId=${providerId}, date=${dateStr}, time=${timeStr}`);
+      console.log(
+        `[CONFLICT CHECK] Checking for conflicts: patientId=${patientId}, providerId=${providerId}, date=${dateStr}, time=${timeStr}, duration=${durationMins}`,
+      );
 
       const normalizeStatusSql = (col: any) =>
         sql`LOWER(REPLACE(TRIM(COALESCE(${col}::text, '')), ' ', '_'))`;
 
-      // Check for patient conflicts (patient has appointment at same date/time with any doctor)
+      // Overlap rule: [newStart, newEnd) overlaps [existingStart, existingEnd) if:
+      // existingStart < newEnd AND existingEnd > newStart
+      const overlapsSql = sql`
+        ${schema.appointments.scheduledAt} < (${scheduledAt}::timestamp + make_interval(mins => ${durationMins}))
+        AND
+        (${schema.appointments.scheduledAt} + make_interval(mins => ${schema.appointments.duration})) > ${scheduledAt}::timestamp
+      `;
+
+      // Check for patient conflicts (patient has overlapping appointment with any provider)
       const patientConflicts = await db.select()
         .from(schema.appointments)
         .where(and(
           eq(schema.appointments.organizationId, organizationId),
           eq(schema.appointments.patientId, patientId),
           sql`DATE(${schema.appointments.scheduledAt}) = ${dateStr}`,
-          sql`TO_CHAR(${schema.appointments.scheduledAt}, 'HH24:MI') = ${timeStr}`,
+          overlapsSql,
           sql`${normalizeStatusSql(schema.appointments.status)} NOT IN ('cancelled','canceled','completed','rescheduled')`
         ));
 
-      // Check for provider conflicts (doctor has appointment at same date/time with any patient)
+      // Check for provider conflicts (provider has overlapping appointment with any patient)
       const providerConflicts = await db.select()
         .from(schema.appointments)
         .where(and(
           eq(schema.appointments.organizationId, organizationId),
           eq(schema.appointments.providerId, providerId),
           sql`DATE(${schema.appointments.scheduledAt}) = ${dateStr}`,
-          sql`TO_CHAR(${schema.appointments.scheduledAt}, 'HH24:MI') = ${timeStr}`,
+          overlapsSql,
           sql`${normalizeStatusSql(schema.appointments.status)} NOT IN ('cancelled','canceled','completed','rescheduled')`
         ));
 

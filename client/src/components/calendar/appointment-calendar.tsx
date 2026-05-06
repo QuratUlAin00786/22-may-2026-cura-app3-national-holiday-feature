@@ -1179,6 +1179,49 @@ const parseShiftTimeToMinutes = (time?: string): number => {
     onSettled: () => setUpdatingConflictAppointmentId(null),
   });
 
+  const autoResolvedProviderConflictRef = useRef<Record<string, boolean>>({});
+
+  const tryAutoResolveProviderConflictsAndRetry = useCallback(
+    async (opts: { providerId: number; scheduledAt: string; conflicts: any[]; pendingPayload: any }) => {
+      // Only auto-resolve in production for admins (status update requires edit permission).
+      if (!(import.meta as any)?.env?.PROD) return false;
+      if (user?.role !== "admin") return false;
+
+      const key = `${String(opts.providerId)}|${String(opts.scheduledAt)}`;
+      if (autoResolvedProviderConflictRef.current[key]) return false;
+      autoResolvedProviderConflictRef.current[key] = true;
+
+      const conflicts = Array.isArray(opts.conflicts) ? opts.conflicts : [];
+      const blocking = conflicts
+        .map((c: any) => ({
+          id: Number(c?.id ?? c?.appointment_id ?? c?.appointmentId),
+          status: String(c?.status ?? "").toLowerCase(),
+        }))
+        .filter((c) => c.id && !Number.isNaN(c.id))
+        .filter((c) => c.status === "scheduled" || c.status === "confirmed" || c.status === "in_progress");
+
+      if (blocking.length === 0) return false;
+
+      try {
+        // Mark all blocking overlaps as completed (fast path).
+        await Promise.all(
+          blocking.map((c) => updateConflictAppointmentStatusMutation.mutateAsync({ id: c.id, status: "completed" })),
+        );
+        setShowProviderTimeConflict(false);
+        setProviderTimeConflicts([]);
+        setPendingCreateAppointmentPayload(null);
+
+        // Retry booking once after resolving conflicts
+        createAppointmentMutation.mutate(opts.pendingPayload);
+        return true;
+      } catch (e) {
+        console.warn("[Calendar] Auto-resolve provider conflicts failed:", e);
+        return false;
+      }
+    },
+    [createAppointmentMutation, updateConflictAppointmentStatusMutation, user?.role],
+  );
+
   const fetchConflictDetailsFromServer = useCallback(async (payload: any) => {
     const patientId = Number(payload?.patientId);
     const providerId = Number(payload?.providerId);
@@ -1281,12 +1324,14 @@ const parseShiftTimeToMinutes = (time?: string): number => {
     patientId: number,
     providerId: number,
     scheduledAt: string,
+    duration: number,
   ): Promise<{ hasConflict: boolean; message: string; patientConflict?: any[]; providerConflict?: any[] }> => {
     try {
       const response = await apiRequest("POST", "/api/appointments/check-conflicts", {
         patientId,
         providerId,
-        scheduledAt
+        scheduledAt,
+        duration,
       });
       const result = await response.json();
       
@@ -2504,6 +2549,18 @@ Medical License: [License Number]
     const n = `${u.firstName || ""} ${u.lastName || ""}`.trim();
     return n || "the selected provider";
   }, [patientOverlapSelectedProviderIdForMessage, usersData]);
+
+  const patientOverlapConflictProviderDisplayName = useMemo(() => {
+    const pid =
+      patientOverlapConflictRecord?.providerId ??
+      patientOverlapConflictRecord?.provider_id ??
+      null;
+    if (pid == null || pid === "") return "";
+    const u = usersData?.find((x: any) => String(x.id) === String(pid));
+    if (!u) return "";
+    const n = `${u.firstName || ""} ${u.lastName || ""}`.trim();
+    return n;
+  }, [patientOverlapConflictRecord, usersData]);
 
   // Map roles to dropdown options format from roles table, excluding 'patient', 'admin', and 'Administrator'
   const availableRoles = rolesData
@@ -5959,7 +6016,8 @@ Medical License: [License Number]
                   const conflictResult = await checkAppointmentConflicts(
                     parseInt(newAppointmentData.patientId),
                     parseInt(selectedProviderId),
-                    newScheduledAt
+                    newScheduledAt,
+                    selectedDuration,
                   );
                   
                   if (conflictResult.hasConflict) {
@@ -6082,7 +6140,7 @@ Medical License: [License Number]
                               duration: durationNum,
                               appointmentsList: payload,
                             });
-                            setPendingCreateAppointmentPayload({
+                            const pendingPayload = {
                               patientId: parseInt(newAppointmentData.patientId),
                               providerId: parseInt(selectedProviderId),
                               assignedRole: selectedRole,
@@ -6098,14 +6156,22 @@ Medical License: [License Number]
                               duration: selectedDuration,
                               description: "",
                               createdBy: user?.id,
-                            });
+                            };
+                            setPendingCreateAppointmentPayload(pendingPayload);
                             setProviderTimeConflicts(inferred);
                             setShowProviderTimeConflict(true);
                             setShowConfirmationDialog(false);
+
+                            void tryAutoResolveProviderConflictsAndRetry({
+                              providerId: providerIdNum,
+                              scheduledAt: newScheduledAt,
+                              conflicts: inferred,
+                              pendingPayload,
+                            });
                             return;
                           }
                           if (payload.code === "PROVIDER_TIME_CONFLICT" && Array.isArray(payload.conflicts)) {
-                            setPendingCreateAppointmentPayload({
+                            const pendingPayload = {
                               patientId: parseInt(newAppointmentData.patientId),
                               providerId: parseInt(selectedProviderId),
                               assignedRole: selectedRole,
@@ -6121,16 +6187,26 @@ Medical License: [License Number]
                               duration: selectedDuration,
                               description: "",
                               createdBy: user?.id,
-                            });
+                            };
+                            setPendingCreateAppointmentPayload(pendingPayload);
                             const fallback = buildLocalProviderConflicts({
                               providerId: parseInt(selectedProviderId),
                               scheduledAt: newScheduledAt,
                               duration: selectedDuration,
                               appointmentsList: appointments,
                             });
-                            setProviderTimeConflicts(payload.conflicts.length > 0 ? payload.conflicts : fallback);
+                            const conflicts = payload.conflicts.length > 0 ? payload.conflicts : fallback;
+                            setProviderTimeConflicts(conflicts);
                             setShowProviderTimeConflict(true);
                             setShowConfirmationDialog(false);
+
+                            // Production auto-fix: mark overlapping appointments completed then retry.
+                            void tryAutoResolveProviderConflictsAndRetry({
+                              providerId: parseInt(selectedProviderId),
+                              scheduledAt: newScheduledAt,
+                              conflicts,
+                              pendingPayload,
+                            });
                             return;
                           }
                           if (payload.code === "DUPLICATE_APPOINTMENT_SERVICE" && payload.message) {
@@ -6898,6 +6974,7 @@ Medical License: [License Number]
                     conflictProviderId:
                       patientOverlapConflictRecord?.providerId ??
                       patientOverlapConflictRecord?.provider_id,
+                    conflictProviderDisplayName: patientOverlapConflictProviderDisplayName || undefined,
                   },
                 )}
               </p>
