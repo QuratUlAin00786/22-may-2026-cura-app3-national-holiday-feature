@@ -223,6 +223,8 @@ export interface IStorage {
   createAppointment(appointment: InsertAppointment): Promise<Appointment>;
   updateAppointment(id: number, organizationId: number, updates: Partial<InsertAppointment>): Promise<Appointment | undefined>;
   deleteAppointment(id: number, organizationId: number): Promise<boolean>;
+  /** Set status to in_progress for appointments whose time window contains NOW() (scheduled/confirmed only). */
+  promoteOngoingAppointmentsToInProgress(organizationId: number): Promise<void>;
 
   // Invoices
   getInvoice(id: number, organizationId: number): Promise<Invoice | undefined>;
@@ -1877,6 +1879,21 @@ export class DatabaseStorage implements IStorage {
     console.log(`Deleted appointment:`, deleted);
     
     return !!deleted;
+  }
+
+  async promoteOngoingAppointmentsToInProgress(organizationId: number): Promise<void> {
+    try {
+      await db.execute(sql`
+        UPDATE appointments
+        SET status = 'in_progress'
+        WHERE organization_id = ${organizationId}
+        AND LOWER(TRIM(status)) IN ('scheduled', 'confirmed')
+        AND scheduled_at <= NOW()
+        AND scheduled_at + (COALESCE(duration, 30) * interval '1 minute') > NOW()
+      `);
+    } catch (error) {
+      console.warn("[STORAGE] promoteOngoingAppointmentsToInProgress failed:", error);
+    }
   }
 
   // Invoices

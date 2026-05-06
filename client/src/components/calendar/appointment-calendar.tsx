@@ -2718,6 +2718,8 @@ Medical License: [License Number]
   );
 
   const nextUpcomingAppointmentId = useMemo(() => {
+    // "Next" only applies when viewing today's schedule, not a future (or past) calendar date.
+    if (!isToday(selectedDate)) return null;
     if (!Array.isArray(sortedSelectedDateAppointments) || sortedSelectedDateAppointments.length === 0) return null;
     const toStartEnd = (apt: any) => {
       const start = apt?.scheduledAt ? parseScheduledAtAsLocal(apt.scheduledAt) : new Date(NaN);
@@ -2748,14 +2750,15 @@ Medical License: [License Number]
     // Preferred: if something is ongoing, "Next" means first appointment after the last ongoing ends.
     if (ongoing.length > 0) {
       const maxOngoingEnd = ongoing.reduce((acc, cur) => (cur.end > acc ? cur.end : acc), ongoing[0].end);
-      const afterOngoing = all.filter(({ start }) => start > maxOngoingEnd);
+      // >= so back-to-back slots (next start === previous end) still get the "Next" badge.
+      const afterOngoing = all.filter(({ start }) => start >= maxOngoingEnd);
       if (afterOngoing.length > 0) return Number(afterOngoing[0].apt.id);
     }
 
     // Fallback: first upcoming after now.
     const upcoming = all.filter(({ start }) => start > nowForCardStyle);
     return upcoming.length > 0 ? Number(upcoming[0].apt.id) : null;
-  }, [sortedSelectedDateAppointments, nowForCardStyle]);
+  }, [selectedDate, sortedSelectedDateAppointments, nowForCardStyle]);
 
   if (isLoading) {
     return (

@@ -45,6 +45,40 @@ function formatAppointmentStatusLabelDoc(status: unknown): string {
     .join(" ");
 }
 
+function normalizeAppointmentStatusForDoc(value: unknown): string {
+  return String(value ?? "")
+    .toLowerCase()
+    .trim()
+    .replace(/\s+/g, "_");
+}
+
+function isNonBlockingForRebookDoc(status: unknown): boolean {
+  const s = normalizeAppointmentStatusForDoc(status);
+  return s === "completed" || s === "cancelled" || s === "canceled" || s === "rescheduled";
+}
+
+/** Calendar/list status filter for nurse/doctor schedule view */
+type ListStatusFilter =
+  | "active"
+  | "scheduled"
+  | "confirmed"
+  | "in_progress"
+  | "completed"
+  | "rescheduled"
+  | "cancelled"
+  | "no_show"
+  | "all";
+
+function matchesListStatusFilter(apt: any, filter: ListStatusFilter): boolean {
+  const st = normalizeAppointmentStatusForDoc(apt?.status);
+  if (filter === "all") return true;
+  if (filter === "active") {
+    return st === "scheduled" || st === "confirmed" || st === "in_progress";
+  }
+  if (filter === "cancelled") return st === "cancelled" || st === "canceled";
+  return st === filter;
+}
+
 const statusColors = {
   scheduled: "#4A7DFF",
   completed: "#BBF7D0", 
@@ -69,7 +103,9 @@ export default function DoctorAppointments({ onNewAppointment }: { onNewAppointm
   const [selectedDate, setSelectedDate] = useState(new Date());
   const [viewMode, setViewMode] = useState<"week" | "day">("week");
   const [appointmentFilter, setAppointmentFilter] = useState<"all" | "upcoming" | "past">("upcoming");
-  
+  /** Default: only scheduled, confirmed, and in-progress (active work). */
+  const [listStatusFilter, setListStatusFilter] = useState<ListStatusFilter>("active");
+
   // Search/Filter states
   const [showSearchPanel, setShowSearchPanel] = useState(false);
   const [filterDate, setFilterDate] = useState<string>("");
@@ -355,11 +391,17 @@ export default function DoctorAppointments({ onNewAppointment }: { onNewAppointm
       const data = await response.json();
 
       // Filter appointments for the selected date (excluding the current appointment being edited)
-      // Only include SCHEDULED appointments - CANCELLED appointments should not block time slots
+      // Only include ACTIVE appointments that should block booking.
+      // IMPORTANT: "rescheduled" must NOT block (should remain green/available).
       // Uses parseScheduledAtAsLocal() to parse as local time (ignores timezone conversion)
       const dayAppointments = data.filter((apt: any) => {
         const aptDate = format(parseScheduledAtAsLocal(apt.scheduledAt), "yyyy-MM-dd");
-        return aptDate === dateStr && apt.id !== editingAppointment?.id && apt.status?.toLowerCase() === 'scheduled';
+        const st = String(apt?.status ?? "")
+          .toLowerCase()
+          .trim()
+          .replace(/\s+/g, "_");
+        const isBlocking = st === "scheduled" || st === "confirmed" || st === "in_progress";
+        return aptDate === dateStr && apt.id !== editingAppointment?.id && isBlocking;
       });
 
       // Extract booked 15-minute slots based on appointment duration (same idea as patient modal)
@@ -607,9 +649,13 @@ export default function DoctorAppointments({ onNewAppointment }: { onNewAppointm
       { excludeAppointmentId: editingAppointment.id },
     );
     if (overlapEdit.conflict) {
+      if (isNonBlockingForRebookDoc((overlapEdit.conflict as any)?.status)) {
+        // Allow rebooking over rescheduled/completed/cancelled appointments
+      } else {
       setPatientOverlapConflictRecord(overlapEdit.conflict);
       setShowPatientOverlapConflict(true);
       return;
+      }
     }
 
     // Prepare update data - only include fields that should be updated
@@ -711,6 +757,10 @@ export default function DoctorAppointments({ onNewAppointment }: { onNewAppointm
     
     return appointments;
   }, [appointments, user, patientsData]);
+
+  const displayAppointments = React.useMemo(() => {
+    return doctorAppointments.filter((apt: any) => matchesListStatusFilter(apt, listStatusFilter));
+  }, [doctorAppointments, listStatusFilter]);
 
   // Helper functions - MUST be defined before useMemo that uses them
   const getPatientName = React.useCallback((patientId: number | string | null | undefined) => {
@@ -967,7 +1017,8 @@ export default function DoctorAppointments({ onNewAppointment }: { onNewAppointm
 
       if (ongoing.length > 0) {
         const maxOngoingEnd = ongoing.reduce((acc, cur) => (cur.end > acc ? cur.end : acc), ongoing[0].end);
-        const afterOngoing = all.filter(({ start }) => start > maxOngoingEnd);
+        // Use >= so the first slot that starts when the ongoing block ends (back-to-back) counts as "Next".
+        const afterOngoing = all.filter(({ start }) => start >= maxOngoingEnd);
         return afterOngoing.length > 0 ? Number(afterOngoing[0].apt.id) : null;
       }
 
@@ -1081,7 +1132,7 @@ export default function DoctorAppointments({ onNewAppointment }: { onNewAppointm
   };
 
   const getAppointmentsForDate = (date: Date) => {
-    const filtered = doctorAppointments.filter((apt: any) => {
+    const filtered = displayAppointments.filter((apt: any) => {
       const appointmentDate = new Date(apt.scheduledAt);
       return isSameDay(appointmentDate, date);
     });
@@ -1090,7 +1141,7 @@ export default function DoctorAppointments({ onNewAppointment }: { onNewAppointm
     if (user?.role === 'nurse') {
       console.log('📅 NURSE CALENDAR: getAppointmentsForDate', {
         date: format(date, 'yyyy-MM-dd'),
-        totalAppointments: doctorAppointments.length,
+        totalAppointments: displayAppointments.length,
         filteredCount: filtered.length,
         appointments: filtered.map((apt: any) => ({
           id: apt.id,
@@ -1108,11 +1159,11 @@ export default function DoctorAppointments({ onNewAppointment }: { onNewAppointm
   // Categorize appointments into upcoming and past
   const categorizedAppointments = React.useMemo(() => {
     const now = new Date();
-    const upcoming = doctorAppointments
+    const upcoming = displayAppointments
       .filter((apt: any) => new Date(apt.scheduledAt).getTime() > now.getTime())
       .sort((a: any, b: any) => new Date(a.scheduledAt).getTime() - new Date(b.scheduledAt).getTime());
 
-    const past = doctorAppointments.filter((apt: any) => {
+    const past = displayAppointments.filter((apt: any) => {
       const aptDate = new Date(apt.scheduledAt);
       return isPast(aptDate) && !isSameDay(aptDate, now);
     }).sort((a: any, b: any) => new Date(b.scheduledAt).getTime() - new Date(a.scheduledAt).getTime());
@@ -1123,13 +1174,13 @@ export default function DoctorAppointments({ onNewAppointment }: { onNewAppointm
     });
 
     return { upcoming, past };
-  }, [doctorAppointments]);
+  }, [displayAppointments]);
 
   // Get filtered appointments based on selected filter and search criteria
   const filteredAppointments = React.useMemo(() => {
     let result = [];
     if (appointmentFilter === 'all') {
-      result = doctorAppointments;
+      result = displayAppointments;
     } else if (appointmentFilter === 'upcoming') {
       result = categorizedAppointments.upcoming;
     } else {
@@ -1175,7 +1226,7 @@ export default function DoctorAppointments({ onNewAppointment }: { onNewAppointm
 
     console.log('🎯 DOCTOR APPOINTMENTS: Displaying', result.length, 'appointments (filter:', appointmentFilter + ', search filters active:', !!(filterDate || filterPatientName || filterPatientId || filterNhsNumber) + ')');
     return result;
-  }, [doctorAppointments, categorizedAppointments, appointmentFilter, filterDate, filterPatientName, filterPatientId, filterNhsNumber, patientsData, usersData]);
+  }, [displayAppointments, categorizedAppointments, appointmentFilter, filterDate, filterPatientName, filterPatientId, filterNhsNumber, patientsData, usersData]);
 
   // Get next upcoming appointment (only SCHEDULED status)
   const nextAppointment = categorizedAppointments.upcoming.find((apt: any) => apt.status === 'scheduled') || null;
@@ -1290,8 +1341,8 @@ export default function DoctorAppointments({ onNewAppointment }: { onNewAppointm
       </div>
 
       {/* Appointment Filters */}
-      <div className="flex items-center justify-between bg-gray-100 dark:bg-gray-800 p-2 rounded-lg">
-        <div className="flex items-center space-x-2">
+      <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between bg-gray-100 dark:bg-gray-800 p-2 rounded-lg">
+        <div className="flex flex-wrap items-center gap-2">
           <span className="text-sm font-medium text-gray-700 dark:text-gray-300">Filter:</span>
           <Button
             variant={appointmentFilter === "upcoming" ? "default" : "outline"}
@@ -1315,7 +1366,7 @@ export default function DoctorAppointments({ onNewAppointment }: { onNewAppointm
             onClick={() => setAppointmentFilter("all")}
             data-testid="filter-all"
           >
-            All ({doctorAppointments.length})
+            All ({displayAppointments.length})
           </Button>
         </div>
         <Button
@@ -1445,7 +1496,7 @@ export default function DoctorAppointments({ onNewAppointment }: { onNewAppointm
                       nowForCardStyle,
                       parseScheduledAtAsLocal,
                     );
-                    const nextId = getNextUpcomingAppointmentId(sorted);
+                    const nextId = isToday(day) ? getNextUpcomingAppointmentId(sorted) : null;
                     return sorted.slice(0, 4).map((appointment: any) => {
                       const cardTimeKind = getAppointmentCardTimeKind(
                         appointment,
@@ -1470,9 +1521,16 @@ export default function DoctorAppointments({ onNewAppointment }: { onNewAppointm
                           )}
                           {nextId != null && Number(appointment.id) === Number(nextId) && (
                             <Badge
-                              className={`${appointmentOngoingBadgeClassName} ${appointmentOngoingBadgePositionClassName} text-[10px] px-1.5 py-0 h-5 leading-none bg-indigo-100 text-indigo-800 dark:bg-indigo-900/40 dark:text-indigo-200`}
+                              className={`${appointmentOngoingBadgeClassName} ${appointmentOngoingBadgePositionClassName} text-[10px] px-1.5 py-0 h-5 leading-none bg-white text-gray-700 border border-gray-300 dark:bg-transparent dark:text-gray-200 dark:border-gray-600`}
                             >
                               Next
+                            </Badge>
+                          )}
+                          {cardTimeKind === "past" && (
+                            <Badge
+                              className={`${appointmentOngoingBadgeClassName} ${appointmentOngoingBadgePositionClassName} text-[10px] px-1.5 py-0 h-5 leading-none bg-gray-100 text-gray-700 border border-gray-300 dark:bg-slate-700/40 dark:text-gray-200 dark:border-slate-600`}
+                            >
+                              Passed
                             </Badge>
                           )}
                           <div className="font-medium truncate text-gray-900 dark:text-gray-100 pr-12">
@@ -1502,8 +1560,8 @@ export default function DoctorAppointments({ onNewAppointment }: { onNewAppointm
       {viewMode === "day" && (
         <Card>
           <CardHeader>
-            <CardTitle className="flex items-center justify-between text-gray-900 dark:text-gray-100">
-              <div className="flex items-center space-x-4">
+            <CardTitle className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between text-gray-900 dark:text-gray-100">
+              <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
                 <Button
                   variant="outline"
                   size="sm"
@@ -1522,9 +1580,30 @@ export default function DoctorAppointments({ onNewAppointment }: { onNewAppointm
                   Next Day
                 </Button>
               </div>
-              <Badge variant="secondary">
-                {getAppointmentsForDate(selectedDate).length} appointments
-              </Badge>
+              <div className="flex flex-wrap items-center gap-2 shrink-0">
+                <Select
+                  value={listStatusFilter}
+                  onValueChange={(v) => setListStatusFilter(v as ListStatusFilter)}
+                >
+                  <SelectTrigger className="h-8 w-[200px] md:w-[220px]" data-testid="select-doctor-appointments-status">
+                    <SelectValue placeholder="Status" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="active">Scheduled & ongoing</SelectItem>
+                    <SelectItem value="scheduled">Scheduled</SelectItem>
+                    <SelectItem value="confirmed">Confirmed</SelectItem>
+                    <SelectItem value="in_progress">In progress</SelectItem>
+                    <SelectItem value="completed">Completed</SelectItem>
+                    <SelectItem value="rescheduled">Rescheduled</SelectItem>
+                    <SelectItem value="cancelled">Cancelled</SelectItem>
+                    <SelectItem value="no_show">No show</SelectItem>
+                    <SelectItem value="all">All statuses</SelectItem>
+                  </SelectContent>
+                </Select>
+                <Badge variant="secondary">
+                  {getAppointmentsForDate(selectedDate).length} appointments
+                </Badge>
+              </div>
             </CardTitle>
           </CardHeader>
           <CardContent>
@@ -1535,7 +1614,7 @@ export default function DoctorAppointments({ onNewAppointment }: { onNewAppointm
                   nowForCardStyle,
                   parseScheduledAtAsLocal,
                 );
-                const nextId = getNextUpcomingAppointmentId(sorted);
+                const nextId = isToday(selectedDate) ? getNextUpcomingAppointmentId(sorted) : null;
                 return sorted.map((appointment: any) => {
                 const patient = patientsData?.find((p: any) => p.id === appointment.patientId);
                 const serviceLabel = getAppointmentServiceLabel(appointment);
@@ -1561,9 +1640,16 @@ export default function DoctorAppointments({ onNewAppointment }: { onNewAppointm
                     )}
                     {nextId != null && Number(appointment.id) === Number(nextId) && (
                       <Badge
-                        className={`${appointmentOngoingBadgeClassName} ${appointmentOngoingBadgePositionClassName} bg-indigo-100 text-indigo-800 dark:bg-indigo-900/40 dark:text-indigo-200`}
+                        className={`${appointmentOngoingBadgeClassName} ${appointmentOngoingBadgePositionClassName} bg-white text-gray-700 border border-gray-300 dark:bg-transparent dark:text-gray-200 dark:border-gray-600`}
                       >
                         Next
+                      </Badge>
+                    )}
+                    {cardTimeKind === "past" && (
+                      <Badge
+                        className={`${appointmentOngoingBadgeClassName} ${appointmentOngoingBadgePositionClassName} bg-gray-100 text-gray-700 border border-gray-300 dark:bg-slate-700/40 dark:text-gray-200 dark:border-slate-600`}
+                      >
+                        Passed
                       </Badge>
                     )}
                     <CardContent className="p-4">
@@ -1653,12 +1739,37 @@ export default function DoctorAppointments({ onNewAppointment }: { onNewAppointm
       {viewMode === "week" && (
         <Card>
           <CardHeader>
-            <CardTitle className="text-lg flex items-center gap-2 text-gray-900 dark:text-gray-100">
-              <Calendar className="h-5 w-5" />
-              Appointments for {format(selectedDate, "EEEE, MMMM d, yyyy")}
-              <Badge variant="secondary" className="ml-2">
-                {getAppointmentsForDate(selectedDate).length} appointment{getAppointmentsForDate(selectedDate).length !== 1 ? 's' : ''}
-              </Badge>
+            <CardTitle className="text-lg flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between text-gray-900 dark:text-gray-100">
+              <div className="flex flex-wrap items-center gap-2 min-w-0">
+                <Calendar className="h-5 w-5 shrink-0" />
+                <span className="break-words">
+                  Appointments for {format(selectedDate, "EEEE, MMMM d, yyyy")}
+                </span>
+              </div>
+              <div className="flex flex-wrap items-center gap-2 shrink-0 sm:ml-auto">
+                <Select
+                  value={listStatusFilter}
+                  onValueChange={(v) => setListStatusFilter(v as ListStatusFilter)}
+                >
+                  <SelectTrigger className="h-8 w-[200px] md:w-[220px]" data-testid="select-doctor-appointments-status-week">
+                    <SelectValue placeholder="Status" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="active">Scheduled & ongoing</SelectItem>
+                    <SelectItem value="scheduled">Scheduled</SelectItem>
+                    <SelectItem value="confirmed">Confirmed</SelectItem>
+                    <SelectItem value="in_progress">In progress</SelectItem>
+                    <SelectItem value="completed">Completed</SelectItem>
+                    <SelectItem value="rescheduled">Rescheduled</SelectItem>
+                    <SelectItem value="cancelled">Cancelled</SelectItem>
+                    <SelectItem value="no_show">No show</SelectItem>
+                    <SelectItem value="all">All statuses</SelectItem>
+                  </SelectContent>
+                </Select>
+                <Badge variant="secondary">
+                  {getAppointmentsForDate(selectedDate).length} appointment{getAppointmentsForDate(selectedDate).length !== 1 ? 's' : ''}
+                </Badge>
+              </div>
             </CardTitle>
           </CardHeader>
           <CardContent>
@@ -1669,7 +1780,7 @@ export default function DoctorAppointments({ onNewAppointment }: { onNewAppointm
                   nowForCardStyle,
                   parseScheduledAtAsLocal,
                 );
-                const nextId = getNextUpcomingAppointmentId(sorted);
+                const nextId = isToday(selectedDate) ? getNextUpcomingAppointmentId(sorted) : null;
                 return sorted.map((appointment: any) => {
                 const doctor = usersData?.find((u: any) => u.id === appointment.providerId);
                 // Try multiple matching strategies to find the patient
@@ -1720,9 +1831,16 @@ export default function DoctorAppointments({ onNewAppointment }: { onNewAppointm
                     )}
                     {nextId != null && Number(appointment.id) === Number(nextId) && (
                       <Badge
-                        className={`${appointmentOngoingBadgeClassName} ${appointmentOngoingBadgePositionClassName} bg-indigo-100 text-indigo-800 dark:bg-indigo-900/40 dark:text-indigo-200`}
+                        className={`${appointmentOngoingBadgeClassName} ${appointmentOngoingBadgePositionClassName} bg-white text-gray-700 border border-gray-300 dark:bg-transparent dark:text-gray-200 dark:border-gray-600`}
                       >
                         Next
+                      </Badge>
+                    )}
+                    {cardTimeKind === "past" && (
+                      <Badge
+                        className={`${appointmentOngoingBadgeClassName} ${appointmentOngoingBadgePositionClassName} bg-gray-100 text-gray-700 border border-gray-300 dark:bg-slate-700/40 dark:text-gray-200 dark:border-slate-600`}
+                      >
+                        Passed
                       </Badge>
                     )}
                     <CardContent className="p-4">
@@ -3616,7 +3734,7 @@ export default function DoctorAppointments({ onNewAppointment }: { onNewAppointm
         <DialogContent className="max-h-[min(90vh,90dvh)] max-w-[min(32rem,calc(100vw-2rem))] w-full overflow-y-auto overflow-x-hidden dark:border-gray-700 dark:bg-slate-800">
           <DialogHeader>
             <DialogTitle className="text-xl font-bold text-red-600 dark:text-red-400">
-              Patient has Already an appointment with another doctor
+              Appointment Conflict: Patient Already Has an Appointment at This Time
             </DialogTitle>
             <DialogDescription asChild>
               <p className="text-left text-sm text-gray-700 dark:text-gray-300 pt-1 leading-relaxed">
