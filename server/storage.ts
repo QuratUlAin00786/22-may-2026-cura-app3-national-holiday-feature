@@ -7539,6 +7539,7 @@ export class DatabaseStorage implements IStorage {
       organizations.currency_code,
       organizations.currency_symbol,
       organizations.language_code,
+      saasSubscriptions.status,
       saasSubscriptions.paymentStatus,
       saasSubscriptions.currentPeriodStart,
       saasSubscriptions.currentPeriodEnd,
