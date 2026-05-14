@@ -552,9 +552,21 @@ export default function PharmacyDashboard() {
       setOpeningCash("0.00");
       setShiftNotes("");
     } catch (error) {
+      let description = "Failed to start shift. Please try again.";
+      if (error instanceof Error) {
+        const brace = error.message.indexOf("{");
+        if (brace >= 0) {
+          try {
+            const body = JSON.parse(error.message.slice(brace)) as { error?: string };
+            if (body.error) description = body.error;
+          } catch {
+            /* keep default */
+          }
+        }
+      }
       toast({
         title: "Error",
-        description: "Failed to start shift. Please try again.",
+        description,
         variant: "destructive",
       });
     }
@@ -579,9 +591,21 @@ export default function PharmacyDashboard() {
       setDiscrepancyNotes("");
       setShiftNotes("");
     } catch (error) {
+      let description = "Failed to close shift. Please try again.";
+      if (error instanceof Error) {
+        const brace = error.message.indexOf("{");
+        if (brace >= 0) {
+          try {
+            const body = JSON.parse(error.message.slice(brace)) as { error?: string };
+            if (body.error) description = body.error;
+          } catch {
+            /* keep default */
+          }
+        }
+      }
       toast({
         title: "Error",
-        description: "Failed to close shift. Please try again.",
+        description,
         variant: "destructive",
       });
     }

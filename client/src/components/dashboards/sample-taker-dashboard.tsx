@@ -13,6 +13,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { useToast } from "@/hooks/use-toast";
+import { useCurrency } from "@/hooks/use-currency";
 import { queryClient, apiRequest } from "@/lib/queryClient";
 import { getActiveSubdomain } from "@/lib/subdomain-utils";
 

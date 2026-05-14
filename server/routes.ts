@@ -34621,6 +34621,200 @@ ${clinicName}`;
     }
   });
 
+  // ====== PHARMACY DASHBOARD, SHIFTS & REPORTS (pharmacyService) ======
+  const pharmacyAccessRoles = ["admin", "doctor", "nurse", "receptionist", "pharmacist"];
+
+  app.get("/api/pharmacy/dashboard", authMiddleware, requireRole(pharmacyAccessRoles), async (req: TenantRequest, res) => {
+    try {
+      const summary = await pharmacyService.getDashboardSummary(req.tenant!.id);
+      res.json(summary);
+    } catch (error: any) {
+      console.error("Error fetching pharmacy dashboard:", error);
+      res.status(500).json({ error: error.message || "Failed to fetch pharmacy dashboard" });
+    }
+  });
+
+  app.get("/api/pharmacy/shifts/current", authMiddleware, requireRole(pharmacyAccessRoles), async (req: TenantRequest, res) => {
+    try {
+      const shift = await pharmacyService.getOpenShift(req.tenant!.id, req.user!.id);
+      res.json(shift ?? null);
+    } catch (error: any) {
+      console.error("Error fetching current pharmacy shift:", error);
+      res.status(500).json({ error: error.message || "Failed to fetch current shift" });
+    }
+  });
+
+  app.post("/api/pharmacy/shifts/start", authMiddleware, requireRole(pharmacyAccessRoles), async (req: TenantRequest, res) => {
+    try {
+      const body = z.object({
+        openingCash: z.union([z.string(), z.number()]),
+        notes: z.string().optional().nullable(),
+      }).parse(req.body);
+
+      const raw =
+        typeof body.openingCash === "number"
+          ? body.openingCash
+          : parseFloat(String(body.openingCash).replace(/,/g, ""));
+      if (Number.isNaN(raw) || raw < 0) {
+        return res.status(400).json({ error: "Invalid opening cash amount" });
+      }
+
+      const now = new Date();
+      const shift = await pharmacyService.startShift({
+        organizationId: req.tenant!.id,
+        pharmacistId: req.user!.id,
+        shiftDate: now,
+        shiftStartTime: now,
+        openingCash: raw.toFixed(2),
+        notes: body.notes?.trim() || undefined,
+      });
+
+      res.status(201).json(shift);
+    } catch (error: any) {
+      console.error("Error starting pharmacy shift:", error);
+      const msg = error?.message || "Failed to start shift";
+      const status = typeof msg === "string" && msg.includes("already an open shift") ? 409 : 400;
+      res.status(status).json({ error: msg });
+    }
+  });
+
+  app.post("/api/pharmacy/shifts/:id/close", authMiddleware, requireRole(pharmacyAccessRoles), async (req: TenantRequest, res) => {
+    try {
+      const shiftId = parseInt(req.params.id, 10);
+      if (Number.isNaN(shiftId)) {
+        return res.status(400).json({ error: "Invalid shift ID" });
+      }
+
+      const existing = await pharmacyService.getShift(shiftId);
+      if (!existing || existing.organizationId !== req.tenant!.id) {
+        return res.status(404).json({ error: "Shift not found" });
+      }
+      if (existing.pharmacistId !== req.user!.id && req.user!.role !== "admin") {
+        return res.status(403).json({ error: "You can only close your own shift" });
+      }
+
+      const body = z.object({
+        closingCash: z.union([z.string(), z.number()]),
+        discrepancyNotes: z.string().optional().nullable(),
+        notes: z.string().optional().nullable(),
+      }).parse(req.body);
+
+      const closingRaw =
+        typeof body.closingCash === "number"
+          ? body.closingCash
+          : parseFloat(String(body.closingCash).replace(/,/g, ""));
+      if (Number.isNaN(closingRaw) || closingRaw < 0) {
+        return res.status(400).json({ error: "Invalid closing cash amount" });
+      }
+
+      const updated = await pharmacyService.closeShift(shiftId, {
+        closingCash: closingRaw.toFixed(2),
+        discrepancyNotes: body.discrepancyNotes?.trim() || undefined,
+        notes: body.notes?.trim() || undefined,
+      });
+
+      res.json(updated);
+    } catch (error: any) {
+      console.error("Error closing pharmacy shift:", error);
+      res.status(400).json({ error: error.message || "Failed to close shift" });
+    }
+  });
+
+  app.get("/api/pharmacy/reports/daily-sales", authMiddleware, requireRole(pharmacyAccessRoles), async (req: TenantRequest, res) => {
+    try {
+      const dateStr = (req.query.date as string) || new Date().toISOString().slice(0, 10);
+      const reportDate = new Date(`${dateStr}T12:00:00`);
+      if (Number.isNaN(reportDate.getTime())) {
+        return res.status(400).json({ error: "Invalid date" });
+      }
+      const report = await pharmacyService.getDailySalesReport(req.tenant!.id, reportDate);
+      res.json(report);
+    } catch (error: any) {
+      console.error("Error fetching pharmacy daily sales report:", error);
+      res.status(500).json({ error: error.message || "Failed to fetch report" });
+    }
+  });
+
+  app.get("/api/pharmacy/reports/returns", authMiddleware, requireRole(pharmacyAccessRoles), async (req: TenantRequest, res) => {
+    try {
+      const end = req.query.endDate ? new Date(req.query.endDate as string) : new Date();
+      const start = req.query.startDate
+        ? new Date(req.query.startDate as string)
+        : new Date(end.getTime() - 30 * 24 * 60 * 60 * 1000);
+      if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) {
+        return res.status(400).json({ error: "Invalid date range" });
+      }
+      const report = await pharmacyService.getReturnSummaryReport(req.tenant!.id, start, end);
+      res.json(report);
+    } catch (error: any) {
+      console.error("Error fetching pharmacy returns report:", error);
+      res.status(500).json({ error: error.message || "Failed to fetch report" });
+    }
+  });
+
+  app.get("/api/pharmacy/reports/item-wise-sales", authMiddleware, requireRole(pharmacyAccessRoles), async (req: TenantRequest, res) => {
+    try {
+      const end = req.query.endDate ? new Date(req.query.endDate as string) : new Date();
+      const start = req.query.startDate
+        ? new Date(req.query.startDate as string)
+        : new Date(end.getTime() - 30 * 24 * 60 * 60 * 1000);
+      if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) {
+        return res.status(400).json({ error: "Invalid date range" });
+      }
+      const rows = await pharmacyService.getItemWiseSalesReport(req.tenant!.id, start, end);
+      res.json(rows);
+    } catch (error: any) {
+      console.error("Error fetching item-wise sales report:", error);
+      res.status(500).json({ error: error.message || "Failed to fetch report" });
+    }
+  });
+
+  app.get("/api/pharmacy/reports/pharmacist-activity", authMiddleware, requireRole(pharmacyAccessRoles), async (req: TenantRequest, res) => {
+    try {
+      const end = req.query.endDate ? new Date(req.query.endDate as string) : new Date();
+      const start = req.query.startDate
+        ? new Date(req.query.startDate as string)
+        : new Date(end.getTime() - 30 * 24 * 60 * 60 * 1000);
+      if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) {
+        return res.status(400).json({ error: "Invalid date range" });
+      }
+      const rows = await pharmacyService.getPharmacistActivityReport(req.tenant!.id, start, end);
+      res.json(rows);
+    } catch (error: any) {
+      console.error("Error fetching pharmacist activity report:", error);
+      res.status(500).json({ error: error.message || "Failed to fetch report" });
+    }
+  });
+
+  app.get("/api/pharmacy/invoices/sales", authMiddleware, requireRole(pharmacyAccessRoles), async (req: TenantRequest, res) => {
+    try {
+      const invoices = await pharmacyService.getSalesInvoices(req.tenant!.id, {
+        startDate: req.query.startDate ? new Date(req.query.startDate as string) : undefined,
+        endDate: req.query.endDate ? new Date(req.query.endDate as string) : undefined,
+        invoiceNumber: req.query.invoiceNumber as string | undefined,
+        status: req.query.status as string | undefined,
+      });
+      res.json(invoices);
+    } catch (error: any) {
+      console.error("Error fetching pharmacy sales invoices:", error);
+      res.status(500).json({ error: error.message || "Failed to fetch invoices" });
+    }
+  });
+
+  app.get("/api/pharmacy/invoices/returns", authMiddleware, requireRole(pharmacyAccessRoles), async (req: TenantRequest, res) => {
+    try {
+      const invoices = await pharmacyService.getReturnInvoices(req.tenant!.id, {
+        startDate: req.query.startDate ? new Date(req.query.startDate as string) : undefined,
+        endDate: req.query.endDate ? new Date(req.query.endDate as string) : undefined,
+        status: req.query.status as string | undefined,
+      });
+      res.json(invoices);
+    } catch (error: any) {
+      console.error("Error fetching pharmacy return invoices:", error);
+      res.status(500).json({ error: error.message || "Failed to fetch invoices" });
+    }
+  });
+
   // ====== PHARMACY SALES MODULE ROUTES ======
 
   // Get available batches for an item using FEFO
