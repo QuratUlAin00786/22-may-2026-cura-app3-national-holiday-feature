@@ -174,7 +174,13 @@ function mergeWithDefaults(partial: Partial<TelemedicineSettings> | null): Telem
 }
 
 // Patient List Component for selecting patients for telemedicine consultations
-function PatientList({ telemedicineSettings }: { telemedicineSettings?: TelemedicineSettings | null }) {
+function PatientList({
+  telemedicineSettings,
+  myProfileImageUrl,
+}: {
+  telemedicineSettings?: TelemedicineSettings | null;
+  myProfileImageUrl?: string | null;
+}) {
   const { toast } = useToast();
   const { user } = useAuth();
   const { canCreate } = useRolePermissions();
@@ -2764,7 +2770,10 @@ export default function Telemedicine() {
               </p>
             </CardHeader>
             <CardContent>
-              <PatientList telemedicineSettings={telemedicineSettings} />
+              <PatientList
+                telemedicineSettings={telemedicineSettings}
+                myProfileImageUrl={myProfileImageUrl}
+              />
             </CardContent>
           </Card>
         </TabsContent>
