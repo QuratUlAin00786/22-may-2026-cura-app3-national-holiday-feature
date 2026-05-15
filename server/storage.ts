@@ -1627,25 +1627,22 @@ export class DatabaseStorage implements IStorage {
   }
 
   async getAppointmentsByProvider(providerId: number, organizationId: number, date?: Date | string): Promise<Appointment[]> {
-    let baseConditions = [
+    let baseConditions: any[] = [
       eq(appointments.providerId, providerId),
       eq(appointments.organizationId, organizationId)
     ];
 
-    // If date is provided, filter appointments for that specific calendar day (naive / wall-clock).
+    // Filter by calendar day using a pure wall-clock DATE() comparison so that JS Date objects
+    // are never sent to PostgreSQL (which would apply a UTC shift and move the window by the
+    // server's timezone offset, causing false positives like 10:00 AM conflicting with 3:00 PM).
     if (date) {
-      const bounds = dayBoundsForScheduledInput(date as any);
-      if (bounds) {
-        baseConditions.push(
-          gte(appointments.scheduledAt, bounds.start),
-          lte(appointments.scheduledAt, bounds.end),
-        );
-      } else {
-        const startOfDay = new Date(date as any);
-        startOfDay.setHours(0, 0, 0, 0);
-        const endOfDay = new Date(date as any);
-        endOfDay.setHours(23, 59, 59, 999);
-        baseConditions.push(gte(appointments.scheduledAt, startOfDay), lte(appointments.scheduledAt, endOfDay));
+      const wall = parseAppointmentWallClock(date as any);
+      if (!Number.isNaN(wall.getTime())) {
+        const y = wall.getFullYear();
+        const mo = String(wall.getMonth() + 1).padStart(2, "0");
+        const d = String(wall.getDate()).padStart(2, "0");
+        const dateStr = `${y}-${mo}-${d}`;
+        baseConditions.push(sql`DATE(${appointments.scheduledAt}::timestamp) = ${dateStr}::date`);
       }
     }
 

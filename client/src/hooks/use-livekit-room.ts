@@ -2,6 +2,19 @@ import { useState, useEffect, useCallback, useRef } from 'react';
 import { Room, RoomEvent, Track, RemoteParticipant, LocalParticipant } from 'livekit-client';
 import { useToast } from '@/hooks/use-toast';
 
+/**
+ * livekit-client builds signal URLs as {host}/rtc/... If the server already returns a URL
+ * ending in /rtc, the WebSocket becomes /rtc/rtc/v1 and the handshake returns 404.
+ */
+function normalizeLiveKitServerUrl(url: string | undefined): string {
+  if (url == null || typeof url !== 'string') return '';
+  let u = url.trim().replace(/\/+$/, '');
+  while (/\/rtc$/i.test(u)) {
+    u = u.replace(/\/rtc$/i, '').replace(/\/+$/, '');
+  }
+  return u;
+}
+
 export interface LiveKitRoomConfig {
   roomName: string;
   participantName: string;
@@ -76,7 +89,7 @@ export function useLiveKitRoom(): UseLiveKitRoomReturn {
         config.url = data.url;
       }
 
-      const serverUrl = config.url;
+      const serverUrl = normalizeLiveKitServerUrl(config.url);
       if (!serverUrl) {
         throw new Error('LiveKit URL is required');
       }
