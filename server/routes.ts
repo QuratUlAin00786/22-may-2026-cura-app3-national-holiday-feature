@@ -7855,6 +7855,9 @@ This treatment plan should be reviewed and adjusted based on individual patient 
     // For all other roles, check module permission
     return requireModulePermission('appointments', 'create')(req, res, next);
   }, async (req: TenantRequest, res) => {
+    // Hoisted so POST /api/appointments catch handlers can build PROVIDER_TIME_CONFLICT details
+    // (const inside try is not in scope in catch — was causing ReferenceError → empty conflicts[]).
+    let appointmentData: any = undefined;
     try {
       console.log("[APPOINTMENTS] Request received:", {
         method: req.method,
@@ -7876,7 +7879,7 @@ This treatment plan should be reviewed and adjusted based on individual patient 
         rescheduledFromId: req.body.rescheduledFromId ?? req.body.rescheduled_from_id ?? null,
       };
 
-      const appointmentData = z.object({
+      appointmentData = z.object({
         patientId: z.union([z.number(), z.string()]).transform((val) => {
           console.log("[APPOINTMENTS-ZOD] Transforming patientId:", val, "Type:", typeof val);
           // Handle null, undefined, empty string, or NaN
@@ -8476,9 +8479,11 @@ ${clinicName}`;
         // Keep a consistent conflict shape for the UI (and use 409 Conflict).
         // Also return conflict details when possible.
         try {
-          const providerId = Number((appointmentData as any)?.providerId);
-          const scheduledAt = String((appointmentData as any)?.scheduledAt || "");
-          const duration = Number((appointmentData as any)?.duration || 30);
+          const providerId = Number(appointmentData?.providerId);
+          const scheduledAt = String(
+            appointmentData?.scheduledAt || appointmentData?.appointmentDate || "",
+          );
+          const duration = Number(appointmentData?.duration || 30);
           if (providerId && scheduledAt) {
             const existingAppointments = await storage.getAppointmentsByProvider(
               providerId,
@@ -8533,9 +8538,11 @@ ${clinicName}`;
       // Provider time overlap conflict: return conflicting appointment details
       if (error instanceof Error && error.message.includes("Doctor is already scheduled at this time")) {
         try {
-          const providerId = Number((appointmentData as any)?.providerId);
-          const scheduledAt = String((appointmentData as any)?.scheduledAt || "");
-          const duration = Number((appointmentData as any)?.duration || 30);
+          const providerId = Number(appointmentData?.providerId);
+          const scheduledAt = String(
+            appointmentData?.scheduledAt || appointmentData?.appointmentDate || "",
+          );
+          const duration = Number(appointmentData?.duration || 30);
           if (providerId && scheduledAt) {
             const existingAppointments = await storage.getAppointmentsByProvider(
               providerId,

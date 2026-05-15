@@ -740,134 +740,197 @@ const parseShiftTimeToMinutes = (time?: string): number => {
     return null;
   };
 
-  // Function to check if a time slot is available and within shift
-  const isTimeSlotAvailable = (date: Date, timeSlot: string) => {
-    if (!date || !timeSlot || !appointments) return true;
-    
-    // Determine which provider to check for shift validation
-    const providerForShift = editingAppointment ? editingAppointment.providerId : (selectedProviderId ? parseInt(selectedProviderId) : null);
-    
-    // Check if slot is within staff's working hours
-    if (providerForShift && !isTimeSlotInShift(timeSlot, date, providerForShift)) {
-      console.log('[Availability Check] Slot not in shift for provider:', providerForShift, 'Time:', timeSlot);
-      // Additional debug: log shift bounds for troubleshooting
-      const shiftBounds = getProviderShiftBounds(date, providerForShift);
-      if (shiftBounds) {
-        const slotMins = timeSlotToMinutes(timeSlot);
-        console.log('[Availability Check] Shift bounds:', {
-          start: shiftBounds.start,
-          end: shiftBounds.end,
-          slotMinutes: slotMins,
-          slotEndMinutes: slotMins + 15,
-          wouldFit: (slotMins + 15) <= shiftBounds.end
-        });
+  /** Duplicate row ids to ignore while the reschedule/duplicate modal is open (see isTimeSlotAvailable). */
+  const computeRescheduleExcludeAppointmentKeys = (): Set<string> => {
+    const rescheduleExcludeKeys = new Set<string>();
+    const addRescheduleEx = (v: unknown) => {
+      if (v == null || v === "") return;
+      rescheduleExcludeKeys.add(String(v));
+    };
+    if (duplicateAppointment) {
+      let excludeDup = false;
+      if (newAppointmentDate && newSelectedTimeSlot) {
+        const newIv = buildLocalIntervalFromDateAndTimeSlot(
+          newAppointmentDate,
+          newSelectedTimeSlot,
+          selectedDuration || 30,
+        );
+        if (newIv && !Number.isNaN(newIv.start.getTime()) && !Number.isNaN(newIv.end.getTime())) {
+          const dupRaw = parseScheduledAtAsLocal(
+            duplicateAppointment.scheduledAt ?? duplicateAppointment.scheduled_at,
+          );
+          if (!Number.isNaN(dupRaw.getTime())) {
+            const dupDurRaw = Number(duplicateAppointment.duration);
+            const dupDur = Number.isFinite(dupDurRaw) && dupDurRaw > 0 ? dupDurRaw : 30;
+            const dupStartNorm = new Date(
+              dupRaw.getFullYear(),
+              dupRaw.getMonth(),
+              dupRaw.getDate(),
+              dupRaw.getHours(),
+              dupRaw.getMinutes(),
+              0,
+              0,
+            );
+            const dupEnd = new Date(dupStartNorm.getTime() + dupDur * 60 * 1000);
+            const ns = newIv.start.getTime();
+            const ne = newIv.end.getTime();
+            const ds = dupStartNorm.getTime();
+            const de = dupEnd.getTime();
+            const overlap = ns < de && ne > ds;
+            const oldFullyBeforeOrTouchesNewStart = de <= ns;
+            excludeDup = overlap || oldFullyBeforeOrTouchesNewStart;
+          }
+        }
       }
-      return false;
+      if (excludeDup) {
+        addRescheduleEx(duplicateAppointment.id);
+        addRescheduleEx(duplicateAppointment.appointment_id);
+      }
     }
-    
-    const selectedDateString = format(date, 'yyyy-MM-dd');
-    
-    // Log the provider being checked
-    console.log('[Availability Check] Checking slot:', timeSlot, 'for provider:', providerForShift || 'ALL', 'on date:', selectedDateString);
-    
-    // Convert the time slot to minutes (this represents the START time of the slot)
-    const [time, period] = timeSlot.split(' ');
-    const [hours, minutes] = time.split(':').map(Number);
+    return rescheduleExcludeKeys;
+  };
+
+  /**
+   * True if this 15-minute row [slotStart, slotEnd) overlaps a blocking appointment for the same calendar day.
+   * Used for "booked/grey" styling — not for "cannot fit full duration starting here" (that stays on click via checkConsecutiveSlotsAvailable).
+   */
+  const timeSlotHasBookingOverlap = (date: Date, timeSlot: string): boolean => {
+    if (!date || !timeSlot || !appointments) return false;
+
+    const selectedDateString = format(date, "yyyy-MM-dd");
+    const [time, period] = timeSlot.split(" ");
+    const [hours, minutes] = time.split(":").map(Number);
     let hour24 = hours;
-    if (period === 'PM' && hours !== 12) hour24 += 12;
-    if (period === 'AM' && hours === 12) hour24 = 0;
+    if (period === "PM" && hours !== 12) hour24 += 12;
+    if (period === "AM" && hours === 12) hour24 = 0;
     const slotStartMinutes = hour24 * 60 + minutes;
-    // Each slot is 15 minutes, but we need to check if starting an appointment HERE would fit
-    const slotEndMinutes = slotStartMinutes + 15; // Just this 15-min slot
-    
-    // *** CHANGE 2: Enhanced conflict checking with logging ***
-    // Check if this slot overlaps with any existing appointment
-    const isBooked = appointments.some((apt: any) => {
-      // Exclude the appointment being edited from conflict checks
+    const slotEndMinutes = slotStartMinutes + 15;
+
+    const slotStartDate = new Date(
+      date.getFullYear(),
+      date.getMonth(),
+      date.getDate(),
+      hour24,
+      minutes,
+      0,
+      0,
+    );
+    const slotEndDate = new Date(slotStartDate.getTime() + 15 * 60 * 1000);
+    const rescheduleExcludeKeys = computeRescheduleExcludeAppointmentKeys();
+
+    return appointments.some((apt: any) => {
       if (editingAppointment && apt.id === editingAppointment.id) {
-        console.log('[Availability Check] Excluding current editing appointment:', apt.id);
         return false;
       }
-      
+
+      const aptRowId = apt.id != null ? String(apt.id) : "";
+      const aptBizId = (apt as any).appointment_id != null ? String((apt as any).appointment_id) : "";
+      if ((aptRowId && rescheduleExcludeKeys.has(aptRowId)) || (aptBizId && rescheduleExcludeKeys.has(aptBizId))) {
+        return false;
+      }
+
       const st = String(apt.status ?? "")
         .toLowerCase()
         .trim()
         .replace(/\s+/g, "_");
-
-      // Exclude cancelled/completed appointments - treat them as available slots
-      if (st === 'cancelled' || st === 'canceled' || st === 'completed' || st === "rescheduled") {
-        console.log('[Availability Check] Excluding non-blocking appointment:', apt.id, st);
+      if (st === "cancelled" || st === "canceled" || st === "completed" || st === "rescheduled") {
         return false;
       }
-      
-      // Determine which provider to check: editing appointment's provider or selected provider for new appointments
+
       const providerToCheck = editingAppointment
         ? Number(editingAppointment.providerId ?? (editingAppointment as any).provider_id)
-        : (selectedProviderId ? Number(selectedProviderId) : null);
-      // IMPORTANT UX RULE:
-      // - While booking (admin/nurse/doctor), time slots should reflect provider availability only.
-      // - Patient conflicts are handled on confirmation/server-side (and via conflict modal).
-      // - Only patient-self booking should disable slots by patient overlaps.
+        : selectedProviderId
+          ? Number(selectedProviderId)
+          : null;
       const patientToCheck =
         user?.role === "patient"
-          ? (editingAppointment
-              ? (editingAppointment.patientId ?? (editingAppointment as any).patient_id ?? null)
-              : (newAppointmentData?.patientId ? parseInt(newAppointmentData.patientId) : null))
+          ? editingAppointment
+            ? (editingAppointment.patientId ?? (editingAppointment as any).patient_id ?? null)
+            : newAppointmentData?.patientId
+              ? parseInt(newAppointmentData.patientId)
+              : null
           : null;
       const aptProviderId = Number(apt?.providerId ?? (apt as any).provider_id);
-      
-      // Only check appointments for the relevant provider
-      if (providerToCheck && aptProviderId !== providerToCheck) {
-        // still may conflict by patient; don't early-return yet
-      }
-      
-      // Parse scheduledAt as local time (handles ISO and PostgreSQL timestamp formats)
+
       const aptDate = parseScheduledAtAsLocal(apt.scheduledAt);
       if (Number.isNaN(aptDate.getTime())) return false;
-      const aptDateString = format(aptDate, "yyyy-MM-dd");
-      
-      // Only check appointments on the same date
-      if (aptDateString !== selectedDateString) return false;
-      
-      // Extract local time components (no timezone conversion)
-      const aptStartMinutes = aptDate.getHours() * 60 + aptDate.getMinutes();
-      const aptDuration = apt.duration || 30; // Default to 30 if duration not set
-      const aptEndMinutes = aptStartMinutes + aptDuration;
-      
-      // Check if this 15-minute slot overlaps with the existing appointment
-      // Two time ranges overlap if: slot_start < existing_end AND slot_end > existing_start
-      const hasConflict = slotStartMinutes < aptEndMinutes && slotEndMinutes > aptStartMinutes;
-      
-      if (hasConflict) {
-        const isProviderConflict = providerToCheck && aptProviderId === providerToCheck;
-        const isPatientConflict =
-          patientToCheck != null &&
-          (Number(apt.patientId ?? (apt as any).patient_id) === Number(patientToCheck));
+      if (format(aptDate, "yyyy-MM-dd") !== selectedDateString) return false;
 
-        if (!isProviderConflict && !isPatientConflict) {
-          return false;
-        }
-        console.log('[Availability Check] ❌ CONFLICT DETECTED:', {
-          slot: timeSlot,
-          slotRange: `${slotStartMinutes}-${slotEndMinutes} mins`,
-          providerChecking: providerToCheck,
-          patientChecking: patientToCheck,
-          conflictingAppointment: {
-            id: apt.id,
-            providerId: aptProviderId,
-            patientId: apt.patientId ?? (apt as any).patient_id,
-            time: `${aptDate.getHours().toString().padStart(2, "0")}:${aptDate.getMinutes().toString().padStart(2, "0")}`,
-            range: `${aptStartMinutes}-${aptEndMinutes} mins`,
-            duration: aptDuration
-          }
-        });
-        return true;
-      }
-      
-      return false;
+      const aptStartDate = new Date(
+        aptDate.getFullYear(),
+        aptDate.getMonth(),
+        aptDate.getDate(),
+        aptDate.getHours(),
+        aptDate.getMinutes(),
+        0,
+        0,
+      );
+      const rawDur = Number(apt?.duration);
+      const aptDurationMins = Number.isFinite(rawDur) && rawDur > 0 ? rawDur : 30;
+      const aptEndDate = new Date(aptStartDate.getTime() + aptDurationMins * 60 * 1000);
+
+      const hasConflict = slotStartDate < aptEndDate && slotEndDate > aptStartDate;
+      if (!hasConflict) return false;
+
+      const isProviderConflict = Boolean(providerToCheck && aptProviderId === providerToCheck);
+      const isPatientConflict =
+        patientToCheck != null && Number(apt.patientId ?? (apt as any).patient_id) === Number(patientToCheck);
+      if (!isProviderConflict && !isPatientConflict) return false;
+
+      console.log("[Availability Check] ❌ CONFLICT DETECTED:", {
+        slot: timeSlot,
+        slotRange: `${slotStartMinutes}-${slotEndMinutes} mins`,
+        providerChecking: providerToCheck,
+        patientChecking: patientToCheck,
+        conflictingAppointment: {
+          id: apt.id,
+          providerId: aptProviderId,
+          patientId: apt.patientId ?? (apt as any).patient_id,
+          time: `${aptStartDate.getHours().toString().padStart(2, "0")}:${aptStartDate.getMinutes().toString().padStart(2, "0")}`,
+          duration: aptDurationMins,
+        },
+      });
+      return true;
     });
-    
-    return !isBooked;
+  };
+
+  // Function to check if a time slot is available and within shift
+  const isTimeSlotAvailable = (date: Date, timeSlot: string) => {
+    if (!date || !timeSlot || !appointments) return true;
+
+    const providerForShift = editingAppointment
+      ? editingAppointment.providerId
+      : selectedProviderId
+        ? parseInt(selectedProviderId)
+        : null;
+
+    if (providerForShift && !isTimeSlotInShift(timeSlot, date, providerForShift)) {
+      console.log("[Availability Check] Slot not in shift for provider:", providerForShift, "Time:", timeSlot);
+      const shiftBounds = getProviderShiftBounds(date, providerForShift);
+      if (shiftBounds) {
+        const slotMins = timeSlotToMinutes(timeSlot);
+        console.log("[Availability Check] Shift bounds:", {
+          start: shiftBounds.start,
+          end: shiftBounds.end,
+          slotMinutes: slotMins,
+          slotEndMinutes: slotMins + 15,
+          wouldFit: slotMins + 15 <= shiftBounds.end,
+        });
+      }
+      return false;
+    }
+
+    const selectedDateString = format(date, "yyyy-MM-dd");
+    console.log(
+      "[Availability Check] Checking slot:",
+      timeSlot,
+      "for provider:",
+      providerForShift || "ALL",
+      "on date:",
+      selectedDateString,
+    );
+
+    return !timeSlotHasBookingOverlap(date, timeSlot);
   };
 
   // Fetch booked time slots for Edit Appointment (grey slots), like patient Edit modal:
@@ -911,10 +974,21 @@ const parseShiftTimeToMinutes = (time?: string): number => {
       dayAppointments.forEach((apt: any) => {
         const aptDate = parseScheduledAtAsLocal(apt.scheduledAt);
         if (Number.isNaN(aptDate.getTime())) return;
-        const startMinutes = aptDate.getHours() * 60 + aptDate.getMinutes();
-        const duration = apt.duration || 30;
-        const endMinutes = startMinutes + duration;
-        for (let m = startMinutes; m < endMinutes; m += 15) {
+        const start = new Date(
+          aptDate.getFullYear(),
+          aptDate.getMonth(),
+          aptDate.getDate(),
+          aptDate.getHours(),
+          aptDate.getMinutes(),
+          0,
+          0,
+        );
+        const rawDur = Number(apt?.duration);
+        const duration = Number.isFinite(rawDur) && rawDur > 0 ? rawDur : 30;
+        const end = new Date(start.getTime() + duration * 60 * 1000);
+        for (let t = start.getTime(); t < end.getTime(); t += 15 * 60 * 1000) {
+          const cur = new Date(t);
+          const m = cur.getHours() * 60 + cur.getMinutes();
           bookedSlotsSet.add(minutesToTimeSlot(m));
         }
       });
@@ -5030,24 +5104,27 @@ Medical License: [License Number]
                       ) : (
                         <div className="grid grid-cols-2 gap-2">
                           {timeSlots.map((slot) => {
-                            const validationForSlot =
-                              newAppointmentDate &&
-                              checkConsecutiveSlotsAvailable(newAppointmentDate, slot, selectedDuration);
-                            const isAvailable = Boolean(validationForSlot?.available);
+                            const providerForShift = selectedProviderId ? parseInt(selectedProviderId, 10) : null;
+                            const inShift =
+                              !!newAppointmentDate &&
+                              (!providerForShift || isTimeSlotInShift(slot, newAppointmentDate, providerForShift));
+                            const overlapsBooked =
+                              !!newAppointmentDate && timeSlotHasBookingOverlap(newAppointmentDate, slot);
+                            const looksUnavailable = !inShift || overlapsBooked;
                             const isSelected = newSelectedTimeSlot === slot;
-                            
+
                             return (
                               <Button
                                 key={slot}
                                 variant={isSelected ? "default" : "outline"}
                                 className={`h-10 text-xs font-medium ${
-                                  !isAvailable 
-                                    ? "bg-gray-200 text-gray-400 cursor-not-allowed border-gray-300" 
-                                    : isSelected 
-                                      ? "bg-blue-500 hover:bg-blue-600 text-white border-blue-500" 
+                                  looksUnavailable
+                                    ? "bg-gray-200 text-gray-400 cursor-not-allowed border-gray-300"
+                                    : isSelected
+                                      ? "bg-blue-500 hover:bg-blue-600 text-white border-blue-500"
                                       : "bg-green-500 hover:bg-green-600 text-white border-green-500"
                                 }`}
-                                disabled={!isAvailable}
+                                disabled={looksUnavailable}
                                 onClick={() => {
                                   if (!newAppointmentDate) return;
                                   
@@ -5243,24 +5320,27 @@ Medical License: [License Number]
                     <div className="border rounded-lg p-3 bg-gray-50 h-[320px] overflow-y-auto">
                       <div className="grid grid-cols-2 gap-2">
                           {timeSlots.map((slot) => {
-                            const validationForSlot =
-                              newAppointmentDate &&
-                              checkConsecutiveSlotsAvailable(newAppointmentDate, slot, selectedDuration);
-                            const isAvailable = newAppointmentDate ? Boolean(validationForSlot?.available) : true;
-                          const isSelected = newSelectedTimeSlot === slot;
-                          
+                            const providerForShift = selectedProviderId ? parseInt(selectedProviderId, 10) : null;
+                            const inShift =
+                              !!newAppointmentDate &&
+                              (!providerForShift || isTimeSlotInShift(slot, newAppointmentDate, providerForShift));
+                            const overlapsBooked =
+                              !!newAppointmentDate && timeSlotHasBookingOverlap(newAppointmentDate, slot);
+                            const looksUnavailable = !inShift || overlapsBooked;
+                            const isSelected = newSelectedTimeSlot === slot;
+
                           return (
                             <Button
                               key={slot}
                               variant={isSelected ? "default" : "outline"}
                               className={`h-10 text-xs font-medium ${
-                                !isAvailable 
-                                  ? "bg-gray-200 text-gray-400 cursor-not-allowed border-gray-300" 
-                                  : isSelected 
-                                    ? "bg-blue-500 hover:bg-blue-600 text-white border-blue-500" 
+                                looksUnavailable
+                                  ? "bg-gray-200 text-gray-400 cursor-not-allowed border-gray-300"
+                                  : isSelected
+                                    ? "bg-blue-500 hover:bg-blue-600 text-white border-blue-500"
                                     : "bg-green-500 hover:bg-green-600 text-white border-green-500"
                               }`}
-                              disabled={!isAvailable}
+                              disabled={looksUnavailable}
                               onClick={() => {
                                 if (!newAppointmentDate) return;
                                 
