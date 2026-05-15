@@ -96,6 +96,7 @@ import {
   buildPatientOverlapDialogDescription,
   findPatientScheduleOverlap,
   buildLocalIntervalFromDateAndTimeSlot,
+  filterAppointmentRowsByWallClockOverlap,
 } from "@/lib/patient-appointment-overlap";
 import { useLocation } from "wouter";
 import { getActiveSubdomain } from "@/lib/subdomain-utils";
@@ -1455,26 +1456,59 @@ const parseShiftTimeToMinutes = (time?: string): number => {
         duration,
       });
       const result = await response.json();
-      
-      if (result.hasConflict) {
-        if (result.patientConflict?.length > 0) {
-          return {
-            hasConflict: true,
-            message: "This patient already has an appointment at this date and time with another doctor.",
-            patientConflict: Array.isArray(result.patientConflict) ? result.patientConflict : [],
-            providerConflict: Array.isArray(result.providerConflict) ? result.providerConflict : [],
-          };
-        }
-        if (result.providerConflict?.length > 0) {
-          return {
-            hasConflict: true,
-            message: "This doctor already has an appointment at this date and time with another patient.",
-            patientConflict: Array.isArray(result.patientConflict) ? result.patientConflict : [],
-            providerConflict: Array.isArray(result.providerConflict) ? result.providerConflict : [],
-          };
-        }
+
+      const mapRow = (c: any) => ({
+        id: c.id ?? c.appointment_id,
+        appointmentId: c.appointmentId ?? c.appointment_id,
+        scheduledAt: c.scheduledAt ?? c.scheduled_at,
+        duration: c.duration,
+        status: c.status,
+        title: c.title,
+        patientId: c.patientId ?? c.patient_id,
+        providerId: c.providerId ?? c.provider_id,
+        createdBy: c.createdBy ?? c.created_by,
+      });
+
+      const patientConflictRaw = Array.isArray(result.patientConflict)
+        ? result.patientConflict.map(mapRow)
+        : [];
+      const providerConflictRaw = Array.isArray(result.providerConflict)
+        ? result.providerConflict.map(mapRow)
+        : [];
+
+      // Same wall-clock overlap as green/grey slots — ignore same-day rows that do not overlap in time.
+      const patientConflict = filterAppointmentRowsByWallClockOverlap(
+        scheduledAt,
+        duration,
+        patientConflictRaw,
+        parseScheduledAtAsLocal,
+      );
+      const providerConflict = buildLocalProviderConflicts({
+        providerId,
+        scheduledAt,
+        duration,
+        appointmentsList: providerConflictRaw,
+      });
+
+      if (patientConflict.length > 0) {
+        return {
+          hasConflict: true,
+          message:
+            "This patient already has an appointment at this date and time with another doctor.",
+          patientConflict,
+          providerConflict,
+        };
       }
-      
+      if (providerConflict.length > 0) {
+        return {
+          hasConflict: true,
+          message:
+            "This doctor already has an appointment at this date and time with another patient.",
+          patientConflict,
+          providerConflict,
+        };
+      }
+
       return { hasConflict: false, message: "", patientConflict: [], providerConflict: [] };
     } catch (error) {
       console.error("Error checking appointment conflicts:", error);
@@ -6217,13 +6251,27 @@ Medical License: [License Number]
                     }
                   }
 
+                  const patientName = patientsData?.find(
+                    (p: any) => p.id.toString() === newAppointmentData.patientId,
+                  );
+                  const generatedTitle = `${patientName?.firstName || "Patient"} - ${selectedRole.charAt(0).toUpperCase() + selectedRole.slice(1)} Appointment`;
+                  const normalizedAppointmentType = appointmentType || "consultation";
+                  const treatmentId =
+                    normalizedAppointmentType === "treatment"
+                      ? appointmentSelectedTreatment?.id || null
+                      : null;
+                  const consultationId =
+                    normalizedAppointmentType === "consultation"
+                      ? appointmentSelectedConsultation?.id || null
+                      : null;
+
                   const conflictResult = await checkAppointmentConflicts(
                     parseInt(newAppointmentData.patientId),
                     parseInt(selectedProviderId),
                     newScheduledAt,
                     selectedDuration,
                   );
-                  
+
                   if (conflictResult.hasConflict) {
                     const patientConflict = Array.isArray(conflictResult.patientConflict)
                       ? conflictResult.patientConflict
@@ -6233,10 +6281,7 @@ Medical License: [License Number]
                       : [];
                     if (patientConflict.length > 0) {
                       const first = patientConflict[0];
-                      if (isNonBlockingForRebook(first?.status)) {
-                        // allow rebooking over completed/cancelled/canceled/rescheduled appointments
-                        // keep going and create the new appointment
-                      } else {
+                      if (!isNonBlockingForRebook(first?.status)) {
                         setPatientOverlapConflictRecord({
                           ...first,
                           id: first.id ?? first.appointment_id,
@@ -6249,41 +6294,30 @@ Medical License: [License Number]
                         return;
                       }
                     } else if (providerConflict.length > 0) {
-                      // Provider overlap is handled by the 409 conflict modal in the create mutation;
-                      // keep the existing toast here as a fallback for this pre-check.
-                      toast({
-                        title: "Appointment Conflict",
-                        description: conflictResult.message,
-                        variant: "destructive",
-                      });
-                    } else {
-                      toast({
-                        title: "Appointment Conflict",
-                        description: conflictResult.message,
-                        variant: "destructive",
-                      });
-                    }
-                    // If patientConflict existed but was non-blocking (e.g. rescheduled), we intentionally continue.
-                    if (
-                      patientConflict.length === 0 ||
-                      !isNonBlockingForRebook((patientConflict[0] as any)?.status)
-                    ) {
+                      const pendingPayload = {
+                        patientId: parseInt(newAppointmentData.patientId),
+                        providerId: parseInt(selectedProviderId),
+                        assignedRole: selectedRole,
+                        title: generatedTitle,
+                        type: normalizedAppointmentType === "treatment" ? "procedure" : "consultation",
+                        appointmentType: normalizedAppointmentType,
+                        treatmentId,
+                        treatment_id: treatmentId,
+                        consultationId,
+                        consultation_id: consultationId,
+                        status: "scheduled",
+                        scheduledAt: newScheduledAt,
+                        duration: selectedDuration,
+                        description: "",
+                        createdBy: user?.id,
+                      };
+                      setPendingCreateAppointmentPayload(pendingPayload);
+                      setProviderTimeConflicts(providerConflict);
+                      setShowProviderTimeConflict(true);
+                      setShowConfirmationDialog(false);
                       return;
                     }
                   }
-                  
-                  // Generate title from patient and provider names
-                  const patientName = patientsData?.find((p: any) => p.id.toString() === newAppointmentData.patientId);
-                  const providerName = usersData?.find((u: any) => u.id.toString() === selectedProviderId);
-                  const generatedTitle = `${patientName?.firstName || 'Patient'} - ${selectedRole.charAt(0).toUpperCase() + selectedRole.slice(1)} Appointment`;
-                  
-                  const normalizedAppointmentType = appointmentType || "consultation";
-                  const treatmentId = normalizedAppointmentType === "treatment"
-                    ? appointmentSelectedTreatment?.id || null
-                    : null;
-                  const consultationId = normalizedAppointmentType === "consultation"
-                    ? appointmentSelectedConsultation?.id || null
-                    : null;
 
                   console.log('[APPOINTMENT-CALENDAR] Creating appointment with data:', {
                     patientId: parseInt(newAppointmentData.patientId),

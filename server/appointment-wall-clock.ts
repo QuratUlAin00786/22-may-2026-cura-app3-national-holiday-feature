@@ -121,14 +121,28 @@ export function wallClockIntervalsOverlap(a: WallClockInterval, b: WallClockInte
   return a.startMin < b.endMin && a.endMin > b.startMin;
 }
 
+/** Normalize DB driver Date / ISO-Z strings to wall-clock inputs before comparing. */
+export function normalizeScheduledAtForWallClock(value: unknown): unknown {
+  if (value instanceof Date) {
+    return formatAppointmentScheduledAtForApi(value) ?? value;
+  }
+  return value;
+}
+
 export function appointmentWallClockOverlaps(
   newScheduledAt: unknown,
   newDurationMins: number | null | undefined,
   existingScheduledAt: unknown,
   existingDurationMins: number | null | undefined,
 ): boolean {
-  const a = wallClockIntervalFromScheduled(newScheduledAt, newDurationMins);
-  const b = wallClockIntervalFromScheduled(existingScheduledAt, existingDurationMins);
+  const a = wallClockIntervalFromScheduled(
+    normalizeScheduledAtForWallClock(newScheduledAt),
+    newDurationMins,
+  );
+  const b = wallClockIntervalFromScheduled(
+    normalizeScheduledAtForWallClock(existingScheduledAt),
+    existingDurationMins,
+  );
   if (!a || !b) return false;
   return wallClockIntervalsOverlap(a, b);
 }

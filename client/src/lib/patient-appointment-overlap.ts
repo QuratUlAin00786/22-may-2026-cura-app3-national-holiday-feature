@@ -116,6 +116,44 @@ export function buildLocalIntervalFromDateAndTimeSlot(
   };
 }
 
+const NON_BLOCKING_OVERLAP_STATUSES = new Set([
+  "cancelled",
+  "canceled",
+  "completed",
+  "rescheduled",
+]);
+
+function normalizeOverlapStatus(status: unknown): string {
+  return String(status ?? "")
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, "_");
+}
+
+/** Keep only rows whose wall-clock interval overlaps [scheduledAt, scheduledAt + duration). */
+export function filterAppointmentRowsByWallClockOverlap(
+  scheduledAt: string,
+  durationMinutes: number,
+  rows: any[] | null | undefined,
+  parseLocal: (v: string | Date) => Date,
+): any[] {
+  if (!Array.isArray(rows) || rows.length === 0) return [];
+  const newStart = parseLocal(scheduledAt);
+  const newDur = Number(durationMinutes) > 0 ? Number(durationMinutes) : 30;
+  const newEnd = new Date(newStart.getTime() + newDur * 60 * 1000);
+  const n0 = newStart.getTime();
+  const n1 = newEnd.getTime();
+  if (Number.isNaN(n0) || Number.isNaN(n1) || n1 <= n0) return [];
+
+  return rows.filter((apt) => {
+    const st = normalizeOverlapStatus(apt?.status);
+    if (NON_BLOCKING_OVERLAP_STATUSES.has(st)) return false;
+    const iv = getExistingAppointmentIntervalMs(apt, parseLocal);
+    if (!iv) return false;
+    return appointmentIntervalsOverlapMs(n0, n1, iv.startMs, iv.endMs);
+  });
+}
+
 export function findPatientScheduleOverlap(
   patientIdStr: string,
   newStart: Date,

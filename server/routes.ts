@@ -7836,12 +7836,14 @@ This treatment plan should be reviewed and adjusted based on individual patient 
         providerDayRows,
       );
 
-      console.log(`[CONFLICT CHECK] Found ${patientConflicts.length} patient conflicts, ${providerConflicts.length} provider conflicts`);
+      console.log(
+        `[CONFLICT CHECK] Found ${patientConflicts.length} patient conflicts, ${providerConflicts.length} provider conflicts (wall-clock overlap only)`,
+      );
 
       res.json({
         hasConflict: patientConflicts.length > 0 || providerConflicts.length > 0,
-        patientConflict: patientConflicts,
-        providerConflict: providerConflicts
+        patientConflict: patientConflicts.map((c: any) => mapAppointmentConflictForApi(c)),
+        providerConflict: providerConflicts.map((c: any) => mapAppointmentConflictForApi(c)),
       });
     } catch (error) {
       console.error("Error checking appointment conflicts:", error);
