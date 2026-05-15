@@ -87,3 +87,117 @@ export function dayBoundsForScheduledInput(scheduledAt: string | Date): { start:
     end: new Date(y, mo, d, 23, 59, 59, 999),
   };
 }
+
+/** Calendar date + minutes-from-midnight interval (wall clock, no timezone). */
+export interface WallClockInterval {
+  y: number;
+  m: number;
+  d: number;
+  startMin: number;
+  endMin: number;
+}
+
+export function wallClockIntervalFromScheduled(
+  scheduledAt: unknown,
+  durationMins?: number | null,
+): WallClockInterval | null {
+  const wall = parseAppointmentWallClock(scheduledAt);
+  if (Number.isNaN(wall.getTime())) return null;
+  const dur =
+    durationMins != null && Number(durationMins) > 0 ? Number(durationMins) : 30;
+  const startMin = wall.getHours() * 60 + wall.getMinutes();
+  return {
+    y: wall.getFullYear(),
+    m: wall.getMonth() + 1,
+    d: wall.getDate(),
+    startMin,
+    endMin: startMin + dur,
+  };
+}
+
+/** Half-open overlap on the same calendar day only. */
+export function wallClockIntervalsOverlap(a: WallClockInterval, b: WallClockInterval): boolean {
+  if (a.y !== b.y || a.m !== b.m || a.d !== b.d) return false;
+  return a.startMin < b.endMin && a.endMin > b.startMin;
+}
+
+export function appointmentWallClockOverlaps(
+  newScheduledAt: unknown,
+  newDurationMins: number | null | undefined,
+  existingScheduledAt: unknown,
+  existingDurationMins: number | null | undefined,
+): boolean {
+  const a = wallClockIntervalFromScheduled(newScheduledAt, newDurationMins);
+  const b = wallClockIntervalFromScheduled(existingScheduledAt, existingDurationMins);
+  if (!a || !b) return false;
+  return wallClockIntervalsOverlap(a, b);
+}
+
+/** API/JSON: naive local timestamp without Z (avoids UTC shift in clients). */
+export function formatAppointmentScheduledAtForApi(value: unknown): string | null {
+  const wall = parseAppointmentWallClock(value);
+  if (Number.isNaN(wall.getTime())) return null;
+  const y = wall.getFullYear();
+  const mo = String(wall.getMonth() + 1).padStart(2, "0");
+  const d = String(wall.getDate()).padStart(2, "0");
+  const hh = String(wall.getHours()).padStart(2, "0");
+  const mm = String(wall.getMinutes()).padStart(2, "0");
+  const ss = String(wall.getSeconds()).padStart(2, "0");
+  return `${y}-${mo}-${d}T${hh}:${mm}:${ss}`;
+}
+
+export function wallClockDateStringFromScheduled(scheduledAt: unknown): string | null {
+  const wall = parseAppointmentWallClock(scheduledAt);
+  if (Number.isNaN(wall.getTime())) return null;
+  const mo = String(wall.getMonth() + 1).padStart(2, "0");
+  const d = String(wall.getDate()).padStart(2, "0");
+  return `${wall.getFullYear()}-${mo}-${d}`;
+}
+
+const NON_BLOCKING_APPOINTMENT_STATUSES = new Set([
+  "cancelled",
+  "canceled",
+  "completed",
+  "rescheduled",
+]);
+
+export function normalizeAppointmentStatusKey(raw: unknown): string {
+  return String(raw ?? "")
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, "_");
+}
+
+/** Active appointments on the same calendar day that truly overlap [newStart, newEnd). */
+export function filterActiveWallClockConflicts(
+  newScheduledAt: unknown,
+  newDurationMins: number,
+  existingAppointments: any[] | null | undefined,
+): any[] {
+  if (!Array.isArray(existingAppointments)) return [];
+  const dur = Number(newDurationMins) > 0 ? Number(newDurationMins) : 30;
+  return existingAppointments.filter((existing) => {
+    const st = normalizeAppointmentStatusKey(existing?.status);
+    if (NON_BLOCKING_APPOINTMENT_STATUSES.has(st)) return false;
+    const exDur = Number(existing?.duration) > 0 ? Number(existing.duration) : 30;
+    return appointmentWallClockOverlaps(newScheduledAt, dur, existing?.scheduledAt, exDur);
+  });
+}
+
+export function mapAppointmentConflictForApi(row: any): Record<string, unknown> {
+  const scheduledAt =
+    formatAppointmentScheduledAtForApi(row?.scheduledAt ?? row?.scheduled_at) ??
+    row?.scheduledAt ??
+    row?.scheduled_at;
+  return {
+    id: row?.id,
+    appointmentId: row?.appointmentId ?? row?.appointment_id,
+    scheduledAt,
+    duration: row?.duration,
+    status: row?.status,
+    title: row?.title,
+    patientId: row?.patientId ?? row?.patient_id,
+    providerId: row?.providerId ?? row?.provider_id,
+    createdBy: row?.createdBy ?? row?.created_by,
+  };
+}

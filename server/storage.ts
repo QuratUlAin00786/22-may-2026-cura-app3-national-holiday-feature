@@ -1,5 +1,10 @@
 import { isDoctorLike } from './utils/role-utils.js';
-import { dayBoundsForScheduledInput, parseAppointmentWallClock } from "./appointment-wall-clock.js";
+import {
+  appointmentWallClockOverlaps,
+  formatAppointmentScheduledAtForApi,
+  parseAppointmentWallClock,
+  wallClockDateStringFromScheduled,
+} from "./appointment-wall-clock.js";
 import { 
   organizations, users, patients, medicalRecords, medicalRecordsFiles, appointments, invoices, payments, aiInsights, subscriptions, patientCommunications, consultations, notifications, prescriptions, documents, medicalImages, clinicalPhotos, labResults, riskAssessments, claims, revenueRecords, insuranceVerifications, clinicalProcedures, emergencyProtocols, medicationsDatabase, roles, staffShifts, doctorDefaultShifts, gdprConsents, gdprDataRequests, gdprAuditTrail, gdprProcessingActivities, conversations as conversationsTable, messages, messageCampaigns, messageTemplates, userConversationFavorites, messageTags, messageTagAssignments, voiceNotes, saasOwners, saasPackages, saasSubscriptions, saasPayments, saasInvoices, saasSettings, chatbotConfigs, chatbotSessions, chatbotMessages, chatbotAnalytics, musclePositions, userDocumentPreferences, letterDrafts, forecastModels, financialForecasts, quickbooksConnections, quickbooksSyncLogs, quickbooksCustomerMappings, quickbooksInvoiceMappings, quickbooksPaymentMappings, quickbooksAccountMappings, quickbooksItemMappings, quickbooksSyncConfigs, doctorsFee, labTestPricing, imagingPricing, treatments, treatmentsInfo, clinicHeaders, clinicFooters, symptomChecks,   forms, formSections, formFields, formShares, formShareLogs, formResponses, formResponseValues, prescriptionShareLogs,
   type Organization, type InsertOrganization,
@@ -1635,15 +1640,9 @@ export class DatabaseStorage implements IStorage {
     // Filter by calendar day using a pure wall-clock DATE() comparison so that JS Date objects
     // are never sent to PostgreSQL (which would apply a UTC shift and move the window by the
     // server's timezone offset, causing false positives like 10:00 AM conflicting with 3:00 PM).
-    if (date) {
-      const wall = parseAppointmentWallClock(date as any);
-      if (!Number.isNaN(wall.getTime())) {
-        const y = wall.getFullYear();
-        const mo = String(wall.getMonth() + 1).padStart(2, "0");
-        const d = String(wall.getDate()).padStart(2, "0");
-        const dateStr = `${y}-${mo}-${d}`;
-        baseConditions.push(sql`DATE(${appointments.scheduledAt}::timestamp) = ${dateStr}::date`);
-      }
+    const dateStr = wallClockDateStringFromScheduled(date as any);
+    if (dateStr) {
+      baseConditions.push(sql`DATE(${appointments.scheduledAt}::timestamp) = ${dateStr}::date`);
     }
 
     return await db.select().from(appointments)
@@ -1670,29 +1669,23 @@ export class DatabaseStorage implements IStorage {
         appointment.scheduledAt
       );
       
-      // Check for time conflicts (use wall-clock parsing so this matches the calendar UI + PG naive timestamps).
-      const appointmentStart = parseAppointmentWallClock(appointment.scheduledAt);
-      const appointmentEnd = new Date(appointmentStart.getTime() + (appointment.duration || 30) * 60 * 1000);
-      const now = new Date();
-      const conflicts = existingAppointments.filter(existing => {
+      // Wall-clock minute overlap (same calendar day only) — avoids false positives from Date/UTC shifts.
+      const newDur = Number(appointment.duration) > 0 ? Number(appointment.duration) : 30;
+      const conflicts = existingAppointments.filter((existing) => {
         const st = String(existing.status ?? "")
           .toLowerCase()
           .trim()
           .replace(/\s+/g, "_");
-        // Exclude cancelled/completed appointments - they should not block rebooking
-        if (st === 'cancelled' || st === 'canceled' || st === 'completed' || st === "rescheduled") {
+        if (st === "cancelled" || st === "canceled" || st === "completed" || st === "rescheduled") {
           return false;
         }
-        
-        const existingStart = parseAppointmentWallClock(existing.scheduledAt);
-        const existingEnd = new Date(existingStart.getTime() + (existing.duration || 30) * 60 * 1000);
-        // Do not block booking if the existing appointment is currently ongoing.
-        // Its status will typically be updated after it finishes.
-        if (existingStart <= now && now < existingEnd) {
-          return false;
-        }
-        // Check if the time ranges overlap
-        return (appointmentStart < existingEnd && appointmentEnd > existingStart);
+        const exDur = Number(existing.duration) > 0 ? Number(existing.duration) : 30;
+        return appointmentWallClockOverlaps(
+          appointment.scheduledAt,
+          newDur,
+          existing.scheduledAt,
+          exDur,
+        );
       });
       
       if (conflicts.length > 0) {
@@ -1761,8 +1754,10 @@ export class DatabaseStorage implements IStorage {
         // PostgreSQL returns: "2025-11-15 23:15:00", we need: "2025-11-15T23:15:00"
         const createdAppointment: Appointment = {
           ...rawRow,
-          scheduledAt: rawRow.scheduledAt.replace(' ', 'T'),
-          createdAt: new Date(rawRow.createdAt)
+          scheduledAt:
+            formatAppointmentScheduledAtForApi(rawRow.scheduledAt) ??
+            String(rawRow.scheduledAt).replace(" ", "T"),
+          createdAt: new Date(rawRow.createdAt),
         };
         
         // Verify sequential order was maintained

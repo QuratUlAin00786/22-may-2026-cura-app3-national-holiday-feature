@@ -17,7 +17,11 @@ import { multiTenantEnforcer, validateOrganizationFilter, withTenantIsolation } 
 import { initializeMultiTenantPackage, getMultiTenantPackage } from "./packages/multi-tenant-core";
 import { messagingService } from "./messaging-service";
 import { isDoctorLike } from './utils/role-utils.js';
-import { parseAppointmentWallClock } from "./appointment-wall-clock.js";
+import {
+  filterActiveWallClockConflicts,
+  mapAppointmentConflictForApi,
+  wallClockDateStringFromScheduled,
+} from "./appointment-wall-clock.js";
 // PayPal imports moved to dynamic imports to avoid initialization errors when credentials are missing
 import { gdprComplianceService } from "./services/gdpr-compliance";
 import { insertGdprConsentSchema, insertGdprDataRequestSchema, updateMedicalImageReportFieldSchema, medicationsDatabase, patientDrugInteractions, insuranceVerifications, type Appointment, organizations, subscriptions, users, User, patients, symptomChecks, quickbooksConnections, insertClinicHeaderSchema, insertClinicFooterSchema, doctorsFee, invoices, labResults, insertMessageTemplateSchema, passwordResetTokens, saasSubscriptions, saasPackages, saasPayments, organizationIntegrations, insertTreatmentSchema, insertTreatmentsInfoSchema, InsertSaaSSubscription, imagingPricing, scheduledVideoCalls, insertScheduledVideoCallSchema, messages, analyticsSubjects, analyticsSubjectTreatments } from "../shared/schema";
@@ -7791,47 +7795,46 @@ This treatment plan should be reviewed and adjusted based on individual patient 
         return res.status(400).json({ error: "duration must be a positive number (minutes)" });
       }
 
-      // Parse the date/time directly from ISO string WITHOUT timezone conversion
-      // scheduledAt format: "2025-12-12T12:45:00"
-      const dateStr = scheduledAt.substring(0, 10); // "2025-12-12"
-      const timeStr = scheduledAt.substring(11, 16); // "12:45"
+      const dateStr = wallClockDateStringFromScheduled(scheduledAt) ?? String(scheduledAt).substring(0, 10);
 
       console.log(
-        `[CONFLICT CHECK] Checking for conflicts: patientId=${patientId}, providerId=${providerId}, date=${dateStr}, time=${timeStr}, duration=${durationMins}`,
+        `[CONFLICT CHECK] Checking for conflicts: patientId=${patientId}, providerId=${providerId}, date=${dateStr}, scheduledAt=${scheduledAt}, duration=${durationMins}`,
       );
 
       const normalizeStatusSql = (col: any) =>
         sql`LOWER(REPLACE(TRIM(COALESCE(${col}::text, '')), ' ', '_'))`;
 
-      // Overlap rule: [newStart, newEnd) overlaps [existingStart, existingEnd) if:
-      // existingStart < newEnd AND existingEnd > newStart
-      const overlapsSql = sql`
-        ${schema.appointments.scheduledAt} < (${scheduledAt}::timestamp + (${durationMins}::int * interval '1 minute'))
-        AND
-        (${schema.appointments.scheduledAt} + (COALESCE(${schema.appointments.duration}, 30)::int * interval '1 minute')) > ${scheduledAt}::timestamp
-      `;
+      const sameDaySql = sql`DATE(${schema.appointments.scheduledAt}::timestamp) = ${dateStr}::date`;
+      const activeStatusSql = sql`${normalizeStatusSql(schema.appointments.status)} NOT IN ('cancelled','canceled','completed','rescheduled')`;
 
-      // Check for patient conflicts (patient has overlapping appointment with any provider)
-      const patientConflicts = await db.select()
+      const patientDayRows = await db.select()
         .from(schema.appointments)
         .where(and(
           eq(schema.appointments.organizationId, organizationId),
           eq(schema.appointments.patientId, patientId),
-          sql`DATE(${schema.appointments.scheduledAt}) = ${dateStr}`,
-          overlapsSql,
-          sql`${normalizeStatusSql(schema.appointments.status)} NOT IN ('cancelled','canceled','completed','rescheduled')`
+          sameDaySql,
+          activeStatusSql,
         ));
 
-      // Check for provider conflicts (provider has overlapping appointment with any patient)
-      const providerConflicts = await db.select()
+      const providerDayRows = await db.select()
         .from(schema.appointments)
         .where(and(
           eq(schema.appointments.organizationId, organizationId),
           eq(schema.appointments.providerId, providerId),
-          sql`DATE(${schema.appointments.scheduledAt}) = ${dateStr}`,
-          overlapsSql,
-          sql`${normalizeStatusSql(schema.appointments.status)} NOT IN ('cancelled','canceled','completed','rescheduled')`
+          sameDaySql,
+          activeStatusSql,
         ));
+
+      const patientConflicts = filterActiveWallClockConflicts(
+        scheduledAt,
+        durationMins,
+        patientDayRows,
+      );
+      const providerConflicts = filterActiveWallClockConflicts(
+        scheduledAt,
+        durationMins,
+        providerDayRows,
+      );
 
       console.log(`[CONFLICT CHECK] Found ${patientConflicts.length} patient conflicts, ${providerConflicts.length} provider conflicts`);
 
