@@ -8,6 +8,43 @@ import { seedDatabase } from "./seed-data";
 import { smsScheduler } from "./services/sms-scheduler";
 import { startSubscriptionReminderScheduler } from "./services/subscription-reminders";
 
+/** Append to CSP connect-src for LiveKit validate + WebSocket (self-hosted IP, LiveKit Cloud, mk1). */
+function getLiveKitCspConnectExtras(): string {
+  const explicit = process.env.CSP_EXTRA_CONNECT_SRC?.trim();
+  if (explicit) {
+    return explicit.startsWith(" ") ? explicit : ` ${explicit}`;
+  }
+  const parts = new Set<string>([
+    "wss://*.livekit.cloud",
+    "https://*.livekit.cloud",
+  ]);
+  for (const key of [
+    "APP_URL",
+    "BASE_URL",
+    "VITE_API_URL",
+    "LIVEKIT_SERVER_URL",
+    "VITE_LIVEKIT_SERVER_URL",
+  ] as const) {
+    const raw = process.env[key]?.trim();
+    if (!raw) continue;
+    try {
+      const normalized = raw.replace(/^wss:/i, "https:").replace(/^ws:/i, "http:");
+      const u = new URL(normalized.startsWith("http") ? normalized : `https://${normalized}`);
+      if (u.hostname) {
+        parts.add(`https://${u.hostname}`);
+        parts.add(`wss://${u.hostname}`);
+        if (u.port) {
+          parts.add(`https://${u.hostname}:${u.port}`);
+          parts.add(`wss://${u.hostname}:${u.port}`);
+        }
+      }
+    } catch {
+      /* ignore bad URL */
+    }
+  }
+  return ` ${Array.from(parts).join(" ")}`;
+}
+
 console.log("🔐 ENVIRONMENT CHECK:");
 console.log("  - FILE_SECRET exists:", !!process.env.FILE_SECRET);
 console.log("  - NODE_ENV:", process.env.NODE_ENV);
@@ -38,7 +75,7 @@ app.use((req, res, next) => {
       [
         "default-src 'self'",
         "script-src 'self' 'unsafe-inline' 'unsafe-eval' https://js.stripe.com https://connect-js.stripe.com https://*.stripe.com https://cdnjs.cloudflare.com",
-        "connect-src 'self' https://api.stripe.com https://connect.stripe.com https://connect-js.stripe.com https://*.stripe.com https://*.hcaptcha.com https://c.increment.com https://c.stripe.dev https://c.stripe.global https://c.stripe.partners https://edge-api.stripe.com https://edge-billing.stripe.com https://edge-connect.stripe.com https://edge-dashboard.stripe.com https://edge-docs.stripe.com https://edge-marketplace.stripe.com https://edge-site-admin.stripe.com https://edge-support.stripe.com https://issuing-key.stripe.com https://t.stripe.com https://b.stripecdn.com https://billing.stripe.com https://dashboard.stripe.com https://dataconnectors-dashboard-upload-us-west-2-prod.s3.us-west-2.amazonaws.com https://docs.stripe.com https://edge-support-conversations.stripe.com https://edge.stripe.com https://errors.stripe.com https://files.stripe.com https://hcaptcha.com https://marketplace.stripe.com https://qr.stripe.com https://r.stripe.com https://sourcemaps.corp.stripe.com https://site-admin.stripe.com https://stripe.com https://support-conversations.stripe.com https://support.stripe.com https://access.stripe.com wss://stripe-cli-ws-nw.stripe.com wss://stripe-cli.stripe.com wss://stripecli-ws-nw.stripe.com wss://stripecli.stripe.com wss://*.glance.net:* wss://mk1.averox.com https://mk1.averox.com",
+        `connect-src 'self' https://api.stripe.com https://connect.stripe.com https://connect-js.stripe.com https://*.stripe.com https://*.hcaptcha.com https://c.increment.com https://c.stripe.dev https://c.stripe.global https://c.stripe.partners https://edge-api.stripe.com https://edge-billing.stripe.com https://edge-connect.stripe.com https://edge-dashboard.stripe.com https://edge-docs.stripe.com https://edge-marketplace.stripe.com https://edge-site-admin.stripe.com https://edge-support.stripe.com https://issuing-key.stripe.com https://t.stripe.com https://b.stripecdn.com https://billing.stripe.com https://dashboard.stripe.com https://dataconnectors-dashboard-upload-us-west-2-prod.s3.us-west-2.amazonaws.com https://docs.stripe.com https://edge-support-conversations.stripe.com https://edge.stripe.com https://errors.stripe.com https://files.stripe.com https://hcaptcha.com https://marketplace.stripe.com https://qr.stripe.com https://r.stripe.com https://sourcemaps.corp.stripe.com https://site-admin.stripe.com https://stripe.com https://support-conversations.stripe.com https://support.stripe.com https://access.stripe.com wss://stripe-cli-ws-nw.stripe.com wss://stripe-cli.stripe.com wss://stripecli-ws-nw.stripe.com wss://stripecli.stripe.com wss://*.glance.net:* wss://mk1.averox.com https://mk1.averox.com${getLiveKitCspConnectExtras()}`,
         "frame-src 'self' blob: https://js.stripe.com https://connect.stripe.com https://*.stripe.com",
         "frame-ancestors 'self' https://app.contentful.com",
         "img-src 'self' data: https: blob:",

@@ -1,24 +1,44 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
-import { Room, RoomEvent, Track, RemoteParticipant, LocalParticipant } from 'livekit-client';
+import {
+  Room,
+  RoomEvent,
+  Track,
+  RemoteParticipant,
+  LocalParticipant,
+  createLocalVideoTrack,
+} from 'livekit-client';
 import { useToast } from '@/hooks/use-toast';
+import { formatLiveKitConnectionError, resolveLiveKitServerUrl } from '@/lib/livekit-url';
 
-/**
- * livekit-client builds signal URLs as {host}/rtc/... If the server already returns a URL
- * ending in /rtc, the WebSocket becomes /rtc/rtc/v1 and the handshake returns 404.
- */
-function normalizeLiveKitServerUrl(url: string | undefined): string {
-  if (url == null || typeof url !== 'string') return '';
-  let u = url.trim().replace(/\/+$/, '');
-  while (/\/rtc$/i.test(u)) {
-    u = u.replace(/\/rtc$/i, '').replace(/\/+$/, '');
+function releaseCallerWarmStream() {
+  const stream = (window as Window & { __callerWarmStream?: MediaStream | null })
+    .__callerWarmStream;
+  if (stream) {
+    stream.getTracks().forEach((track) => track.stop());
+    (window as Window & { __callerWarmStream?: MediaStream | null }).__callerWarmStream =
+      null;
   }
-  return u;
+}
+
+/** Free the camera/mic device held by the start-call preview stream before LiveKit opens it. */
+function stopCallerWarmTracks(kinds: Array<'audio' | 'video'>) {
+  const stream = (window as Window & { __callerWarmStream?: MediaStream | null })
+    .__callerWarmStream;
+  if (!stream) return;
+  stream.getTracks().forEach((track) => {
+    if (kinds.includes(track.kind as 'audio' | 'video')) {
+      track.stop();
+    }
+  });
+  if (stream.getTracks().every((t) => t.readyState === 'ended')) {
+    (window as Window & { __callerWarmStream?: MediaStream | null }).__callerWarmStream =
+      null;
+  }
 }
 
 export interface LiveKitRoomConfig {
   roomName: string;
   participantName: string;
-  participantRole?: string;
   url?: string;
   token?: string;
   audioEnabled?: boolean;
@@ -50,8 +70,6 @@ export function useLiveKitRoom(): UseLiveKitRoomReturn {
   const [isAudioEnabled, setIsAudioEnabled] = useState(true);
   const [isVideoEnabled, setIsVideoEnabled] = useState(true);
   const roomRef = useRef<Room | null>(null);
-  const localParticipantInfoRef = useRef<{ name: string; role?: string } | null>(null);
-  const remoteParticipantsInfoRef = useRef<Map<string, { name: string; role?: string }>>(new Map());
   const { toast } = useToast();
 
   const connect = useCallback(async (config: LiveKitRoomConfig) => {
@@ -89,9 +107,11 @@ export function useLiveKitRoom(): UseLiveKitRoomReturn {
         config.url = data.url;
       }
 
-      const serverUrl = normalizeLiveKitServerUrl(config.url);
+      const serverUrl = resolveLiveKitServerUrl(config.url);
       if (!serverUrl) {
-        throw new Error('LiveKit URL is required');
+        throw new Error(
+          'LiveKit URL is missing or points at the mk1 API host. Set VITE_LIVEKIT_SERVER_URL in .env to your real wss:// LiveKit host.',
+        );
       }
 
       if (!token) {
@@ -102,16 +122,7 @@ export function useLiveKitRoom(): UseLiveKitRoomReturn {
       const newRoom = new Room({
         adaptiveStream: true,
         dynacast: true,
-        videoCaptureDefaults: {
-          resolution: { width: 1280, height: 720 },
-        },
       });
-
-      // Store local participant info
-      localParticipantInfoRef.current = {
-        name: config.participantName,
-        role: config.participantRole,
-      };
 
       // Set up event listeners
       newRoom.on(RoomEvent.Connected, () => {
@@ -170,88 +181,24 @@ export function useLiveKitRoom(): UseLiveKitRoomReturn {
           console.log('Error stopping media streams on disconnect:', e);
         }
         
-        // Get the local participant's identity before clearing state
-        const localParticipantIdentity = newRoom.localParticipant?.identity;
-        let disconnectedParticipantName = '';
-        let disconnectedParticipantRole: string | undefined;
-        
-        // Try to extract name and role from local participant identity
-        if (localParticipantIdentity) {
-          const identityParts = localParticipantIdentity.split(':');
-          if (identityParts.length >= 5) {
-            disconnectedParticipantRole = identityParts[0];
-            const firstName = identityParts[2];
-            const lastName = identityParts[3];
-            if (firstName && lastName) {
-              disconnectedParticipantName = `${firstName} ${lastName}`;
-            }
-          } else {
-            // Fallback to stored local info
-            const localInfo = localParticipantInfoRef.current;
-            if (localInfo) {
-              disconnectedParticipantName = localInfo.name;
-              disconnectedParticipantRole = localInfo.role;
-            } else {
-              disconnectedParticipantName = localParticipantIdentity;
-            }
-          }
-        } else {
-          // Fallback to stored local info if identity is not available
-          const localInfo = localParticipantInfoRef.current;
-          if (localInfo) {
-            disconnectedParticipantName = localInfo.name;
-            disconnectedParticipantRole = localInfo.role;
-          }
-        }
-        
         setIsConnected(false);
         setIsConnecting(false);
         setLocalParticipant(null);
         setRemoteParticipants([]);
-        
-        // Don't show toast here - parent components handle showing modals
-        // Clear stored participant info
-        localParticipantInfoRef.current = null;
-        remoteParticipantsInfoRef.current.clear();
+        toast({
+          title: 'Disconnected',
+          description: 'You have left the call',
+        });
       });
 
       newRoom.on(RoomEvent.ParticipantConnected, (participant) => {
         console.log('👤 Participant connected:', participant.identity);
         setRemoteParticipants(Array.from(newRoom.remoteParticipants.values()));
-        
-        // Try to extract name and role from participant identity or metadata
-        // The identity format is typically: "role:id:firstName:lastName:email"
-        const identityParts = participant.identity?.split(':') || [];
-        let participantName = participant.name || participant.identity || 'Unknown';
-        let participantRole: string | undefined;
-        
-        if (identityParts.length >= 5) {
-          participantRole = identityParts[0];
-          const firstName = identityParts[2];
-          const lastName = identityParts[3];
-          if (firstName && lastName) {
-            participantName = `${firstName} ${lastName}`;
-          }
-        } else if (participant.name) {
-          participantName = participant.name;
-        }
-        
-        // Store remote participant info
-        remoteParticipantsInfoRef.current.set(participant.identity, {
-          name: participantName,
-          role: participantRole,
-        });
       });
 
       newRoom.on(RoomEvent.ParticipantDisconnected, (participant) => {
         console.log('👤 Participant disconnected:', participant.identity);
         setRemoteParticipants(Array.from(newRoom.remoteParticipants.values()));
-        
-        // Don't show toast here - LiveKit components handle this and call onDisconnect()
-        // which triggers the modal in parent components
-        
-        // Remove from stored participants
-        remoteParticipantsInfoRef.current.delete(participant.identity);
       });
 
       newRoom.on(RoomEvent.TrackSubscribed, (track, publication, participant) => {
@@ -274,8 +221,14 @@ export function useLiveKitRoom(): UseLiveKitRoomReturn {
         console.log('🔊 Track unmuted:', publication.kind, participant.identity);
       });
 
-      newRoom.on(RoomEvent.LocalTrackPublished, (publication, participant) => {
+      newRoom.on(RoomEvent.LocalTrackPublished, (publication) => {
         console.log('📤 Local track published:', publication.kind);
+        if (publication.kind === Track.Kind.Video) {
+          setIsVideoEnabled(true);
+        }
+        if (publication.kind === Track.Kind.Audio) {
+          setIsAudioEnabled(true);
+        }
       });
 
       newRoom.on(RoomEvent.LocalTrackUnpublished, (publication, participant) => {
@@ -289,124 +242,57 @@ export function useLiveKitRoom(): UseLiveKitRoomReturn {
       // Connect to room
       await newRoom.connect(serverUrl, token);
 
-      // Request permissions first, then enable tracks
-      // This prevents "device not found" errors
-      if (config.audioEnabled !== false || config.videoEnabled !== false) {
-        try {
-          // Request permissions by getting a temporary stream
-          const constraints: MediaStreamConstraints = {};
-          if (config.audioEnabled !== false) {
-            constraints.audio = true;
-          }
-          if (config.videoEnabled !== false) {
-            constraints.video = { width: 1280, height: 720 };
-          }
-
-          // Request permissions first
-          const tempStream = await navigator.mediaDevices.getUserMedia(constraints);
-          // Stop the temporary stream immediately - we just needed permissions
-          tempStream.getTracks().forEach(track => track.stop());
-          console.log('✅ Media permissions granted');
-        } catch (err: any) {
-          console.error('❌ Failed to get media permissions:', err);
-          // Continue anyway - user can enable manually later
-          if (config.audioEnabled !== false) {
-            setIsAudioEnabled(false);
-          }
-          if (config.videoEnabled !== false) {
-            setIsVideoEnabled(false);
-          }
-          
-          // Provide more specific error messages
-          let errorMessage = 'Could not access media devices. You can join and enable them manually.';
-          if (err.name === 'NotAllowedError') {
-            errorMessage = 'Please allow camera/microphone access to join the call with video/audio.';
-          } else if (err.name === 'NotFoundError' || err.message?.includes('not found') || err.message?.includes('device not found')) {
-            errorMessage = 'No camera/microphone device found. The call will continue without video/audio.';
-          }
-          
-          toast({
-            title: 'Media Permissions',
-            description: errorMessage,
-            variant: 'default',
-          });
-        }
-      }
-
-      // Now enable tracks (permissions should be granted)
       if (config.audioEnabled !== false) {
         try {
+          stopCallerWarmTracks(['audio']);
           await newRoom.localParticipant.setMicrophoneEnabled(true);
+          setIsAudioEnabled(true);
           console.log('✅ Microphone enabled');
         } catch (err: any) {
           console.error('❌ Failed to enable microphone:', err);
           setIsAudioEnabled(false);
-          // Don't throw - allow call to continue without audio
         }
       }
 
       if (config.videoEnabled !== false) {
+        const enableCamera = async () => {
+          stopCallerWarmTracks(['video']);
+          await new Promise((resolve) => setTimeout(resolve, 100));
+          await newRoom.localParticipant.setCameraEnabled(true);
+          setIsVideoEnabled(true);
+          console.log('✅ Camera enabled');
+        };
         try {
-          // Check if camera is available before trying to enable it
-          let hasCamera = false;
-          try {
-            const devices = await navigator.mediaDevices.enumerateDevices();
-            hasCamera = devices.some(device => device.kind === 'videoinput' && device.deviceId !== '');
-            
-            // If no camera found in initial enumeration, try requesting permission
-            if (!hasCamera) {
-              try {
-                const tempStream = await navigator.mediaDevices.getUserMedia({ video: true });
-                tempStream.getTracks().forEach(track => track.stop());
-                // Re-enumerate after permission
-                const devicesAfterPerm = await navigator.mediaDevices.enumerateDevices();
-                hasCamera = devicesAfterPerm.some(device => device.kind === 'videoinput' && device.deviceId !== '');
-              } catch (permErr: any) {
-                // Permission denied or no camera - that's okay, we'll continue without video
-                console.log('⚠️ Camera not available or permission denied:', permErr.name);
-                hasCamera = false;
-              }
-            }
-          } catch (enumErr) {
-            console.warn('⚠️ Could not enumerate devices:', enumErr);
-            hasCamera = false;
-          }
-
-          if (hasCamera) {
-            await newRoom.localParticipant.setCameraEnabled(true);
-            console.log('✅ Camera enabled');
-          } else {
-            console.log('⚠️ No camera device found - continuing call without video');
-            setIsVideoEnabled(false);
-            toast({
-              title: 'Camera Not Available',
-              description: 'No camera device found. The call will continue without video.',
-              variant: 'default',
-            });
-          }
+          await enableCamera();
         } catch (err: any) {
-          console.error('❌ Failed to enable camera:', err);
-          setIsVideoEnabled(false);
-          // Don't throw - allow call to continue without video
-          if (err.name === 'NotFoundError' || err.message?.includes('not found') || err.message?.includes('device not found')) {
-            toast({
-              title: 'Camera Not Available',
-              description: 'No camera device found. The call will continue without video.',
-              variant: 'default',
+          try {
+            stopCallerWarmTracks(['video']);
+            await new Promise((resolve) => setTimeout(resolve, 300));
+            const videoTrack = await createLocalVideoTrack();
+            await newRoom.localParticipant.publishTrack(videoTrack, {
+              source: Track.Source.Camera,
             });
+            setIsVideoEnabled(true);
+            console.log('✅ Camera enabled via publishTrack');
+          } catch (retryErr: any) {
+            console.error('❌ Failed to enable camera:', retryErr);
+            setIsVideoEnabled(false);
           }
         }
       }
+
+      releaseCallerWarmStream();
 
       setRoom(newRoom);
       roomRef.current = newRoom;
     } catch (err: any) {
       console.error('❌ Failed to connect to LiveKit room:', err);
-      setError(err.message || 'Failed to connect to room');
+      const description = formatLiveKitConnectionError(err);
+      setError(description);
       setIsConnecting(false);
       toast({
         title: 'Connection Failed',
-        description: err.message || 'Failed to connect to the call',
+        description,
         variant: 'destructive',
       });
     }

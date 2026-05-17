@@ -2,8 +2,8 @@ import { db } from "./db";
 import { scheduledVideoCalls, users, patients, notifications } from "@shared/schema";
 import { and, eq, sql } from "drizzle-orm";
 import { createBulkNotifications } from "./notification-helper";
+import { resolveLiveKitServerUrl } from "./livekit-url";
 import { emailService } from "./services/email";
-
 const MK1_BASE_URL = "https://mk1.averox.com/api";
 const MK1_API_KEY = "3a7520ec8dd5de7bf74e2f791b14167773cd747cf8f4f452f3f473251a1c803d";
 
@@ -59,7 +59,11 @@ async function createRemoteLiveKitRoom(params: {
   }
 
   try {
-    return JSON.parse(text);
+    const parsed = JSON.parse(text) as CreateRemoteRoomResponse;
+    return {
+      ...parsed,
+      serverUrl: resolveLiveKitServerUrl(parsed.serverUrl),
+    };
   } catch (error) {
     throw new Error("Failed to parse LiveKit room response");
   }

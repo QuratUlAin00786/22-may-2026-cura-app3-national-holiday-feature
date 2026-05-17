@@ -14,9 +14,12 @@ interface LiveKitVideoCallProps {
   token?: string;
   serverUrl?: string;
   onDisconnect?: (disconnectedParticipant?: { name: string; role?: string }) => void;
+  onConnected?: () => void;
   showControls?: boolean;
   audioEnabled?: boolean;
   videoEnabled?: boolean;
+  /** When false, show ringing UI until callee accepts (outgoing calls). */
+  connectWhenReady?: boolean;
 }
 
 export function LiveKitVideoCall({
@@ -27,9 +30,11 @@ export function LiveKitVideoCall({
   token,
   serverUrl,
   onDisconnect,
+  onConnected,
   showControls = true,
   audioEnabled = true,
   videoEnabled = true,
+  connectWhenReady = true,
 }: LiveKitVideoCallProps) {
   const {
     room,
@@ -46,30 +51,33 @@ export function LiveKitVideoCall({
     isVideoEnabled,
   } = useLiveKitRoom();
 
+  const localVideoPublication = localParticipant
+    ? Array.from(localParticipant.videoTrackPublications.values())[0]
+    : undefined;
+  const hasActiveLocalVideo = !!localVideoPublication?.track;
+
   const localVideoRef = useRef<HTMLVideoElement>(null);
   const remoteVideoRefs = useRef<Map<string, HTMLVideoElement>>(new Map());
   const remoteAudioRefs = useRef<Map<string, HTMLAudioElement>>(new Map());
+  const connectStartedRef = useRef(false);
 
-  // Connect on mount, disconnect on unmount
+  // Connect when ready (outgoing: after callee accepts). Do not disconnect when
+  // isConnecting/isConnected change — that re-ran this effect and killed the room.
   useEffect(() => {
-    if (!isConnected && !isConnecting) {
-      connect({
-        roomName,
-        participantName,
-        participantRole,
-        audioEnabled,
-        videoEnabled,
-        token,
-        url: serverUrl,
-      });
-    }
-    
-    // Cleanup: disconnect and stop camera when component unmounts
-    return () => {
-      console.log('[LiveKitVideoCall] Component unmounting, disconnecting...');
-      disconnect();
-    };
+    if (!connectWhenReady || connectStartedRef.current) return;
+    connectStartedRef.current = true;
+
+    connect({
+      roomName,
+      participantName,
+      participantRole,
+      audioEnabled,
+      videoEnabled,
+      token,
+      url: serverUrl,
+    });
   }, [
+    connectWhenReady,
     roomName,
     participantName,
     participantRole,
@@ -77,11 +85,22 @@ export function LiveKitVideoCall({
     serverUrl,
     audioEnabled,
     videoEnabled,
-    isConnected,
-    isConnecting,
     connect,
-    disconnect,
   ]);
+
+  useEffect(() => {
+    return () => {
+      console.log("[LiveKitVideoCall] Component unmounting, disconnecting...");
+      connectStartedRef.current = false;
+      disconnect();
+    };
+  }, [disconnect]);
+
+  useEffect(() => {
+    if (isConnected) {
+      onConnected?.();
+    }
+  }, [isConnected, onConnected]);
 
   // Attach local video track
   useEffect(() => {
@@ -125,7 +144,38 @@ export function LiveKitVideoCall({
         }
       }
     };
-  }, [room, localParticipant]);
+  }, [room, localParticipant, hasActiveLocalVideo]);
+
+  // Outgoing caller: turn camera on after accept if connect finished without a video track
+  useEffect(() => {
+    if (!videoEnabled || !connectWhenReady || !isConnected || !room || !localParticipant) {
+      return;
+    }
+    if (hasActiveLocalVideo) return;
+
+    let cancelled = false;
+    const tryEnable = async () => {
+      try {
+        await room.localParticipant.setCameraEnabled(true);
+        if (!cancelled) {
+          console.log('[LiveKitVideoCall] Camera enabled after connect');
+        }
+      } catch (e) {
+        console.warn('[LiveKitVideoCall] Deferred camera enable failed:', e);
+      }
+    };
+    void tryEnable();
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    videoEnabled,
+    connectWhenReady,
+    isConnected,
+    room,
+    localParticipant,
+    hasActiveLocalVideo,
+  ]);
 
   // When the other participant leaves the room (they ended the call), close the call UI
   useEffect(() => {
@@ -275,10 +325,20 @@ export function LiveKitVideoCall({
     return (
       <Card className="p-6">
         <CardContent className="flex flex-col items-center justify-center min-h-[400px]">
-          <div className="text-red-500 mb-4">❌ {error}</div>
+          <div className="text-red-500 mb-4 text-center">❌ {error}</div>
           <button
-            onClick={() => connect({ roomName, participantName })}
-            className="px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600"
+            onClick={() =>
+              connect({
+                roomName,
+                participantName,
+                participantRole,
+                token,
+                url: serverUrl,
+                audioEnabled,
+                videoEnabled,
+              })
+            }
+            className="mt-4 px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600"
           >
             Retry Connection
           </button>
@@ -286,6 +346,18 @@ export function LiveKitVideoCall({
       </Card>
     );
   }
+
+  if (!connectWhenReady) {
+    return null;
+  }
+
+  const localProfileInitials = participantName
+    .split(" ")
+    .filter(Boolean)
+    .map((part) => part[0])
+    .join("")
+    .slice(0, 2)
+    .toUpperCase();
 
   if (isConnecting) {
     return (
@@ -390,8 +462,7 @@ export function LiveKitVideoCall({
       {/* Local Video Preview */}
       {isConnected && localParticipant && (
         <div className="absolute bottom-20 right-4 w-48 h-36 bg-gray-900 rounded-lg overflow-hidden border-2 border-white shadow-lg z-10">
-          {isVideoEnabled &&
-          localParticipant.videoTrackPublications.size > 0 ? (
+          {hasActiveLocalVideo ? (
             <video
               ref={localVideoRef}
               autoPlay
@@ -401,12 +472,16 @@ export function LiveKitVideoCall({
             />
           ) : (
             <div className="w-full h-full flex items-center justify-center bg-gray-800">
-              <Avatar className="w-16 h-16">
+              <Avatar className="h-full w-full rounded-none">
                 {participantImageUrl ? (
-                  <AvatarImage src={participantImageUrl} alt="Profile picture" />
+                  <AvatarImage
+                    src={participantImageUrl}
+                    alt="Profile picture"
+                    className="h-full w-full object-cover"
+                  />
                 ) : null}
-                <AvatarFallback>
-                  <User className="w-8 h-8" />
+                <AvatarFallback className="h-full w-full rounded-none bg-gray-700 text-2xl text-white">
+                  {localProfileInitials || <User className="h-10 w-10" />}
                 </AvatarFallback>
               </Avatar>
             </div>

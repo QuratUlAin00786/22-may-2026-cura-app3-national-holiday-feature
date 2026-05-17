@@ -1,13 +1,14 @@
-import { useState, useRef, useEffect } from "react";
+﻿import { useState, useRef, useEffect } from "react";
 import { useQuery, useMutation } from "@tanstack/react-query";
 import { useLocation } from "wouter";
 import { apiRequest, queryClient } from "@/lib/queryClient";
 import { getActiveSubdomain } from "@/lib/subdomain-utils";
 import { useAuth } from "@/hooks/use-auth";
 import { createRemoteLiveKitRoom } from "@/lib/livekit-room-service";
-import { buildSocketUserIdentifier, socketManager } from "@/lib/socket-manager";
+import { buildSocketUserIdentifier, isSocketUserMatch, socketManager } from "@/lib/socket-manager";
 import { LiveKitVideoCall } from "@/components/telemedicine/livekit-video-call";
 import { LiveKitAudioCall } from "@/components/telemedicine/livekit-audio-call";
+import { OutgoingCallWaiting } from "@/components/telemedicine/outgoing-call-waiting";
 import { useSocket } from "@/hooks/use-socket";
 import { isUserOnline } from "@/lib/socket-user-utils";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -184,13 +185,15 @@ function PatientList({
   const { toast } = useToast();
   const { user } = useAuth();
   const { canCreate } = useRolePermissions();
-  const [isAudioMuted, setIsAudioMuted] = useState(false);
   const [callDuration, setCallDuration] = useState(0);
   const callTimerRef = useRef<NodeJS.Timeout | null>(null);
   const callTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const callStartTimeRef = useRef<number | null>(null);
   const currentAudioCallRef = useRef<typeof liveKitAudioCall>(null);
+  const currentVideoCallRef = useRef<typeof liveKitVideoCall>(null);
   const callAcceptedRef = useRef<boolean>(false);
+  const [outgoingVideoAccepted, setOutgoingVideoAccepted] = useState(false);
+  const [outgoingAudioAccepted, setOutgoingAudioAccepted] = useState(false);
   const [callStatusModal, setCallStatusModal] = useState<{
     open: boolean;
     title: string;
@@ -198,20 +201,18 @@ function PatientList({
   }>({ open: false, title: "", description: "" });
 
   // LiveKit call state
-  const [liveKitVideoCall, setLiveKitVideoCall] = useState<{
+  type LiveKitCallSession = {
     roomName: string;
     patient: any;
-    token?: string;
-    serverUrl?: string;
+    token: string;
+    serverUrl: string;
     e2eeKey?: string;
-  } | null>(null);
-  const [liveKitAudioCall, setLiveKitAudioCall] = useState<{
-    roomName: string;
-    patient: any;
-    token?: string;
-    serverUrl?: string;
-    e2eeKey?: string;
-  } | null>(null);
+    initiatorSocketId: string;
+    participantSocketId: string;
+  };
+
+  const [liveKitVideoCall, setLiveKitVideoCall] = useState<LiveKitCallSession | null>(null);
+  const [liveKitAudioCall, setLiveKitAudioCall] = useState<LiveKitCallSession | null>(null);
 
   // Note: Incoming call is now handled globally by GlobalIncomingCallBar
 
@@ -321,123 +322,6 @@ function PatientList({
     }
   };
 
-  // LiveKit audio call function
-  const startAveroxAudioCall = async (patient: any) => {
-    try {
-      if (!user) {
-        toast({
-          title: "Authentication Required",
-          description: "Please log in to start an audio call",
-          variant: "destructive",
-        });
-        return;
-      }
-
-      toast({
-        title: "Connecting...",
-        description: `Initializing audio call with ${patient.firstName} ${patient.lastName}`,
-      });
-
-      // Create LiveKit room for audio call
-      const roomName = `audio-call-${user.id}-${patient.id}-${Date.now()}`;
-      const socketUserId = buildSocketUserIdentifier(user);
-      const targetSocketId = buildSocketUserIdentifier(patient);
-
-      if (!socketUserId || !targetSocketId) {
-        throw new Error("Unable to build user identifiers for call");
-      }
-
-      const roomData = await createRemoteLiveKitRoom({
-        roomId: roomName,
-        fromUsername: `${user.firstName} ${user.lastName}`,
-        toUsers: [
-          {
-            identifier: targetSocketId,
-            displayName: `${patient.firstName} ${patient.lastName}`,
-          },
-        ],
-        isVideo: false, // Audio only call
-      });
-
-      if (roomData) {
-        setLiveKitAudioCall({
-          roomName: roomData.roomId,
-          patient,
-          token: roomData.token,
-          serverUrl: roomData.serverUrl,
-          e2eeKey: roomData.e2eeKey,
-        });
-
-        // Start call duration timer
-        setCallDuration(0);
-        callAcceptedRef.current = true; // Mark call as accepted when timer starts
-        callTimerRef.current = setInterval(() => {
-          setCallDuration((prev) => prev + 1);
-        }, 1000);
-
-        toast({
-          title: "Call Connected",
-          description: `Audio call with ${patient.firstName} ${patient.lastName} is now active`,
-        });
-
-        // Create consultation record
-        await fetch("/api/telemedicine/consultations", {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            Authorization: `Bearer ${localStorage.getItem("auth_token")}`,
-            "X-Tenant-Subdomain": getActiveSubdomain(),
-          },
-          body: JSON.stringify({
-            patientId: patient.id,
-            type: "audio",
-            scheduledTime: new Date().toISOString(),
-            duration: 30,
-            meetingId: roomName,
-          }),
-          credentials: "include",
-        });
-      }
-    } catch (error: any) {
-      console.error("💥 Audio call failed:", error);
-      toast({
-        title: "Call Failed",
-        description:
-          error.message ||
-          "Unable to start audio call. Please check microphone permissions and try again.",
-        variant: "destructive",
-      });
-    }
-  };
-
-  // Handle ending audio call
-  const handleEndAudioCall = () => {
-    if (callTimerRef.current) {
-      clearInterval(callTimerRef.current);
-      callTimerRef.current = null;
-    }
-
-    setLiveKitAudioCall(null);
-    setIsAudioMuted(false);
-    setCallDuration(0);
-
-    toast({
-      title: "Call Ended",
-      description: "Audio call has been terminated",
-    });
-  };
-
-  // Toggle mute - handled by LiveKit component internally
-  const toggleAudioMute = () => {
-    setIsAudioMuted(!isAudioMuted);
-    toast({
-      title: !isAudioMuted ? "Microphone Muted" : "Microphone Unmuted",
-      description: !isAudioMuted
-        ? "Your microphone is now muted"
-        : "Your microphone is now active",
-    });
-  };
-
   // LiveKit Video Call
   const buildParticipantIdentifier = (
     entity: any,
@@ -460,85 +344,228 @@ function PatientList({
     return name || entity?.email || `user-${entity?.id}`;
   };
 
+  /** Notify callee via Socket.IO so GlobalIncomingCallBar / nurse can ring and join the same room. */
+  const emitTelemedicineIncomingInvite = (
+    session: LiveKitCallSession,
+    isVideo: boolean,
+  ) => {
+    if (!user || !session.token || !session.serverUrl) return;
+    const fromUsername = getDisplayName(user);
+    socketManager.emitToServer("incoming-call", {
+      roomId: session.roomName,
+      fromUserId: session.initiatorSocketId,
+      fromUsername,
+      toUserId: session.participantSocketId,
+      to: session.participantSocketId,
+      isVideo,
+      token: session.token,
+      serverUrl: session.serverUrl,
+      e2eeKey: session.e2eeKey,
+      participants: [],
+      isGroup: false,
+      groupName: isVideo ? "Telemedicine Video Consultation" : "Telemedicine Audio Consultation",
+      isDelayedCall: false,
+    });
+  };
+
+  const emitTelemedicineCallSignal = (
+    session: LiveKitCallSession,
+    event: "call_declined" | "call_ended",
+  ) => {
+    const initiatorUserId = session.initiatorSocketId;
+    const participantId = session.participantSocketId;
+    if (!initiatorUserId || !participantId) return;
+
+    if (event === "call_declined") {
+      socketManager.emitToServer("call_declined", {
+        roomId: session.roomName,
+        fromUserId: initiatorUserId,
+        toUserId: participantId,
+        isGroup: false,
+      });
+      return;
+    }
+
+    socketManager.emitToServer("call_ended", {
+      roomId: session.roomName,
+      initiatorUserId,
+      participantIds: [participantId],
+    });
+  };
+
+  const createTelemedicineCallSession = async (
+    patient: any,
+    isVideo: boolean,
+  ): Promise<LiveKitCallSession> => {
+    if (!user) {
+      throw new Error("Please log in to start a call");
+    }
+
+    const fromIdentifier = buildParticipantIdentifier(user, user.role);
+    const toIdentifier = buildParticipantIdentifier(patient, patient.role);
+
+    if (!fromIdentifier || !toIdentifier) {
+      throw new Error("Unable to determine participant identifiers for this call");
+    }
+
+    const prefix = isVideo ? "telemedicine-video" : "telemedicine-audio";
+    const roomName = `${prefix}-${user.id}-${patient.id}-${Date.now()}`;
+
+    const liveKitRoom = await createRemoteLiveKitRoom({
+      roomId: roomName,
+      fromUsername: fromIdentifier,
+      toUsers: [
+        {
+          identifier: toIdentifier,
+          displayName: getDisplayName(patient),
+        },
+      ],
+      isVideo,
+      groupName: isVideo
+        ? "Telemedicine Video Consultation"
+        : "Telemedicine Audio Consultation",
+    });
+
+    const finalRoomId = liveKitRoom.roomId || roomName;
+
+    if (!liveKitRoom.token || !liveKitRoom.serverUrl) {
+      throw new Error("LiveKit did not return connection credentials");
+    }
+
+    return {
+      roomName: finalRoomId,
+      patient,
+      token: liveKitRoom.token,
+      serverUrl: liveKitRoom.serverUrl,
+      e2eeKey: liveKitRoom.e2eeKey,
+      initiatorSocketId: fromIdentifier,
+      participantSocketId: toIdentifier,
+    };
+  };
+
+  const recordTelemedicineConsultation = async (
+    patientId: number,
+    type: "video" | "audio",
+    meetingId: string,
+  ) => {
+    await fetch("/api/telemedicine/consultations", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${localStorage.getItem("auth_token")}`,
+        "X-Tenant-Subdomain": getActiveSubdomain(),
+      },
+      body: JSON.stringify({
+        patientId,
+        type,
+        scheduledTime: new Date().toISOString(),
+        duration: 30,
+        meetingId,
+      }),
+      credentials: "include",
+    });
+  };
+
+  const startCallDurationTimer = () => {
+    setCallDuration(0);
+    if (callTimerRef.current) {
+      clearInterval(callTimerRef.current);
+    }
+    callTimerRef.current = setInterval(() => {
+      setCallDuration((prev) => prev + 1);
+    }, 1000);
+  };
+
+  const stopCallDurationTimer = () => {
+    if (callTimerRef.current) {
+      clearInterval(callTimerRef.current);
+      callTimerRef.current = null;
+    }
+    setCallDuration(0);
+  };
+
+  /** Hold mic/camera from the start-call click until LiveKit takes over after accept. */
+  const warmUpCallerMediaDevices = async (includeVideo: boolean) => {
+    if (!navigator.mediaDevices?.getUserMedia) return;
+    try {
+      const existing = (window as Window & { __callerWarmStream?: MediaStream | null })
+        .__callerWarmStream;
+      existing?.getTracks().forEach((track) => track.stop());
+
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: true,
+        video: includeVideo,
+      });
+      (window as Window & { __callerWarmStream?: MediaStream | null }).__callerWarmStream =
+        stream;
+    } catch (e) {
+      console.warn("[Telemedicine] Media warm-up (caller):", e);
+    }
+  };
+
+  const releaseCallerWarmStream = () => {
+    const stream = (window as Window & { __callerWarmStream?: MediaStream | null })
+      .__callerWarmStream;
+    if (stream) {
+      stream.getTracks().forEach((track) => track.stop());
+      (window as Window & { __callerWarmStream?: MediaStream | null }).__callerWarmStream =
+        null;
+    }
+  };
+
   const startLiveKitVideoCall = async (patient: any) => {
     try {
-      if (!user) {
+      if (liveKitVideoCall || liveKitAudioCall) {
         toast({
-          title: "Authentication Required",
-          description: "Please log in to start a video call",
+          title: "Call already active",
+          description: "End the current call before starting another.",
           variant: "destructive",
         });
         return;
       }
 
-      const fromIdentifier = buildParticipantIdentifier(user, user.role);
-      const toIdentifier = buildParticipantIdentifier(patient, patient.role);
-
-      if (!fromIdentifier || !toIdentifier) {
-        toast({
-          title: "Call Failed",
-          description: "Unable to determine participant identifiers",
-          variant: "destructive",
-        });
-        return;
-      }
-
-      const roomName = `telemedicine-video-${user.id}-${patient.id}-${Date.now()}`;
+      await warmUpCallerMediaDevices(true);
 
       toast({
         title: "Video Call Starting",
         description: `Connecting to video call with ${patient.firstName} ${patient.lastName}`,
       });
 
-      const liveKitRoom = await createRemoteLiveKitRoom({
-        roomId: roomName,
-        fromUsername: fromIdentifier,
-        toUsers: [
-          {
-            identifier: toIdentifier,
-            displayName: getDisplayName(patient),
-          },
-        ],
-        isVideo: true,
-        groupName: "Telemedicine Video Consultation",
-      });
+      const session = await createTelemedicineCallSession(patient, true);
+      setOutgoingVideoAccepted(false);
+      callAcceptedRef.current = false;
+      currentVideoCallRef.current = session;
+      setLiveKitVideoCall(session);
+      emitTelemedicineIncomingInvite(session, true);
+      startCallDurationTimer();
 
-      const finalRoomId = liveKitRoom.roomId || roomName;
-
-      setLiveKitVideoCall({
-        roomName: finalRoomId,
-        patient,
-        token: liveKitRoom.token,
-        serverUrl: liveKitRoom.serverUrl,
-        e2eeKey: liveKitRoom.e2eeKey,
-      });
-
-      // Start call duration timer for video call
-      setCallDuration(0);
-      if (callTimerRef.current) {
-        clearInterval(callTimerRef.current);
+      callStartTimeRef.current = Date.now();
+      if (callTimeoutRef.current) {
+        clearTimeout(callTimeoutRef.current);
       }
-      callTimerRef.current = setInterval(() => {
-        setCallDuration((prev) => prev + 1);
-      }, 1000);
+      const capturedSession = session;
+      callTimeoutRef.current = setTimeout(() => {
+        const currentCall = currentVideoCallRef.current;
+        if (
+          currentCall &&
+          currentCall.roomName === capturedSession.roomName &&
+          callStartTimeRef.current &&
+          !callAcceptedRef.current
+        ) {
+          emitTelemedicineCallSignal(capturedSession, "call_declined");
+          stopCallDurationTimer();
+          setLiveKitVideoCall(null);
+          currentVideoCallRef.current = null;
+          setOutgoingVideoAccepted(false);
+          callStartTimeRef.current = null;
+          toast({
+            title: "No answer",
+            description: `${getDisplayName(patient)} did not answer the call.`,
+          });
+        }
+      }, 30000);
 
-      // Create consultation record
-      await fetch("/api/telemedicine/consultations", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${localStorage.getItem("auth_token")}`,
-          "X-Tenant-Subdomain": getActiveSubdomain(),
-        },
-        body: JSON.stringify({
-          patientId: patient.id,
-          type: "video",
-          scheduledTime: new Date().toISOString(),
-          duration: 30,
-          meetingId: finalRoomId,
-        }),
-        credentials: "include",
-      });
+      await recordTelemedicineConsultation(patient.id, "video", session.roomName);
     } catch (error: any) {
       console.error("LiveKit video call failed:", error);
       toast({
@@ -552,126 +579,58 @@ function PatientList({
   // LiveKit Audio Call
   const startLiveKitAudioCall = async (patient: any) => {
     try {
-      if (!user) {
+      if (liveKitVideoCall || liveKitAudioCall) {
         toast({
-          title: "Authentication Required",
-          description: "Please log in to start an audio call",
+          title: "Call already active",
+          description: "End the current call before starting another.",
           variant: "destructive",
         });
         return;
       }
-
-      const fromIdentifier = buildParticipantIdentifier(user, user.role);
-      const toIdentifier = buildParticipantIdentifier(patient, patient.role);
-
-      if (!fromIdentifier || !toIdentifier) {
-        toast({
-          title: "Call Failed",
-          description: "Unable to determine participant identifiers",
-          variant: "destructive",
-        });
-        return;
-      }
-
-      const roomName = `telemedicine-audio-${user.id}-${patient.id}-${Date.now()}`;
 
       toast({
         title: "Audio Call Starting",
         description: `Connecting to audio call with ${patient.firstName} ${patient.lastName}`,
       });
 
-      const liveKitRoom = await createRemoteLiveKitRoom({
-        roomId: roomName,
-        fromUsername: fromIdentifier,
-        toUsers: [
-          {
-            identifier: toIdentifier,
-            displayName: getDisplayName(patient),
-          },
-        ],
-        isVideo: false,
-        groupName: "Telemedicine Audio Consultation",
-      });
-
-      const finalRoomId = liveKitRoom.roomId || roomName;
-
-      const callData = {
-        roomName: finalRoomId,
-        patient,
-        token: liveKitRoom.token,
-        serverUrl: liveKitRoom.serverUrl,
-        e2eeKey: liveKitRoom.e2eeKey,
-      };
-
-      setLiveKitAudioCall(callData);
-      currentAudioCallRef.current = callData;
+      const session = await createTelemedicineCallSession(patient, false);
+      setOutgoingAudioAccepted(false);
+      setLiveKitAudioCall(session);
+      emitTelemedicineIncomingInvite(session, false);
+      currentAudioCallRef.current = session;
       callAcceptedRef.current = false;
+      startCallDurationTimer();
 
-      // Start timeout for "Not Answering" (30 seconds)
       callStartTimeRef.current = Date.now();
       if (callTimeoutRef.current) {
         clearTimeout(callTimeoutRef.current);
       }
-      
-      // Capture values for timeout callback
-      const capturedRoomId = finalRoomId;
-      const capturedPatient = patient;
-      const capturedUser = user;
-      
+
+      const capturedSession = session;
       callTimeoutRef.current = setTimeout(() => {
-        // Check if call is still active and no one answered
         const currentCall = currentAudioCallRef.current;
-        if (currentCall && currentCall.roomName === capturedRoomId && callStartTimeRef.current && !callAcceptedRef.current) {
+        if (
+          currentCall &&
+          currentCall.roomName === capturedSession.roomName &&
+          callStartTimeRef.current &&
+          !callAcceptedRef.current
+        ) {
           const timeElapsed = Date.now() - callStartTimeRef.current;
           if (timeElapsed >= 30000) {
-            console.log('[Telemedicine] Call timeout - no answer after 30 seconds');
-            // Emit call_declined to close recipient's popup
-            if (capturedUser) {
-              const initiatorUserId = buildSocketUserIdentifier(capturedUser);
-              const participantId = buildSocketUserIdentifier(capturedPatient);
-              
-              if (initiatorUserId && participantId) {
-                socketManager.emitToServer('call_declined', {
-                  roomId: capturedRoomId,
-                  fromUserId: initiatorUserId,
-                  toUserId: participantId,
-                  isGroup: false,
-                });
-                console.log('[Telemedicine] Emitted call_declined for timeout');
-              }
-            }
-            
-            // Close initiator's popup and show "Not Answering" message
-            if (callTimerRef.current) {
-              clearInterval(callTimerRef.current);
-              callTimerRef.current = null;
-            }
-            setCallDuration(0);
+            emitTelemedicineCallSignal(capturedSession, "call_declined");
+            stopCallDurationTimer();
             setLiveKitAudioCall(null);
             currentAudioCallRef.current = null;
             callStartTimeRef.current = null;
-            // Don't show call status modal - close window automatically
+            toast({
+              title: "No answer",
+              description: `${getDisplayName(patient)} did not answer the call.`,
+            });
           }
         }
       }, 30000);
 
-      // Create consultation record
-      await fetch("/api/telemedicine/consultations", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${localStorage.getItem("auth_token")}`,
-          "X-Tenant-Subdomain": getActiveSubdomain(),
-        },
-        body: JSON.stringify({
-          patientId: patient.id,
-          type: "audio",
-          scheduledTime: new Date().toISOString(),
-          duration: 30,
-          meetingId: finalRoomId,
-        }),
-        credentials: "include",
-      });
+      await recordTelemedicineConsultation(patient.id, "audio", session.roomName);
     } catch (error: any) {
       console.error("LiveKit audio call failed:", error);
       toast({
@@ -682,39 +641,31 @@ function PatientList({
     }
   };
 
-  const handleLiveKitVideoCallEnd = (disconnectedParticipant?: { name: string; role?: string }) => {
-    // Stop call timer
-    if (callTimerRef.current) {
-      clearInterval(callTimerRef.current);
-      callTimerRef.current = null;
+  const handleLiveKitVideoCallConnected = () => {
+    callAcceptedRef.current = true;
+    if (callTimeoutRef.current) {
+      clearTimeout(callTimeoutRef.current);
+      callTimeoutRef.current = null;
     }
-    setCallDuration(0);
+  };
 
-    // Emit both call_ended and call_declined events to ensure recipient's popup closes
-    if (liveKitVideoCall && user) {
-      const initiatorUserId = buildSocketUserIdentifier(user);
-      const participantId = buildSocketUserIdentifier(liveKitVideoCall.patient);
-      
-      if (initiatorUserId && participantId) {
-        // Emit call_declined to close recipient's incoming call popup
-        socketManager.emitToServer('call_declined', {
-          roomId: liveKitVideoCall.roomName,
-          fromUserId: initiatorUserId,
-          toUserId: participantId,
-          isGroup: false,
-        });
-        console.log('[Telemedicine] Emitted call_declined for video call:', liveKitVideoCall.roomName);
-        
-        // Also emit call_ended for consistency
-        socketManager.emitToServer('call_ended', {
-          roomId: liveKitVideoCall.roomName,
-          initiatorUserId: initiatorUserId,
-          participantIds: [participantId],
-        });
-        console.log('[Telemedicine] Emitted call_ended for video call:', liveKitVideoCall.roomName);
-      }
+  const handleLiveKitVideoCallEnd = (disconnectedParticipant?: { name: string; role?: string }) => {
+    const currentVideoCall = liveKitVideoCall;
+    releaseCallerWarmStream();
+    stopCallDurationTimer();
+    if (callTimeoutRef.current) {
+      clearTimeout(callTimeoutRef.current);
+      callTimeoutRef.current = null;
     }
-    
+    currentVideoCallRef.current = null;
+    setOutgoingVideoAccepted(false);
+    callStartTimeRef.current = null;
+
+    if (currentVideoCall) {
+      emitTelemedicineCallSignal(currentVideoCall, "call_declined");
+      emitTelemedicineCallSignal(currentVideoCall, "call_ended");
+    }
+
     setLiveKitVideoCall(null);
     
     // Format disconnect message with participant name if available
@@ -735,46 +686,30 @@ function PatientList({
     }, 100);
   };
 
-  const handleLiveKitAudioCallEnd = (disconnectedParticipant?: { name: string; role?: string }) => {
-    // Stop call timer
-    if (callTimerRef.current) {
-      clearInterval(callTimerRef.current);
-      callTimerRef.current = null;
-    }
-    
-    // Stop timeout timer
+  const handleLiveKitAudioCallConnected = () => {
+    callAcceptedRef.current = true;
+    setOutgoingAudioAccepted(true);
     if (callTimeoutRef.current) {
       clearTimeout(callTimeoutRef.current);
       callTimeoutRef.current = null;
     }
-    
-    setCallDuration(0);
+  };
 
-    // Emit both call_ended and call_declined events to ensure recipient's popup closes
-    if (liveKitAudioCall && user) {
-      const initiatorUserId = buildSocketUserIdentifier(user);
-      const participantId = buildSocketUserIdentifier(liveKitAudioCall.patient);
-      
-      if (initiatorUserId && participantId) {
-        // Emit call_declined to close recipient's incoming call popup
-        socketManager.emitToServer('call_declined', {
-          roomId: liveKitAudioCall.roomName,
-          fromUserId: initiatorUserId,
-          toUserId: participantId,
-          isGroup: false,
-        });
-        console.log('[Telemedicine] Emitted call_declined for audio call:', liveKitAudioCall.roomName);
-        
-        // Also emit call_ended for consistency
-        socketManager.emitToServer('call_ended', {
-          roomId: liveKitAudioCall.roomName,
-          initiatorUserId: initiatorUserId,
-          participantIds: [participantId],
-        });
-        console.log('[Telemedicine] Emitted call_ended for audio call:', liveKitAudioCall.roomName);
-      }
+  const handleLiveKitAudioCallEnd = (disconnectedParticipant?: { name: string; role?: string }) => {
+    const currentAudioCall = liveKitAudioCall;
+    stopCallDurationTimer();
+    setOutgoingAudioAccepted(false);
+
+    if (callTimeoutRef.current) {
+      clearTimeout(callTimeoutRef.current);
+      callTimeoutRef.current = null;
     }
-    
+
+    if (currentAudioCall) {
+      emitTelemedicineCallSignal(currentAudioCall, "call_declined");
+      emitTelemedicineCallSignal(currentAudioCall, "call_ended");
+    }
+
     setLiveKitAudioCall(null);
     currentAudioCallRef.current = null;
     callStartTimeRef.current = null;
@@ -810,8 +745,32 @@ function PatientList({
     };
   }, []);
 
-  // Listen for call_ended and call_declined events from other participants
+  // Listen for call_ended, call_declined, and call_accepted (outgoing → connect after answer)
   useEffect(() => {
+    const unsubscribeCallAccepted = socketManager.on("call_accepted", (data: any) => {
+      if (!user || !isSocketUserMatch(data?.toUserId, user)) return;
+
+      const videoSession = currentVideoCallRef.current;
+      if (videoSession && data.roomId === videoSession.roomName) {
+        callAcceptedRef.current = true;
+        setOutgoingVideoAccepted(true);
+        if (callTimeoutRef.current) {
+          clearTimeout(callTimeoutRef.current);
+          callTimeoutRef.current = null;
+        }
+      }
+
+      const audioSession = currentAudioCallRef.current;
+      if (audioSession && data.roomId === audioSession.roomName) {
+        callAcceptedRef.current = true;
+        setOutgoingAudioAccepted(true);
+        if (callTimeoutRef.current) {
+          clearTimeout(callTimeoutRef.current);
+          callTimeoutRef.current = null;
+        }
+      }
+    });
+
     // Handle when the other party ends the call
     const unsubscribeCallEnded = socketManager.on('call_ended', (data: any) => {
       console.log('[Telemedicine] Received call_ended event:', data);
@@ -837,6 +796,8 @@ function PatientList({
           }
         }
         
+        setOutgoingVideoAccepted(false);
+        currentVideoCallRef.current = null;
         setLiveKitVideoCall(null);
         // Use setTimeout to ensure modal shows after main dialog closes
         setTimeout(() => {
@@ -874,6 +835,7 @@ function PatientList({
           }
         }
         
+        setOutgoingAudioAccepted(false);
         setLiveKitAudioCall(null);
         currentAudioCallRef.current = null;
         callStartTimeRef.current = null;
@@ -934,7 +896,12 @@ function PatientList({
           });
         });
         
-        // Setting to null will unmount LiveKitVideoCall which cleans up camera/tracks
+        setOutgoingVideoAccepted(false);
+        currentVideoCallRef.current = null;
+        if (callTimeoutRef.current) {
+          clearTimeout(callTimeoutRef.current);
+          callTimeoutRef.current = null;
+        }
         setLiveKitVideoCall(null);
         // Don't show call status modal - close window automatically
       }
@@ -953,6 +920,7 @@ function PatientList({
           callTimeoutRef.current = null;
         }
         setCallDuration(0);
+        setOutgoingAudioAccepted(false);
         setLiveKitAudioCall(null);
         currentAudioCallRef.current = null;
         callStartTimeRef.current = null;
@@ -962,10 +930,11 @@ function PatientList({
     });
 
     return () => {
+      unsubscribeCallAccepted();
       unsubscribeCallEnded();
       unsubscribeCallDeclined();
     };
-  }, [liveKitVideoCall, liveKitAudioCall, toast]);
+  }, [liveKitVideoCall, liveKitAudioCall, user, toast]);
 
   // Format call duration
   const formatCallDuration = (seconds: number) => {
@@ -1102,10 +1071,15 @@ function PatientList({
     );
   }
 
-  return (
-    <>
-      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-        {patients.filter((patient: any) => patient.id !== user?.id).map((patient: any) => (
+  const consultUsers = patients.filter((patient: any) => patient.id !== user?.id);
+  const onlineConsultUsers = consultUsers.filter((patient: any) =>
+    isUserOnline(patient.id, onlineUsers),
+  );
+  const offlineConsultUsers = consultUsers.filter(
+    (patient: any) => !isUserOnline(patient.id, onlineUsers),
+  );
+
+  const renderConsultUserCard = (patient: any) => (
           <Card
             key={patient.id}
             className="hover:shadow-md transition-shadow cursor-pointer"
@@ -1172,6 +1146,7 @@ function PatientList({
                     className="flex-1"
                     size="sm"
                     variant="default"
+                    disabled={liveKitVideoCall !== null || liveKitAudioCall !== null}
                     data-testid={`button-livekit-video-call-${patient.id}`}
                   >
                     <Video className="w-4 h-4 mr-2" />
@@ -1185,7 +1160,7 @@ function PatientList({
                     className="flex-1"
                     onClick={() => startLiveKitAudioCall(patient)}
                     data-testid={`button-livekit-audio-call-${patient.id}`}
-                    disabled={liveKitAudioCall !== null}
+                    disabled={liveKitAudioCall !== null || liveKitVideoCall !== null}
                   >
                     <Phone className="w-4 h-4 mr-2" />
                     Audio
@@ -1194,77 +1169,33 @@ function PatientList({
               </div>
             </CardContent>
           </Card>
-        ))}
+  );
+
+  return (
+    <>
+      <div className="space-y-8">
+        <section>
+          <h3 className="text-sm font-semibold text-foreground mb-3">Online</h3>
+          {onlineConsultUsers.length > 0 ? (
+            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+              {onlineConsultUsers.map((patient: any) => renderConsultUserCard(patient))}
+            </div>
+          ) : (
+            <p className="text-sm text-muted-foreground">No users online</p>
+          )}
+        </section>
+
+        <section>
+          <h3 className="text-sm font-semibold text-muted-foreground mb-3">Offline</h3>
+          {offlineConsultUsers.length > 0 ? (
+            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+              {offlineConsultUsers.map((patient: any) => renderConsultUserCard(patient))}
+            </div>
+          ) : (
+            <p className="text-sm text-muted-foreground">No users offline</p>
+          )}
+        </section>
       </div>
-
-      {/* Active Audio Call UI Controls */}
-      {liveKitAudioCall && (
-        <Card className="fixed bottom-4 right-4 w-96 shadow-2xl border-2 border-primary z-50">
-          <CardContent className="p-6">
-            <div className="flex items-center justify-between mb-4">
-              <div className="flex items-center gap-3">
-                <div className="relative">
-                  <div className="w-3 h-3 bg-green-500 rounded-full animate-pulse" />
-                  <div className="w-3 h-3 bg-green-500 rounded-full animate-ping absolute top-0 left-0" />
-                </div>
-                <div>
-                  <p className="font-semibold text-lg">Audio Call Active</p>
-                  <p className="text-sm text-gray-600 dark:text-gray-400">
-                    {liveKitAudioCall.patient?.firstName}{" "}
-                    {liveKitAudioCall.patient?.lastName}
-                  </p>
-                </div>
-              </div>
-              <div className="text-right">
-                <p className="text-2xl font-mono font-bold text-primary">
-                  {formatCallDuration(callDuration)}
-                </p>
-                <p className="text-xs text-gray-500">Duration</p>
-              </div>
-            </div>
-
-            <div className="flex gap-3">
-              <Button
-                variant={isAudioMuted ? "destructive" : "outline"}
-                size="lg"
-                onClick={toggleAudioMute}
-                className="flex-1"
-                data-testid="button-toggle-mute"
-              >
-                {isAudioMuted ? (
-                  <>
-                    <MicOff className="w-5 h-5 mr-2" />
-                    Unmute
-                  </>
-                ) : (
-                  <>
-                    <Mic className="w-5 h-5 mr-2" />
-                    Mute
-                  </>
-                )}
-              </Button>
-
-              <Button
-                variant="destructive"
-                size="lg"
-                onClick={handleEndAudioCall}
-                className="flex-1"
-                data-testid="button-end-call"
-              >
-                <PhoneOff className="w-5 h-5 mr-2" />
-                End Call
-              </Button>
-            </div>
-
-            <div className="mt-4 p-3 bg-blue-50 dark:bg-blue-950 rounded-lg">
-              <div className="flex items-center gap-2 text-sm text-blue-700 dark:text-blue-300">
-                <Activity className="w-4 h-4" />
-                <span>LiveKit Audio Call</span>
-              </div>
-            </div>
-          </CardContent>
-        </Card>
-      )}
 
       {/* LiveKit Video Call Modal - Full Screen */}
       {liveKitVideoCall && (
@@ -1283,19 +1214,29 @@ function PatientList({
               </DialogTitle>
             </DialogHeader>
             <div className="w-full h-full pt-16">
-              <LiveKitVideoCall
-                roomName={liveKitVideoCall.roomName}
-                participantName={
-                  user ? `${user.firstName} ${user.lastName}` : "Provider"
-                }
-                participantRole={user?.role}
-                participantImageUrl={myProfileImageUrl}
-                token={liveKitVideoCall.token}
-                serverUrl={liveKitVideoCall.serverUrl}
-                onDisconnect={handleLiveKitVideoCallEnd}
-                audioEnabled={telemedicineSettings?.autoStartAudio ?? true}
-                videoEnabled={telemedicineSettings?.autoStartVideo ?? true}
-              />
+              {!outgoingVideoAccepted ? (
+                <OutgoingCallWaiting
+                  calleeName={`${liveKitVideoCall.patient.firstName} ${liveKitVideoCall.patient.lastName}`.trim()}
+                  isVideo
+                  onCancel={() => handleLiveKitVideoCallEnd()}
+                />
+              ) : (
+                <LiveKitVideoCall
+                  roomName={liveKitVideoCall.roomName}
+                  participantName={
+                    user ? `${user.firstName} ${user.lastName}` : "Provider"
+                  }
+                  participantRole={user?.role}
+                  participantImageUrl={myProfileImageUrl}
+                  token={liveKitVideoCall.token}
+                  serverUrl={liveKitVideoCall.serverUrl}
+                  connectWhenReady
+                  onDisconnect={handleLiveKitVideoCallEnd}
+                  onConnected={handleLiveKitVideoCallConnected}
+                  audioEnabled={telemedicineSettings?.autoStartAudio ?? true}
+                  videoEnabled
+                />
+              )}
             </div>
           </DialogContent>
         </Dialog>
@@ -1318,18 +1259,28 @@ function PatientList({
               </DialogTitle>
             </DialogHeader>
             <div className="p-4">
-              <LiveKitAudioCall
-                roomName={liveKitAudioCall.roomName}
-                participantName={
-                  user ? `${user.firstName} ${user.lastName}` : "Provider"
-                }
-                participantRole={user?.role}
-                participantImageUrl={myProfileImageUrl}
-                token={liveKitAudioCall.token}
-                serverUrl={liveKitAudioCall.serverUrl}
-                onDisconnect={handleLiveKitAudioCallEnd}
-                audioEnabled={telemedicineSettings?.autoStartAudio ?? true}
-              />
+              {!outgoingAudioAccepted ? (
+                <OutgoingCallWaiting
+                  calleeName={`${liveKitAudioCall.patient.firstName} ${liveKitAudioCall.patient.lastName}`.trim()}
+                  isVideo={false}
+                  onCancel={() => handleLiveKitAudioCallEnd()}
+                />
+              ) : (
+                <LiveKitAudioCall
+                  roomName={liveKitAudioCall.roomName}
+                  participantName={
+                    user ? `${user.firstName} ${user.lastName}` : "Provider"
+                  }
+                  participantRole={user?.role}
+                  participantImageUrl={myProfileImageUrl}
+                  token={liveKitAudioCall.token}
+                  serverUrl={liveKitAudioCall.serverUrl}
+                  connectWhenReady
+                  onDisconnect={handleLiveKitAudioCallEnd}
+                  onConnected={handleLiveKitAudioCallConnected}
+                  audioEnabled={telemedicineSettings?.autoStartAudio ?? true}
+                />
+              )}
             </div>
           </DialogContent>
         </Dialog>
@@ -1776,7 +1727,7 @@ export default function Telemedicine() {
   //     if (currentCallRef.current) return; // already in a call
   //     if (autoStartInProgressRef.current) return; // start already triggered
   //     const now = Date.now();
-  //     const windowMs = 2 * 60 * 1000; // auto-connect if scheduled time was 0–2 minutes ago
+  //     const windowMs = 2 * 60 * 1000; // auto-connect if scheduled time was 0â€“2 minutes ago
   //     for (const c of list) {
   //       if (c.status !== "scheduled" || !c.scheduledTime) continue;
   //       const scheduled = new Date(c.scheduledTime).getTime();
@@ -2806,10 +2757,10 @@ export default function Telemedicine() {
                     >
                       <div className="min-w-0">
                         <div className="font-medium text-gray-900 dark:text-gray-100">
-                          {c.patientName || "Patient"} · {c.providerName || "Provider"}
+                          {c.patientName || "Patient"} Â· {c.providerName || "Provider"}
                         </div>
                         <div className="text-sm text-gray-600 dark:text-gray-400 mt-0.5">
-                          {c.scheduledTime ? format(new Date(c.scheduledTime), "PPp") : "—"} · {c.duration ?? 15} min · {c.type === "video" ? "Video" : c.type === "audio" ? "Audio" : "Screen share"}
+                          {c.scheduledTime ? format(new Date(c.scheduledTime), "PPp") : "â€”"} Â· {c.duration ?? 15} min Â· {c.type === "video" ? "Video" : c.type === "audio" ? "Audio" : "Screen share"}
                         </div>
                         {c.notes && (
                           <p className="text-xs text-gray-500 dark:text-gray-500 mt-1 truncate max-w-md">{c.notes}</p>

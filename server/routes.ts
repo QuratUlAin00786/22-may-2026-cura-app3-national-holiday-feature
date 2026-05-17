@@ -37341,6 +37341,44 @@ Cura EMR Team
   // Socket.IO connection handling
   const onlineUsers = new Map<string, Set<string>>(); // userId -> Set of socketIds
 
+  const emitToOnlineUserIds = (
+    targetUserIds: string[],
+    event: string,
+    payload: unknown,
+    excludeSocketId?: string,
+  ) => {
+    const seen = new Set<string>();
+    for (const userId of targetUserIds) {
+      if (!userId || seen.has(userId)) continue;
+      seen.add(userId);
+      const socketIds = onlineUsers.get(userId);
+      if (!socketIds) {
+        console.warn(`[Socket.IO] ${event}: recipient offline:`, userId);
+        continue;
+      }
+      for (const socketId of socketIds) {
+        if (excludeSocketId && socketId === excludeSocketId) continue;
+        io.to(socketId).emit(event, payload);
+      }
+    }
+  };
+
+  const collectIncomingCallRecipients = (callData: any): string[] => {
+    const targets: string[] = [];
+    if (typeof callData?.toUserId === "string" && callData.toUserId.trim()) {
+      targets.push(callData.toUserId.trim());
+    }
+    if (typeof callData?.to === "string" && callData.to.trim()) {
+      targets.push(callData.to.trim());
+    }
+    if (Array.isArray(callData?.toUserIds)) {
+      for (const id of callData.toUserIds) {
+        if (typeof id === "string" && id.trim()) targets.push(id.trim());
+      }
+    }
+    return targets;
+  };
+
   io.on('connection', (socket) => {
     console.log('[Socket.IO] Client connected:', socket.id);
 
@@ -37383,10 +37421,40 @@ Cura EMR Team
       io.emit('call-signal', signal);
     });
 
-    // Handle incoming call
+    // Handle incoming call — deliver only to intended recipient(s), not the caller
     socket.on('incoming-call', (callData: any) => {
-      console.log('[Socket.IO] Incoming call from', callData.from, 'to', callData.to);
-      io.emit('incoming-call', callData);
+      const recipients = collectIncomingCallRecipients(callData);
+      console.log(
+        '[Socket.IO] Incoming call from',
+        callData?.fromUserId || callData?.from,
+        'to',
+        recipients,
+      );
+      if (recipients.length === 0) {
+        console.warn('[Socket.IO] incoming-call ignored: no toUserId/to recipient');
+        return;
+      }
+      emitToOnlineUserIds(recipients, 'incoming-call', callData, socket.id);
+    });
+
+    socket.on('call_accepted', (data: any) => {
+      console.log('[Socket.IO] Call accepted:', data?.roomId, 'notify', data?.toUserId);
+      const recipient = typeof data?.toUserId === 'string' ? data.toUserId.trim() : '';
+      if (!recipient) {
+        console.warn('[Socket.IO] call_accepted ignored: missing toUserId (caller)');
+        return;
+      }
+      emitToOnlineUserIds([recipient], 'call_accepted', data, socket.id);
+    });
+
+    socket.on('call_declined', (data: any) => {
+      console.log('[Socket.IO] Call declined:', data?.roomId, 'notify', data?.toUserId);
+      const recipient = typeof data?.toUserId === 'string' ? data.toUserId.trim() : '';
+      if (!recipient) {
+        console.warn('[Socket.IO] call_declined ignored: missing toUserId (caller)');
+        return;
+      }
+      emitToOnlineUserIds([recipient], 'call_declined', data, socket.id);
     });
 
     // Handle call end (hyphen: legacy)

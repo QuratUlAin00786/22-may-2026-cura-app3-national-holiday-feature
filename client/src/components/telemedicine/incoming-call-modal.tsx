@@ -8,6 +8,7 @@ import { useToast } from '@/hooks/use-toast';
 export interface IncomingCallData {
   roomId: string;
   fromUserId: string;
+  toUserId?: string;
   fromUsername: string;
   isVideo: boolean;
   participants: Array<{
@@ -28,6 +29,7 @@ interface IncomingCallModalProps {
   onAccept: (callData: IncomingCallData) => void;
   onDecline: () => void;
   onTimeout?: () => void;
+  isJoining?: boolean;
 }
 
 export function IncomingCallModal({
@@ -35,6 +37,7 @@ export function IncomingCallModal({
   onAccept,
   onDecline,
   onTimeout,
+  isJoining = false,
 }: IncomingCallModalProps) {
   const [timeRemaining, setTimeRemaining] = useState(30);
   const { toast } = useToast();
@@ -204,6 +207,7 @@ export function IncomingCallModal({
             <Button
               size="lg"
               onClick={handleAccept}
+              disabled={isJoining}
               className="flex-1 bg-green-500 hover:bg-green-600"
             >
               {callData.isVideo ? (

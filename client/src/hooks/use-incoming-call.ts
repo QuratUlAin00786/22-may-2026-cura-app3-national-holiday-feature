@@ -1,5 +1,7 @@
 import { useState, useEffect, useCallback } from 'react';
-import { socketManager, buildSocketUserIdentifier } from '@/lib/socket-manager';
+import { socketManager, buildSocketUserIdentifier, isIncomingCallForUser } from '@/lib/socket-manager';
+import { resolveLiveKitServerUrl } from '@/lib/livekit-url';
+import { useAuth } from '@/hooks/use-auth';
 import type { IncomingCallData } from '@/components/telemedicine/incoming-call-modal';
 
 export interface UseIncomingCallReturn {
@@ -10,11 +12,20 @@ export interface UseIncomingCallReturn {
 }
 
 export function useIncomingCall(): UseIncomingCallReturn {
+  const { user } = useAuth();
   const [incomingCall, setIncomingCall] = useState<IncomingCallData | null>(null);
 
   useEffect(() => {
     // Listen for incoming call events
     const unsubscribe = socketManager.on('incoming_call', (callData: any) => {
+      if (!isIncomingCallForUser(callData, user)) {
+        console.log('📞 Ignoring incoming call (not for this user or user is caller):', {
+          fromUserId: callData?.fromUserId,
+          toUserId: callData?.toUserId || callData?.to,
+        });
+        return;
+      }
+
       console.log('📞 Incoming call received in hook:', callData);
       console.log('📞 Incoming call - roomId:', callData.roomId);
       console.log('📞 Incoming call - fromUserId:', callData.fromUserId);
@@ -32,13 +43,14 @@ export function useIncomingCall(): UseIncomingCallReturn {
       const transformedCallData: IncomingCallData = {
         roomId: callData.roomId,
         fromUserId: callData.fromUserId,
+        toUserId: callData.toUserId || callData.to,
         fromUsername: callData.fromUsername,
         isVideo: callData.isVideo || false,
         participants: callData.participants || [],
         isGroup: callData.isGroup || false,
         groupName: callData.groupName || null,
         token: callData.token,
-        serverUrl: callData.serverUrl,
+        serverUrl: resolveLiveKitServerUrl(callData.serverUrl),
         e2eeKey: callData.e2eeKey,
         isDelayedCall: callData.isDelayedCall || false,
       };
@@ -50,7 +62,7 @@ export function useIncomingCall(): UseIncomingCallReturn {
     return () => {
       unsubscribe();
     };
-  }, []);
+  }, [user]);
 
   const acceptCall = useCallback((callData: IncomingCallData) => {
     console.log('✅ Accepting incoming call:', callData);
@@ -63,37 +75,18 @@ export function useIncomingCall(): UseIncomingCallReturn {
     const currentCall = incomingCall;
     setIncomingCall(null);
     
-    // Emit decline event to server with all required fields
     if (currentCall) {
-      // Get the current user's socket identifier
-      const authToken = localStorage.getItem('auth_token');
-      let toUserId = '';
-      
-      // Try to get current user ID from token
-      if (authToken) {
-        try {
-          const payload = JSON.parse(atob(authToken.split('.')[1]));
-          // Build a basic identifier - the server uses this to notify caller
-          toUserId = `${payload.userId}_declining-user`;
-        } catch (e) {
-          console.error('Failed to decode auth token:', e);
-        }
-      }
-      
+      const calleeId = buildSocketUserIdentifier(user);
       socketManager.emitToServer('call_declined', {
         roomId: currentCall.roomId,
-        fromUserId: currentCall.fromUserId,
-        toUserId: toUserId,
+        fromUserId: calleeId || undefined,
+        toUserId: currentCall.fromUserId,
         isGroup: currentCall.isGroup || false,
       });
-      
-      console.log('[IncomingCall] Emitted call_declined:', {
-        roomId: currentCall.roomId,
-        fromUserId: currentCall.fromUserId,
-        toUserId: toUserId,
-      });
+
+      console.log('[IncomingCall] Emitted call_declined to caller:', currentCall.fromUserId);
     }
-  }, [incomingCall]);
+  }, [incomingCall, user]);
 
   const clearIncomingCall = useCallback(() => {
     setIncomingCall(null);

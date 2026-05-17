@@ -692,6 +692,34 @@ export default function MessagingPage() {
     return name || entity?.name || entity?.email || `user-${entity?.id}`;
   };
 
+  const emitMessagingIncomingInvite = (args: {
+    roomName: string;
+    token?: string;
+    serverUrl?: string;
+    e2eeKey?: string;
+    fromIdentifier: string;
+    toIdentifier: string;
+    isVideo: boolean;
+  }) => {
+    if (!user || !args.token || !args.serverUrl) return;
+    const fromUsername = getDisplayName(user);
+    socketManager.emitToServer("incoming-call", {
+      roomId: args.roomName,
+      fromUserId: args.fromIdentifier,
+      fromUsername,
+      toUserId: args.toIdentifier,
+      to: args.toIdentifier,
+      isVideo: args.isVideo,
+      token: args.token,
+      serverUrl: args.serverUrl,
+      e2eeKey: args.e2eeKey,
+      participants: [],
+      isGroup: false,
+      groupName: args.isVideo ? "Messaging Video Call" : "Messaging Audio Call",
+      isDelayedCall: false,
+    });
+  };
+
   const startLiveKitVideoCall = async (participant: any) => {
     try {
       if (!user) {
@@ -736,6 +764,16 @@ export default function MessagingPage() {
       });
 
       const finalRoomId = liveKitRoom.roomId || roomName;
+
+      emitMessagingIncomingInvite({
+        roomName: finalRoomId,
+        token: liveKitRoom.token,
+        serverUrl: liveKitRoom.serverUrl,
+        e2eeKey: liveKitRoom.e2eeKey,
+        fromIdentifier,
+        toIdentifier,
+        isVideo: true,
+      });
 
       setLiveKitVideoCall({
         roomName: finalRoomId,
@@ -800,6 +838,16 @@ export default function MessagingPage() {
       });
 
       const finalRoomId = liveKitRoom.roomId || roomName;
+
+      emitMessagingIncomingInvite({
+        roomName: finalRoomId,
+        token: liveKitRoom.token,
+        serverUrl: liveKitRoom.serverUrl,
+        e2eeKey: liveKitRoom.e2eeKey,
+        fromIdentifier,
+        toIdentifier,
+        isVideo: false,
+      });
 
       setLiveKitAudioCall({
         roomName: finalRoomId,
@@ -3761,6 +3809,16 @@ export default function MessagingPage() {
 
       const finalRoomId = liveKitRoom.roomId || roomName;
 
+      emitMessagingIncomingInvite({
+        roomName: finalRoomId,
+        token: liveKitRoom.token,
+        serverUrl: liveKitRoom.serverUrl,
+        e2eeKey: liveKitRoom.e2eeKey,
+        fromIdentifier,
+        toIdentifier,
+        isVideo: true,
+      });
+
       // Close dialog and start LiveKit video call
       setShowVideoCall(false);
       setLiveKitVideoCall({
@@ -3768,6 +3826,8 @@ export default function MessagingPage() {
         participant,
         token: liveKitRoom.token,
         serverUrl: liveKitRoom.serverUrl,
+        initiatorSocketId: fromIdentifier,
+        participantSocketId: toIdentifier,
       });
 
       // Reset form and clear validation errors only on success

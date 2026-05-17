@@ -30,6 +30,29 @@ export function buildSocketUserIdentifier(
   return `${user.id}_${name}_${role}`;
 }
 
+/** True when socket identifier belongs to the given user (exact or id prefix). */
+export function isSocketUserMatch(
+  identifier: string | null | undefined,
+  user?: SocketUserInfo | null,
+): boolean {
+  if (!identifier || !user?.id) return false;
+  const mine = buildSocketUserIdentifier(user);
+  if (mine && identifier === mine) return true;
+  return identifier.startsWith(`${user.id}_`);
+}
+
+/** Incoming-call events should only ring the callee, never the caller. */
+export function isIncomingCallForUser(
+  callData: { fromUserId?: string; toUserId?: string; to?: string } | null | undefined,
+  user?: SocketUserInfo | null,
+): boolean {
+  if (!callData || !user) return false;
+  if (isSocketUserMatch(callData.fromUserId, user)) return false;
+  const targetId = callData.toUserId || callData.to;
+  if (targetId) return isSocketUserMatch(targetId, user);
+  return true;
+}
+
 // Socket.IO Events (matching backend)
 // Note: Backend uses events object, but actual event names are lowercase with underscores
 export const SocketEvents = {
@@ -189,11 +212,18 @@ class SocketManager {
       }
     );
 
-    // Handle incoming call events - this will be forwarded to any listeners registered via .on()
-    this.socket.on("incoming_call", (callData: any) => {
-      console.log("[SocketManager] 📞 Incoming call received:", callData);
-      // Emit to internal event system so hooks can listen
+    // Server broadcasts "incoming-call" (hyphen). Normalize to internal listeners.
+    this.socket.on("incoming-call", (callData: any) => {
+      console.log("[SocketManager] 📞 Incoming call (incoming-call):", callData);
       this.emit("incoming_call", callData);
+      this.emit("incoming-call", callData);
+    });
+
+    // Rare: server or peer sends underscore variant
+    this.socket.on("incoming_call", (callData: any) => {
+      console.log("[SocketManager] 📞 Incoming call (incoming_call):", callData);
+      this.emit("incoming_call", callData);
+      this.emit("incoming-call", callData);
     });
 
     // Handle currency update events (room-based)
@@ -338,7 +368,8 @@ class SocketManager {
       SocketEvents.CURRENCY_UPDATED,
       SocketEvents.ORGANIZATION_CURRENCY_UPDATED,
       SocketEvents.ONLINE_USERS_UPDATE,
-      "incoming_call"
+      "incoming_call",
+      "incoming-call",
     ].includes(event);
   }
 

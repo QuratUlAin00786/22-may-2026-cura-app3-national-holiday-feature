@@ -4,6 +4,8 @@ import path from "path";
 // import runtimeErrorOverlay from "@replit/vite-plugin-runtime-error-modal"; // Disabled
 
 export default defineConfig({
+  // Load VITE_* from repo root .env (root is client/, not project root)
+  envDir: path.resolve(import.meta.dirname),
   plugins: [
     react(),
     // runtimeErrorOverlay(), // Disabled error overlay

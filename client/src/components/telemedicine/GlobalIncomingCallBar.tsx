@@ -4,7 +4,8 @@ import { useIncomingCall } from '@/hooks/use-incoming-call';
 import { IncomingCallModal, type IncomingCallData } from '@/components/telemedicine/incoming-call-modal';
 import { LiveKitVideoCall } from '@/components/telemedicine/livekit-video-call';
 import { LiveKitAudioCall } from '@/components/telemedicine/livekit-audio-call';
-import { socketManager, buildSocketUserIdentifier } from '@/lib/socket-manager';
+import { socketManager, buildSocketUserIdentifier, isIncomingCallForUser } from '@/lib/socket-manager';
+import { fetchLiveKitJoinCredentials } from '@/lib/livekit-room-service';
 import { useToast } from '@/hooks/use-toast';
 import {
   Dialog,
@@ -104,6 +105,7 @@ export function GlobalIncomingCallBar() {
   } | null>(null);
 
   const [callDuration, setCallDuration] = useState(0);
+  const [isAcceptingCall, setIsAcceptingCall] = useState(false);
   const callTimerRef = useRef<NodeJS.Timeout | null>(null);
   const isStoppedRef = useRef(false);
 
@@ -171,18 +173,21 @@ export function GlobalIncomingCallBar() {
     return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
   };
 
+  const filteredIncomingCall =
+    incomingCall && isIncomingCallForUser(incomingCall, user) ? incomingCall : null;
+
   useEffect(() => {
-    if (incomingCall) {
-      console.log('[GlobalIncomingCall] Incoming call detected:', incomingCall);
-      console.log('[GlobalIncomingCall] Call from:', incomingCall.fromUsername || incomingCall.fromUserId);
-      console.log('[GlobalIncomingCall] Token exists:', !!incomingCall.token);
-      console.log('[GlobalIncomingCall] isVideo:', incomingCall.isVideo);
+    if (filteredIncomingCall) {
+      console.log('[GlobalIncomingCall] Incoming call detected:', filteredIncomingCall);
+      console.log('[GlobalIncomingCall] Call from:', filteredIncomingCall.fromUsername || filteredIncomingCall.fromUserId);
+      console.log('[GlobalIncomingCall] Token exists:', !!filteredIncomingCall.token);
+      console.log('[GlobalIncomingCall] isVideo:', filteredIncomingCall.isVideo);
       playRingtone();
     } else {
       console.log('[GlobalIncomingCall] No incoming call, stopping ringtone');
       stopRingtone();
     }
-  }, [incomingCall, playRingtone, stopRingtone]);
+  }, [filteredIncomingCall, playRingtone, stopRingtone]);
 
   useEffect(() => {
     return () => {
@@ -193,20 +198,9 @@ export function GlobalIncomingCallBar() {
 
   useEffect(() => {
     const closeIncomingCallIfMatch = (data: { roomId?: string }) => {
-      if (!incomingCall || !data.roomId) return;
-      
-      // More tolerant room ID matching - handles cases where room IDs might differ slightly
-      const roomIdMatches = 
-        data.roomId === incomingCall.roomId ||
-        (data.roomId.includes && data.roomId.includes(incomingCall.roomId)) ||
-        (incomingCall.roomId.includes && incomingCall.roomId.includes(data.roomId));
-      
-      if (roomIdMatches) {
-        console.log('[GlobalIncomingCall] Auto-decline and close Incoming Audio/Video Call - caller ended or declined', {
-          dataRoomId: data.roomId,
-          incomingCallRoomId: incomingCall.roomId,
-        });
-        if (incomingCall.isVideo) stopCameraForIncomingVideoCall();
+      if (filteredIncomingCall && data.roomId === filteredIncomingCall.roomId) {
+        console.log('[GlobalIncomingCall] Auto-decline and close Incoming Audio/Video Call - caller ended or declined');
+        if (filteredIncomingCall.isVideo) stopCameraForIncomingVideoCall();
         stopRingtone();
         clearIncomingCall();
       }
@@ -218,14 +212,7 @@ export function GlobalIncomingCallBar() {
       // If we have an incoming call for this room (caller cancelled from "Call in Progress"), close popup
       closeIncomingCallIfMatch(data);
       
-      // More tolerant room ID matching for active calls
-      const videoCallMatches = activeVideoCall && data.roomId && (
-        data.roomId === activeVideoCall.roomName ||
-        (data.roomId.includes && data.roomId.includes(activeVideoCall.roomName)) ||
-        (activeVideoCall.roomName.includes && activeVideoCall.roomName.includes(data.roomId))
-      );
-      
-      if (videoCallMatches) {
+      if (activeVideoCall && data.roomId === activeVideoCall.roomName) {
         console.log('[GlobalIncomingCall] Closing video call - caller ended');
         stopCallTimer();
         setActiveVideoCall(null);
@@ -235,13 +222,7 @@ export function GlobalIncomingCallBar() {
         });
       }
       
-      const audioCallMatches = activeAudioCall && data.roomId && (
-        data.roomId === activeAudioCall.roomName ||
-        (data.roomId.includes && data.roomId.includes(activeAudioCall.roomName)) ||
-        (activeAudioCall.roomName.includes && activeAudioCall.roomName.includes(data.roomId))
-      );
-      
-      if (audioCallMatches) {
+      if (activeAudioCall && data.roomId === activeAudioCall.roomName) {
         console.log('[GlobalIncomingCall] Closing audio call - caller ended');
         stopCallTimer();
         setActiveAudioCall(null);
@@ -263,54 +244,111 @@ export function GlobalIncomingCallBar() {
       unsubscribeCallEnded();
       unsubscribeCallDeclined();
     };
-  }, [activeVideoCall, activeAudioCall, incomingCall, stopCallTimer, stopRingtone, clearIncomingCall, toast]);
+  }, [activeVideoCall, activeAudioCall, filteredIncomingCall, stopCallTimer, stopRingtone, clearIncomingCall, toast]);
 
-  const handleAccept = useCallback((callData: IncomingCallData) => {
+  const handleAccept = useCallback(async (callData: IncomingCallData) => {
     console.log('[GlobalIncomingCall] Accepting call, stopping ringtone...');
     stopRingtone();
-    
+
     const callerName = callData.fromUsername || callData.fromUserId || 'Unknown';
     const callerId = callData.fromUserId || '';
-    
-    startCallTimer();
-    
-    if (callData.isVideo) {
-      setActiveVideoCall({
-        roomName: callData.roomId,
-        token: callData.token,
-        serverUrl: callData.serverUrl,
-        callerName: callerName,
-        callerId: callerId,
+    const calleeId = buildSocketUserIdentifier(user);
+
+    if (!user || !calleeId) {
+      toast({
+        title: 'Cannot join call',
+        description: 'You must be logged in to accept a call.',
+        variant: 'destructive',
       });
-    } else {
-      setActiveAudioCall({
-        roomName: callData.roomId,
-        token: callData.token,
-        serverUrl: callData.serverUrl,
-        callerName: callerName,
-        callerId: callerId,
-      });
+      return;
     }
-    
-    acceptCall(callData);
-  }, [acceptCall, stopRingtone, startCallTimer]);
+
+    if (!callData.fromUserId) {
+      toast({
+        title: 'Cannot join call',
+        description: 'Caller information is missing.',
+        variant: 'destructive',
+      });
+      return;
+    }
+
+    setIsAcceptingCall(true);
+    try {
+      const calleeDisplayName =
+        [user.firstName, user.lastName].filter(Boolean).join(' ').trim() ||
+        user.email ||
+        'User';
+
+      const credentials = await fetchLiveKitJoinCredentials({
+        roomId: callData.roomId,
+        participantIdentifier: calleeId,
+        participantDisplayName: calleeDisplayName,
+        remoteParticipant: {
+          identifier: callData.fromUserId,
+          displayName: callerName,
+        },
+        isVideo: callData.isVideo,
+      });
+
+      startCallTimer();
+
+      if (callData.isVideo) {
+        setActiveVideoCall({
+          roomName: credentials.roomId,
+          token: credentials.token,
+          serverUrl: credentials.serverUrl,
+          callerName,
+          callerId,
+        });
+      } else {
+        setActiveAudioCall({
+          roomName: credentials.roomId,
+          token: credentials.token,
+          serverUrl: credentials.serverUrl,
+          callerName,
+          callerId,
+        });
+      }
+
+      acceptCall(callData);
+
+      socketManager.emitToServer('call_accepted', {
+        roomId: callData.roomId,
+        fromUserId: calleeId,
+        toUserId: callData.fromUserId,
+        isVideo: callData.isVideo,
+      });
+      console.log('[GlobalIncomingCall] Emitted call_accepted to caller:', callData.fromUserId);
+    } catch (error) {
+      console.error('[GlobalIncomingCall] Failed to join call:', error);
+      stopCallTimer();
+      toast({
+        title: 'Failed to join call',
+        description:
+          error instanceof Error ? error.message : 'Could not get your LiveKit join token.',
+        variant: 'destructive',
+      });
+    } finally {
+      setIsAcceptingCall(false);
+    }
+  }, [acceptCall, stopRingtone, startCallTimer, stopCallTimer, user, toast]);
 
   const handleDecline = useCallback(() => {
     console.log('[GlobalIncomingCall] Declining call, stopping ringtone...');
-    if (incomingCall?.isVideo) stopCameraForIncomingVideoCall();
+    if (filteredIncomingCall?.isVideo) stopCameraForIncomingVideoCall();
     stopRingtone();
     stopCallTimer();
     declineCall(); // Emit and clear state
     clearIncomingCall(); // Ensure "Incoming Audio Call" popup closes when user declines (before other party accepts/declines)
-  }, [incomingCall, declineCall, clearIncomingCall, stopRingtone, stopCallTimer]);
+  }, [filteredIncomingCall, declineCall, clearIncomingCall, stopRingtone, stopCallTimer]);
 
   const handleTimeout = useCallback(() => {
     console.log('[GlobalIncomingCall] Call timed out, stopping ringtone...');
-    if (incomingCall?.isVideo) stopCameraForIncomingVideoCall();
+    if (filteredIncomingCall?.isVideo) stopCameraForIncomingVideoCall();
     stopRingtone();
     stopCallTimer();
     clearIncomingCall();
-  }, [incomingCall, clearIncomingCall, stopRingtone, stopCallTimer]);
+  }, [filteredIncomingCall, clearIncomingCall, stopRingtone, stopCallTimer]);
 
   const handleEndVideoCall = useCallback(() => {
     if (activeVideoCall && user) {
@@ -344,17 +382,18 @@ export function GlobalIncomingCallBar() {
     setActiveAudioCall(null);
   }, [activeAudioCall, user, stopCallTimer]);
 
-  if (!incomingCall && !activeVideoCall && !activeAudioCall) {
+  if (!filteredIncomingCall && !activeVideoCall && !activeAudioCall) {
     return null;
   }
 
   return (
     <>
       <IncomingCallModal
-        callData={incomingCall}
+        callData={filteredIncomingCall}
         onAccept={handleAccept}
         onDecline={handleDecline}
         onTimeout={handleTimeout}
+        isJoining={isAcceptingCall}
       />
 
       {activeVideoCall && (
@@ -372,7 +411,6 @@ export function GlobalIncomingCallBar() {
               <LiveKitVideoCall
                 roomName={activeVideoCall.roomName}
                 participantName={user ? `${user.firstName} ${user.lastName}` : 'User'}
-                participantRole={user?.role}
                 token={activeVideoCall.token}
                 serverUrl={activeVideoCall.serverUrl}
                 onDisconnect={handleEndVideoCall}
@@ -397,7 +435,6 @@ export function GlobalIncomingCallBar() {
               <LiveKitAudioCall
                 roomName={activeAudioCall.roomName}
                 participantName={user ? `${user.firstName} ${user.lastName}` : 'User'}
-                participantRole={user?.role}
                 token={activeAudioCall.token}
                 serverUrl={activeAudioCall.serverUrl}
                 onDisconnect={handleEndAudioCall}

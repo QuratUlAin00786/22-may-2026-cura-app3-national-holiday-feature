@@ -14,8 +14,10 @@ interface LiveKitAudioCallProps {
   token?: string;
   serverUrl?: string;
   onDisconnect?: (disconnectedParticipant?: { name: string; role?: string }) => void;
+  onConnected?: () => void;
   showControls?: boolean;
   audioEnabled?: boolean;
+  connectWhenReady?: boolean;
 }
 
 export function LiveKitAudioCall({
@@ -26,8 +28,10 @@ export function LiveKitAudioCall({
   token,
   serverUrl,
   onDisconnect,
+  onConnected,
   showControls = true,
   audioEnabled = true,
+  connectWhenReady = true,
 }: LiveKitAudioCallProps) {
   const {
     room,
@@ -43,31 +47,44 @@ export function LiveKitAudioCall({
 
   // Store audio elements for remote participants
   const remoteAudioRefs = useRef<Map<string, HTMLAudioElement>>(new Map());
+  const connectStartedRef = useRef(false);
 
-  // Connect on mount
   useEffect(() => {
-    if (!isConnected && !isConnecting) {
-      connect({
-        roomName,
-        participantName,
-        participantRole,
-        audioEnabled,
-        videoEnabled: false,
-        token,
-        url: serverUrl,
-      });
-    }
+    if (!connectWhenReady || connectStartedRef.current) return;
+    connectStartedRef.current = true;
+
+    connect({
+      roomName,
+      participantName,
+      participantRole,
+      audioEnabled,
+      videoEnabled: false,
+      token,
+      url: serverUrl,
+    });
   }, [
+    connectWhenReady,
     roomName,
     participantName,
     participantRole,
     token,
     serverUrl,
     audioEnabled,
-    isConnected,
-    isConnecting,
     connect,
   ]);
+
+  useEffect(() => {
+    return () => {
+      connectStartedRef.current = false;
+      disconnect();
+    };
+  }, [disconnect]);
+
+  useEffect(() => {
+    if (isConnected) {
+      onConnected?.();
+    }
+  }, [isConnected, onConnected]);
 
   // When the other participant leaves the room (they ended the call), close the call UI
   useEffect(() => {
@@ -167,12 +184,20 @@ export function LiveKitAudioCall({
     return (
       <Card className="p-6">
         <CardContent className="flex flex-col items-center justify-center min-h-[300px]">
-          <div className="text-red-500 mb-4">❌ {error}</div>
+          <div className="text-red-500 mb-4 text-center">❌ {error}</div>
           <button
             onClick={() =>
-              connect({ roomName, participantName, videoEnabled: false })
+              connect({
+                roomName,
+                participantName,
+                participantRole,
+                token,
+                url: serverUrl,
+                videoEnabled: false,
+                audioEnabled,
+              })
             }
-            className="px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600"
+            className="mt-4 px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600"
           >
             Retry Connection
           </button>
