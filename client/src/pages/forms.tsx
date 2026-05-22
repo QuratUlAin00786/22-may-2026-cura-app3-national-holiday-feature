@@ -2597,43 +2597,19 @@ Coverage Details: [Insurance Coverage]`;
         const { error: primary, detail } = parseApiFailurePayload(error.message);
         const haystack = `${primary ?? ""} ${detail ?? ""} ${error.message}`;
 
-        if (primary?.includes("Could not link this patient")) {
-          errorMessage = primary;
-        } else if (primary?.includes("Patient with ID") && primary.includes("not found")) {
-          errorMessage = "The selected patient could not be found. Please select a different patient.";
+        if (primary) {
+          errorMessage = detail ? `${primary} (${detail})` : primary;
         } else if (
           haystack.includes("foreign key constraint") &&
-          haystack.includes("patient_id") &&
-          !primary?.includes("Could not link this patient")
+          haystack.includes("patient_id")
         ) {
           errorMessage =
             "The selected patient is not found in the system. Please select a different patient or contact support if this issue persists.";
-        } else if (error.message.includes("404") || (primary && primary.toLowerCase().includes("not found"))) {
-          errorMessage = primary?.includes("Patient with ID")
-            ? "The selected patient could not be found. Please select a different patient."
-            : primary || "The selected patient could not be found. Please select a different patient.";
-        } else if (error.message.includes("500")) {
-          try {
-            const jsonMatch = error.message.match(/\{[\s\S]*\}/);
-            if (jsonMatch) {
-              const errorObj = JSON.parse(jsonMatch[0]) as { error?: string };
-              if (
-                errorObj.error?.includes("foreign key constraint") &&
-                errorObj.error?.includes("patient_id")
-              ) {
-                errorMessage =
-                  "The selected patient is not found in the system. Please select a different patient or contact support if this issue persists.";
-              } else {
-                errorMessage = errorObj.error || "An error occurred while sharing the form. Please try again.";
-              }
-            } else {
-              errorMessage = "A server error occurred. Please try again or contact support if the problem persists.";
-            }
-          } catch {
-            errorMessage = "An error occurred while sharing the form. Please try again.";
-          }
-        } else if (primary) {
-          errorMessage = primary;
+        } else if (error.message.includes("404") || haystack.toLowerCase().includes("not found")) {
+          errorMessage = "The selected patient could not be found. Please select a different patient.";
+        } else if (error.message.includes("500") || error.message.includes("503")) {
+          errorMessage =
+            "A server error occurred. Please try again or contact support if the problem persists.";
         } else {
           errorMessage = error.message;
         }

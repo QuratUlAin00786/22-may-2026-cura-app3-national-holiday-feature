@@ -312,9 +312,20 @@ export class FormService {
     }
   }
 
+  private async ensureFormShareDatabaseReady(): Promise<void> {
+    try {
+      await fixFormForeignKeysForActiveSchema(pool, activeDbSchema);
+      await repointFormSharePatientForeignKeys(pool, activeDbSchema);
+    } catch (err: unknown) {
+      console.warn(
+        "[FORMS] Form-share FK repair skipped (share may still fail if constraints point at the wrong schema):",
+        err instanceof Error ? err.message : err,
+      );
+    }
+  }
+
   async shareForm(input: ShareFormInput) {
-    await fixFormForeignKeysForActiveSchema(pool, activeDbSchema);
-    await repointFormSharePatientForeignKeys(pool, activeDbSchema);
+    await this.ensureFormShareDatabaseReady();
     await this.assertPatientExistsForShare(input.patientId, input.organizationId);
 
     const [shared] = await db
@@ -1395,14 +1406,16 @@ export class FormService {
 
   async previewShareEmail(input: ShareFormInput) {
     const patient = await storage.getPatient(input.patientId, input.organizationId);
-    const toEmail = patient
-      ? await this.resolveRecipientEmail(patient, input.organizationId)
-      : null;
+    if (!patient) {
+      throw new Error(`Patient with ID ${input.patientId} not found in this organization`);
+    }
+    const toEmail = await this.resolveRecipientEmail(patient, input.organizationId);
     if (!toEmail) {
       throw new Error("Patient must have an email address");
     }
     const previewToken = uuidv4();
-    const link = `${this.frontendUrl}/forms/fill?token=${encodeURIComponent(previewToken)}`;
+    const subdomain = await this.getOrganizationSubdomain(input.organizationId);
+    const link = this.buildShareLink(subdomain, previewToken);
     const { subject, html, text } = this.buildShareEmailContent(patient, link);
     return { subject, html, text, link };
   }

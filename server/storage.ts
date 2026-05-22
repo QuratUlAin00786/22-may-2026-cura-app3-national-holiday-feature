@@ -1279,9 +1279,16 @@ export class DatabaseStorage implements IStorage {
   private normalizePatientData(rawPatient: any): Patient | undefined {
     if (!rawPatient) return undefined;
 
-    const decrypted = decryptPatientFromStorageRow(rawPatient as Record<string, unknown>);
-    if (decrypted) {
-      return this.normalizeLegacyPatientData(decrypted);
+    try {
+      const decrypted = decryptPatientFromStorageRow(rawPatient as Record<string, unknown>);
+      if (decrypted) {
+        return this.normalizeLegacyPatientData(decrypted);
+      }
+    } catch (err: unknown) {
+      console.warn(
+        `[PATIENT-ENCRYPT] Full-row decrypt failed for patient id=${(rawPatient as { id?: number }).id}:`,
+        err instanceof Error ? err.message : err,
+      );
     }
 
     const perColumn = mergePerColumnDecryptedPatientFields(rawPatient as Record<string, unknown>);

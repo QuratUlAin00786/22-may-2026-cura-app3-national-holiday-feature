@@ -21398,6 +21398,30 @@ ${clinicName}`;
         console.error("Error sharing form:", error);
         const message = (error as Error).message || "Failed to share form";
         const code = (error as { code?: string }).code;
+
+        if (
+          message.includes("MISSING_ENCRYPTION_KEY") ||
+          message.includes("ENCRYPTION_KEY environment variable")
+        ) {
+          return res.status(503).json({
+            error:
+              "Patient encryption is not configured on this server. Set ENCRYPTION_KEY in production environment variables (same value as used when patients were encrypted), then restart the API.",
+            detail: process.env.NODE_ENV === "development" ? message.slice(0, 500) : undefined,
+          });
+        }
+
+        if (
+          message.includes("INVALID_TAG") ||
+          message.includes("Authentication failed") ||
+          message.includes("DECRYPTION_FAILED")
+        ) {
+          return res.status(503).json({
+            error:
+              "Could not decrypt patient data for this share. Ensure production ENCRYPTION_KEY matches the key used when this patient was saved.",
+            detail: process.env.NODE_ENV === "development" ? message.slice(0, 500) : undefined,
+          });
+        }
+
         if (
           code === "23503" ||
           (message.includes("foreign key constraint") &&
@@ -21412,7 +21436,27 @@ ${clinicName}`;
                 : undefined,
           });
         }
-        res.status(500).json({ error: message });
+
+        if (code === "42501" || /permission denied/i.test(message)) {
+          return res.status(503).json({
+            error:
+              "Database user cannot update form-share constraints. Ask your DBA to run form FK repair on the tenant schema, or grant ALTER privileges to the app DB user.",
+            detail: process.env.NODE_ENV === "development" ? message.slice(0, 500) : undefined,
+          });
+        }
+
+        if (code === "42P01" || /relation .* does not exist/i.test(message)) {
+          return res.status(503).json({
+            error:
+              "Form sharing tables are missing in the active database schema. Run migrations / ensure-db-schema on production, then restart the server.",
+            detail: process.env.NODE_ENV === "development" ? message.slice(0, 500) : undefined,
+          });
+        }
+
+        res.status(500).json({
+          error: message,
+          detail: process.env.NODE_ENV === "development" ? message.slice(0, 500) : undefined,
+        });
       }
     },
   );
