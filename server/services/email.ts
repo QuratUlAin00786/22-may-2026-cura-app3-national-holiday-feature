@@ -169,7 +169,16 @@ class EmailService {
 
   private async sendWithSendGrid(options: EmailOptions): Promise<SendEmailReport> {
     try {
-      const credentials = await this.getSendGridCredentials();
+      const envApiKey = process.env.SENDGRID_API_KEY?.trim();
+      const credentials = envApiKey
+        ? {
+            apiKey: envApiKey,
+            fromEmail:
+              process.env.SENDGRID_FROM_EMAIL?.trim() ||
+              process.env.DEFAULT_FROM_EMAIL?.trim() ||
+              "noreply@curaemr.ai",
+          }
+        : await this.getSendGridCredentials();
       if (!credentials) {
         console.log('[EMAIL] SendGrid credentials not available, will try SMTP fallback');
         return { success: false, error: "SendGrid credentials not available" };
@@ -297,8 +306,13 @@ class EmailService {
         console.log('[EMAIL] Primary SMTP failed:', smtpError.message);
         this.logEmailContent(mailOptions);
 
-        // If primary fails due to domain issues, try fallback method
-        if (smtpError.code === 'ENOTFOUND' || smtpError.code === 'ECONNREFUSED') {
+        // If primary fails due to network / firewall issues, try fallback method
+        const connectionFailed =
+          smtpError.code === "ENOTFOUND" ||
+          smtpError.code === "ECONNREFUSED" ||
+          smtpError.code === "ETIMEDOUT" ||
+          /connection timeout/i.test(smtpError.message || "");
+        if (connectionFailed) {
           console.log('[EMAIL] Domain not configured, checking for fallback email credentials...');
 
           if (process.env.FALLBACK_EMAIL_USER && process.env.FALLBACK_EMAIL_PASS) {

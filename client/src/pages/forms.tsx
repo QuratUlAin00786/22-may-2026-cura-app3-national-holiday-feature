@@ -2583,9 +2583,11 @@ Coverage Details: [Insurance Coverage]`;
       toast({
         title: data.emailSent ? "Form shared" : "Link created",
         description: data.emailSent
-          ? `The form link was emailed successfully.`
-          : `Link generated, but email delivery failed${data.emailError ? ` (${data.emailError})` : ""}—copy the link manually or resend.`,
-        variant: data.emailSent ? undefined : "destructive",
+          ? "The form link was emailed successfully."
+          : data.emailQueued
+            ? "Secure link is ready. Email is sending in the background—copy the link below if the patient does not receive it."
+            : `Link generated, but email could not be sent${data.emailError ? ` (${data.emailError})` : ""}—copy the link manually.`,
+        variant: data.emailSent ? undefined : data.emailQueued ? undefined : "destructive",
       });
       // Don't close the dialog immediately - keep it open so user can preview email
       // closeFormShareDialog();

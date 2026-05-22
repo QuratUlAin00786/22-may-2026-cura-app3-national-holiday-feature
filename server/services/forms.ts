@@ -353,30 +353,45 @@ export class FormService {
       .where(eq(formShares.id, shared.id));
 
     const subdomain = await this.getOrganizationSubdomain(input.organizationId);
-    const emailResult = await this.sendFormLinkEmail({
+    const link = this.buildShareLink(subdomain, token);
+    const emailPrepared = await this.prepareFormLinkEmail({
       token,
       patientId: input.patientId,
       formId: input.formId,
       organizationId: input.organizationId,
       subdomain,
     });
-    const link = this.buildShareLink(subdomain, token);
+
     await this.ensureEmailErrorColumnExists();
-    await db.insert(formShareLogs).values({
-      formId: input.formId,
-      organizationId: input.organizationId,
-      patientId: input.patientId,
-      sentBy: input.sentById,
-      link,
-      emailSent: emailResult.sent,
-      emailSubject: emailResult.subject,
-      emailHtml: emailResult.html,
-      emailText: emailResult.text,
-      emailError: emailResult.error ?? null,
-      createdAt: new Date(),
-    });
+    const [shareLog] = await db
+      .insert(formShareLogs)
+      .values({
+        formId: input.formId,
+        organizationId: input.organizationId,
+        patientId: input.patientId,
+        sentBy: input.sentById,
+        link,
+        emailSent: false,
+        emailSubject: emailPrepared.subject,
+        emailHtml: emailPrepared.html,
+        emailText: emailPrepared.text,
+        emailError: emailPrepared.toEmail ? null : (emailPrepared.error ?? "No recipient email"),
+        createdAt: new Date(),
+      })
+      .returning({ id: formShareLogs.id });
+
+    if (emailPrepared.toEmail && shareLog?.id) {
+      void this.deliverFormShareEmailInBackground(shareLog.id, {
+        to: emailPrepared.toEmail,
+        subject: emailPrepared.subject,
+        html: emailPrepared.html,
+        text: emailPrepared.text,
+        formId: input.formId,
+      });
+    }
 
     const form = await this.getFormStructure(input.formId, input.organizationId);
+
     return {
       share: {
         id: shared.id,
@@ -387,8 +402,11 @@ export class FormService {
       },
       form,
       link,
-      emailSent: emailResult.sent,
-      emailError: emailResult.error,
+      emailSent: false,
+      emailQueued: Boolean(emailPrepared.toEmail),
+      emailError: emailPrepared.toEmail
+        ? undefined
+        : emailPrepared.error ?? "Patient does not have a usable email address",
       emailPreview: {
         subject: emailResult.subject,
         html: emailResult.html,
@@ -1337,13 +1355,13 @@ export class FormService {
     };
   }
 
-  private async sendFormLinkEmail(params: {
+  private async prepareFormLinkEmail(params: {
     token: string;
     patientId: number;
     formId: number;
     organizationId: number;
     subdomain: string;
-  }): Promise<ShareEmailResult> {
+  }): Promise<ShareEmailResult & { toEmail?: string }> {
     const patient = await storage.getPatient(params.patientId, params.organizationId);
     if (!patient) {
       return {
@@ -1357,7 +1375,6 @@ export class FormService {
 
     const link = this.buildShareLink(params.subdomain, params.token);
     const { subject, html, text } = this.buildShareEmailContent(patient, link);
-
     const toEmail = await this.resolveRecipientEmail(patient, params.organizationId);
     if (!toEmail) {
       return {
@@ -1369,23 +1386,77 @@ export class FormService {
       };
     }
 
+    return { sent: false, subject, html, text, toEmail };
+  }
+
+  private async deliverFormShareEmailInBackground(
+    shareLogId: number,
+    params: { to: string; subject: string; html: string; text: string; formId: number },
+  ): Promise<void> {
+    try {
+      const { success, error } = await emailService.sendEmailWithReport({
+        to: params.to,
+        from: process.env.DEFAULT_FROM_EMAIL || "no-reply@curaemr.ai",
+        subject: params.subject,
+        html: params.html,
+        text: params.text,
+      });
+
+      await db
+        .update(formShareLogs)
+        .set({
+          emailSent: success,
+          emailError: success ? null : (error ?? "Email delivery failed"),
+        })
+        .where(eq(formShareLogs.id, shareLogId));
+
+      if (!success) {
+        console.warn("[EMAIL] sendEmailWithReport failed for form share", {
+          to: params.to,
+          formId: params.formId,
+          error,
+        });
+      }
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.error("[EMAIL] Background form-share email failed:", message);
+      await db
+        .update(formShareLogs)
+        .set({ emailSent: false, emailError: message })
+        .where(eq(formShareLogs.id, shareLogId))
+        .catch(() => undefined);
+    }
+  }
+
+  private async sendFormLinkEmail(params: {
+    token: string;
+    patientId: number;
+    formId: number;
+    organizationId: number;
+    subdomain: string;
+  }): Promise<ShareEmailResult> {
+    const prepared = await this.prepareFormLinkEmail(params);
+    if (!prepared.toEmail) {
+      return prepared;
+    }
+
     const { success, error } = await emailService.sendEmailWithReport({
-      to: toEmail,
+      to: prepared.toEmail,
       from: process.env.DEFAULT_FROM_EMAIL || "no-reply@curaemr.ai",
-      subject,
-      html,
-      text,
+      subject: prepared.subject,
+      html: prepared.html,
+      text: prepared.text,
     });
 
     if (!success) {
       console.warn("[EMAIL] sendEmailWithReport failed for form share", {
-        to: toEmail,
+        to: prepared.toEmail,
         formId: params.formId,
         error,
       });
     }
 
-    return { sent: success, subject, html, text, error };
+    return { sent: success, subject: prepared.subject, html: prepared.html, text: prepared.text, error };
   }
 
   private async loadClinicBranding(organizationId: number) {
