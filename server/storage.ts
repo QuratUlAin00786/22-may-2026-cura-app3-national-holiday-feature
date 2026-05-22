@@ -89,6 +89,10 @@ import {
   type ClinicFooter, type InsertClinicFooter
 } from "@shared/schema";
 import { activeDbSchema, db, pool } from "./db";
+import {
+  isInvalidUtf8DatabaseError,
+  sanitizeUtf8FromLatin1Bytes,
+} from "./utils/utf8-sanitize";
 import { ensureAiInsightsIdSequence } from "./ensure-db-schema";
 import { eq, and, desc, asc, count, not, sql, gte, lt, lte, isNotNull, isNull, or, ilike, ne, inArray } from "drizzle-orm";
 
@@ -518,6 +522,7 @@ export interface IStorage {
   resetSubscriptionContactPassword(contactId: number): Promise<any>;
   updateSubscriptionContactStatus(contactId: number, isActive: boolean): Promise<any>;
   getAllOrganizations(): Promise<Organization[]>;
+  listOrganizationIds(): Promise<number[]>;
   getAllCustomers(search?: string, status?: string): Promise<any[]>;
   getCustomerById(customerId: number): Promise<any>;
   getOrganizationSubscription(organizationId: number): Promise<any>;
@@ -7165,8 +7170,71 @@ export class DatabaseStorage implements IStorage {
     return { success: true, user };
   }
 
+  async listOrganizationIds(): Promise<number[]> {
+    const rows = await db
+      .select({ id: organizations.id })
+      .from(organizations)
+      .orderBy(desc(organizations.createdAt));
+    return rows.map((row) => row.id);
+  }
+
+  private mapOrganizationRowFromLatin1(row: Record<string, unknown>): Organization {
+    const str = (key: string, alt?: string) =>
+      sanitizeUtf8FromLatin1Bytes(row[key] ?? row[alt ?? key]) ?? "";
+    return {
+      id: Number(row.id),
+      name: str("name"),
+      subdomain: str("subdomain"),
+      email: str("email"),
+      region: str("region") || "UK",
+      brandName: str("brand_name", "brandName"),
+      country_code: (row.country_code as string | null) ?? null,
+      currency_code: (row.currency_code as string | null) ?? null,
+      currency_symbol: sanitizeUtf8FromLatin1Bytes(row.currency_symbol) ?? null,
+      language_code: (row.language_code as string | null) ?? null,
+      settings: (row.settings as Organization["settings"]) ?? {},
+      features: (row.features as Organization["features"]) ?? {},
+      accessLevel: str("access_level", "accessLevel") || "full",
+      subscriptionStatus: str("subscription_status", "subscriptionStatus") || "trial",
+      paymentStatus: str("payment_status", "paymentStatus") || "trial",
+      stripeAccountId: sanitizeUtf8FromLatin1Bytes(row.stripe_account_id) ?? null,
+      stripeStatus: sanitizeUtf8FromLatin1Bytes(row.stripe_status) ?? "active",
+      stripeCustomerId: sanitizeUtf8FromLatin1Bytes(row.stripe_customer_id) ?? null,
+      createdAt: (row.created_at as Date) ?? new Date(),
+      updatedAt: (row.updated_at as Date) ?? null,
+    } as Organization;
+  }
+
+  private async getAllOrganizationsViaLatin1Encoding(): Promise<Organization[]> {
+    const client = await pool.connect();
+    try {
+      await client.query("SET client_encoding TO 'LATIN1'");
+      const { rows } = await client.query(
+        `SELECT * FROM "${activeDbSchema}"."organizations" ORDER BY created_at DESC`,
+      );
+      await client.query("SET client_encoding TO 'UTF8'");
+      console.warn(
+        `[DB] Loaded ${rows.length} organization(s) with LATIN1 fallback (invalid UTF-8 bytes were sanitized)`,
+      );
+      return rows.map((row) => this.mapOrganizationRowFromLatin1(row as Record<string, unknown>));
+    } finally {
+      await client.query("SET client_encoding TO 'UTF8'").catch(() => undefined);
+      client.release();
+    }
+  }
+
   async getAllOrganizations(): Promise<Organization[]> {
-    return await db.select().from(organizations).orderBy(desc(organizations.createdAt));
+    try {
+      return await db.select().from(organizations).orderBy(desc(organizations.createdAt));
+    } catch (error: unknown) {
+      if (!isInvalidUtf8DatabaseError(error)) {
+        throw error;
+      }
+      console.warn(
+        "[DB] organizations SELECT failed (invalid UTF-8 in a text column); using LATIN1-safe loader",
+      );
+      return this.getAllOrganizationsViaLatin1Encoding();
+    }
   }
 
   async createCustomerOrganization(customerData: any): Promise<any> {

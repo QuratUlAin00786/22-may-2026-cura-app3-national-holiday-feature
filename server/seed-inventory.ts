@@ -291,19 +291,19 @@ export async function seedAllOrganizations() {
     // Import storage to fetch all organizations
     const { storage } = await import("./storage");
     
-    // Get all organizations
-    const organizations = await storage.getAllOrganizations();
-    console.log(`[SEED] Found ${organizations.length} organizations to seed`);
-    
-    // Seed inventory for each organization
-    for (const org of organizations) {
-      console.log(`[SEED] Seeding inventory for organization ${org.id} (${org.name})`);
-      await seedInventoryData(org.id);
+    // Load IDs only — avoids UTF-8 errors if a text column has invalid bytes (e.g. 0x9c)
+    const organizationIds = await storage.listOrganizationIds();
+    console.log(`[SEED] Found ${organizationIds.length} organizations to seed`);
+
+    for (const organizationId of organizationIds) {
+      console.log(`[SEED] Seeding inventory for organization ${organizationId}`);
+      await seedInventoryData(organizationId);
     }
     
     console.log("[SEED] Completed seeding for all organizations");
   } catch (error) {
     console.error("[SEED] Error in auto-seeding:", error);
+    throw error;
   }
 }
 
