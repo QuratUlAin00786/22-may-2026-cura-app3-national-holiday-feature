@@ -75,6 +75,7 @@ import {
   patientStatusBlocksScheduleOverlap,
 } from "@/lib/patient-appointment-overlap";
 import { format } from "date-fns";
+import { useBookingHolidayCalendar } from "@/hooks/use-booking-holiday-calendar";
 import { Elements, PaymentElement, useStripe, useElements } from "@stripe/react-stripe-js";
 import { loadStripe } from "@stripe/stripe-js";
 
@@ -415,6 +416,12 @@ export function DoctorList({
   const [openTreatmentCombo, setOpenTreatmentCombo] = useState(false);
   const [openConsultationCombo, setOpenConsultationCombo] = useState(false);
 
+  const bookingHoliday = useBookingHolidayCalendar({
+    enabled: isBookingOpen,
+    selectedDate,
+    setSelectedDate,
+  });
+
   // Confirmation dialog state
   const [isConfirmationOpen, setIsConfirmationOpen] = useState(false);
   const [isSuccessModalOpen, setIsSuccessModalOpen] = useState(false);
@@ -469,6 +476,7 @@ export function DoctorList({
     setTreatmentSelectionError("");
     setConsultationSelectionError("");
     setSelectedPatient("");
+    bookingHoliday.resetHolidayState();
   };
 
   const appointmentTypeLabel = appointmentType === "treatment" ? "Treatment" : "Consultation";
@@ -1757,7 +1765,7 @@ export function DoctorList({
           const checkDate = new Date(today);
           checkDate.setDate(today.getDate() + i);
 
-          if (hasShiftsOnDate(checkDate)) {
+          if (hasShiftsOnDate(checkDate) && !bookingHoliday.isDateHolidayBlocked(checkDate)) {
             setSelectedDate(checkDate);
             setHasAutoSelectedDate(true);
             break;
@@ -1772,7 +1780,7 @@ export function DoctorList({
     if (!isBookingOpen && hasAutoSelectedDate) {
       setHasAutoSelectedDate(false);
     }
-  }, [isBookingOpen, selectedBookingDoctor, allDoctorShifts, defaultShiftsData]);
+  }, [isBookingOpen, selectedBookingDoctor, allDoctorShifts, defaultShiftsData, bookingHoliday.isDateHolidayBlocked]);
 
   // Format time to 12-hour format for display
   const formatTime = (time: string): string => {
@@ -2813,17 +2821,12 @@ export function DoctorList({
                   <Calendar
                     mode="single"
                     selected={selectedDate}
-                    onSelect={(date: Date | undefined) => setSelectedDate(date)}
-                    disabled={(date: Date) => {
-                      const today = new Date();
-                      today.setHours(0, 0, 0, 0);
-
-                      if (date < today) return true;
-
-                      return !hasShiftsOnDate(date);
-                    }}
-                    className="w-full"
+                    onSelect={bookingHoliday.handleDateSelect}
+                    disabled={bookingHoliday.buildDateDisabled(hasShiftsOnDate)}
+                    className="w-full rounded-md"
+                    {...bookingHoliday.calendarProps}
                   />
+                  {bookingHoliday.legend}
                 </div>
               </div>
 
@@ -2835,6 +2838,20 @@ export function DoctorList({
                     <div className="flex items-center justify-center h-full">
                       <p className="text-gray-400 text-sm">Time slots will appear here</p>
                     </div>
+                  ) : bookingHoliday.needsHolidayAcknowledgement && !bookingHoliday.holidayAcknowledged ? (
+                    <div className="flex flex-col justify-center h-full px-1">
+                      {bookingHoliday.banner}
+                      <p className="text-xs text-gray-600 dark:text-gray-400 mb-3">
+                        This date is a configured holiday. Review the notice above, then continue to choose a time slot.
+                      </p>
+                      <Button
+                        type="button"
+                        className="w-full bg-blue-600 hover:bg-blue-700 text-white"
+                        onClick={() => bookingHoliday.setHolidayAcknowledged(true)}
+                      >
+                        Continue to time slots
+                      </Button>
+                    </div>
                   ) : timeSlots.length === 0 ? (
                     <div className="flex items-center justify-center h-full">
                       <div className="text-center">
@@ -2843,7 +2860,9 @@ export function DoctorList({
                       </div>
                     </div>
                   ) : (
-                    <div className="grid grid-cols-2 gap-2">
+                    <>
+                      {bookingHoliday.banner}
+                      <div className="grid grid-cols-2 gap-2">
                       {timeSlots.map((slot) => {
                         const isAvailable = isTimeSlotAvailable(selectedDate, slot);
                         const isSelected = selectedTimeSlot === timeSlotTo24Hour(slot);
@@ -2869,6 +2888,7 @@ export function DoctorList({
                         );
                       })}
                     </div>
+                    </>
                   )}
                 </div>
               </div>

@@ -52,6 +52,34 @@ function ageYearsFromDobUTC(dob: Date): number {
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
+/** Matches add-patient modal (patient-modal.tsx) insurance dropdowns */
+const INSURANCE_PROVIDER_OPTIONS = [
+  "NHS (National Health Service)",
+  "Bupa",
+  "AXA PPP Healthcare",
+  "Vitality Health",
+  "Aviva Health",
+  "Simply Health",
+  "WPA",
+  "Benenden Health",
+  "Healix Health Services",
+  "Sovereign Health Care",
+  "Exeter Friendly Society",
+  "Self-Pay",
+  "Other",
+] as const;
+
+const INSURANCE_PLAN_TYPE_OPTIONS = [
+  "Comprehensive",
+  "Standard",
+  "Basic",
+  "Dental Only",
+  "Optical Only",
+  "Mental Health",
+  "Maternity",
+  "Specialist",
+] as const;
+
 function getSubdomainFromPath(pathname: string): string | null {
   const parts = pathname.split("/").filter(Boolean);
   if (parts.length >= 1 && parts[0] !== "api") return parts[0];
@@ -93,8 +121,22 @@ export default function PublicPatientRegisterPage() {
   const [city, setCity] = useState("");
   const [state, setState] = useState("");
   const [postcode, setPostcode] = useState("");
+  const [building, setBuilding] = useState("");
   const [country, setCountry] = useState("United Kingdom");
-  const [postcodeLookupLoading, setPostcodeLookupLoading] = useState(false);
+  const [postcodeLookupMessage, setPostcodeLookupMessage] = useState("");
+  const [lookupAddresses, setLookupAddresses] = useState<string[]>([]);
+  const [lookupLoading, setLookupLoading] = useState(false);
+  const [allowManualAddress, setAllowManualAddress] = useState(true);
+  const [selectedLookupString, setSelectedLookupString] = useState<string | null>(null);
+  const [selectedAddressDetails, setSelectedAddressDetails] = useState<{
+    street: string;
+    city: string;
+    postcode: string;
+    building: string;
+    district?: string;
+    county?: string;
+    country?: string;
+  } | null>(null);
 
   const [emergencyName, setEmergencyName] = useState("");
   const [emergencyRelationship, setEmergencyRelationship] = useState("");
@@ -118,6 +160,7 @@ export default function PublicPatientRegisterPage() {
 
   const [submitting, setSubmitting] = useState(false);
   const [showSuccess, setShowSuccess] = useState(false);
+  const [confirmationEmailSent, setConfirmationEmailSent] = useState(true);
 
   const clearFieldError = useCallback((key: string) => {
     setFieldErrors((prev) => {
@@ -172,44 +215,160 @@ export default function PublicPatientRegisterPage() {
     void run();
   }, [subdomain, tokenParam, toast]);
 
-  const handleLookupPostcode = async () => {
-    if (country !== "United Kingdom") {
-      toast({ title: "Postcode lookup is available when country is United Kingdom", variant: "destructive" });
-      return;
-    }
-    const pc = postcode.trim();
-    if (!pc) {
-      toast({ title: "Enter a postcode first", variant: "destructive" });
-      return;
-    }
-    setPostcodeLookupLoading(true);
-    try {
+  const applySelectedAddress = useCallback(
+    async (selection: string) => {
       if (!subdomain) {
         toast({ title: "Missing clinic subdomain", variant: "destructive" });
         return;
       }
-      const r = await fetch(
-        buildUrl(`/api/public/${encodeURIComponent(subdomain)}/postcode-lookup?postcode=${encodeURIComponent(pc)}`),
-        {
-          method: "GET",
-          headers: { "X-Tenant-Subdomain": subdomain },
-          credentials: "include",
-        },
-      );
-      const j = await r.json().catch(() => ({}));
-      if (!r.ok) {
-        toast({ title: j?.error || "Could not find that postcode", variant: "destructive" });
+      const cleanedPostcode = selection.split(",").pop()?.trim() || postcode.trim();
+      setLookupLoading(true);
+      try {
+        const response = await fetch(
+          buildUrl(
+            `/api/public/${encodeURIComponent(subdomain)}/postcode-lookup?postcode=${encodeURIComponent(cleanedPostcode)}`,
+          ),
+          {
+            method: "GET",
+            headers: { "X-Tenant-Subdomain": subdomain },
+            credentials: "include",
+          },
+        );
+        if (!response.ok) {
+          throw new Error("Unable to fetch address details");
+        }
+        const data = await response.json();
+        if (!data.result) throw new Error("Royal Mail returned no results");
+        const result = data.result;
+        const sanitizeText = (text?: string) => text?.trim() || "";
+        const postalCodePattern = result.postcode
+          ? new RegExp(result.postcode.replace(/\s+/g, ""), "gi")
+          : null;
+
+        const streetParts = [
+          sanitizeText(result.line_1),
+          sanitizeText(result.line_2),
+          sanitizeText(result.thoroughfare),
+          sanitizeText(result.dependent_locality),
+          sanitizeText(result.parish),
+        ]
+          .filter(Boolean)
+          .map((part: string) => part.trim());
+
+        let streetAddress = streetParts.length ? streetParts.join(", ") : selection;
+        if (postalCodePattern && postalCodePattern.test(streetAddress.replace(/\s+/g, ""))) {
+          streetAddress = streetAddress.replace(postalCodePattern, "").trim();
+        }
+        if (!streetAddress) {
+          streetAddress = selection.replace(result.postcode || "", "").replace(/,+$/, "").trim();
+        }
+
+        setStreet(streetAddress);
+        setCity(result.post_town || result.admin_district || result.region || "");
+        setState(result.admin_county || result.region || "");
+        setPostcode(result.postcode || cleanedPostcode);
+        setCountry("United Kingdom");
+        const buildingName =
+          result.premise || result.building_name || result.admin_ward || result.line_1 || "";
+        setBuilding(buildingName);
+        setSelectedLookupString(selection);
+        setLookupAddresses([]);
+        setSelectedAddressDetails({
+          street: streetAddress,
+          city: result.post_town || result.admin_district || result.region || "",
+          postcode: result.postcode || cleanedPostcode,
+          building: buildingName,
+          district: result.admin_district || result.admin_ward || result.region,
+          county: result.admin_county || result.region,
+          country: result.country || "United Kingdom",
+        });
+        setPostcodeLookupMessage("Royal Mail address populated.");
+        setAllowManualAddress(false);
+      } catch (error) {
+        console.error("Royal Mail detail error:", error);
+        setPostcodeLookupMessage("Could not retrieve the full address. You can enter it manually.");
+        setAllowManualAddress(true);
+        setSelectedAddressDetails(null);
+      } finally {
+        setLookupLoading(false);
+      }
+    },
+    [subdomain, postcode, toast],
+  );
+
+  const handlePostcodeLookup = useCallback(
+    async (postcodeValue: string) => {
+      if (!postcodeValue || postcodeValue.trim().length < 3) {
+        setPostcodeLookupMessage("Enter a valid postcode before lookup.");
+        setAllowManualAddress(true);
         return;
       }
-      const result = j?.result;
-      if (result?.admin_district) setCity(String(result.admin_district));
-      if (result?.region) setState(String(result.region));
-    } catch {
-      toast({ title: "Postcode lookup failed", variant: "destructive" });
-    } finally {
-      setPostcodeLookupLoading(false);
+      if (country !== "United Kingdom") {
+        setPostcodeLookupMessage("Royal Mail lookup is only available for United Kingdom addresses.");
+        setAllowManualAddress(true);
+        return;
+      }
+      if (!subdomain) {
+        toast({ title: "Missing clinic subdomain", variant: "destructive" });
+        return;
+      }
+
+      setLookupLoading(true);
+      setPostcodeLookupMessage("Looking up addresses via Royal Mail...");
+      setLookupAddresses([]);
+      setSelectedLookupString(null);
+      setSelectedAddressDetails(null);
+
+      try {
+        const cleanedPostcode = postcodeValue.trim().replace(/\s+/g, "");
+        const response = await fetch(
+          buildUrl(
+            `/api/public/${encodeURIComponent(subdomain)}/postcode-autocomplete?postcode=${encodeURIComponent(cleanedPostcode)}`,
+          ),
+          {
+            method: "GET",
+            headers: { "X-Tenant-Subdomain": subdomain },
+            credentials: "include",
+          },
+        );
+        if (!response.ok) {
+          throw new Error("No addresses found");
+        }
+
+        const data = await response.json();
+        const results: string[] = Array.isArray(data.result) ? data.result : [];
+        if (results.length === 0) {
+          throw new Error("No addresses returned");
+        }
+
+        setLookupAddresses(results);
+        setPostcodeLookupMessage(`${results.length} addresses returned. Select the precise Royal Mail address.`);
+        setAllowManualAddress(false);
+        if (results.length === 1) {
+          await applySelectedAddress(results[0]);
+        }
+      } catch (error) {
+        console.error("Lookup error:", error);
+        setPostcodeLookupMessage(
+          "Unable to fetch addresses. You can enter the address manually or try again.",
+        );
+        setAllowManualAddress(true);
+      } finally {
+        setLookupLoading(false);
+      }
+    },
+    [country, subdomain, applySelectedAddress, toast],
+  );
+
+  useEffect(() => {
+    if (!postcode || postcode.trim().length < 3 || !country) {
+      return;
     }
-  };
+    const timeoutId = setTimeout(() => {
+      void handlePostcodeLookup(postcode);
+    }, 500);
+    return () => clearTimeout(timeoutId);
+  }, [postcode, country, handlePostcodeLookup]);
 
   const validate = (): boolean => {
     const err: Record<string, string> = {};
@@ -295,6 +454,7 @@ export default function PublicPatientRegisterPage() {
           state: state.trim() || undefined,
           postcode: postcode.trim() || undefined,
           country: country.trim() || undefined,
+          building: building.trim() || undefined,
         },
         emergencyContact: {
           name: emergencyName.trim(),
@@ -356,6 +516,13 @@ export default function PublicPatientRegisterPage() {
           variant: "destructive",
         });
         return;
+      }
+      setConfirmationEmailSent(data?.confirmationEmailSent !== false);
+      if (data?.confirmationEmailSent === false) {
+        console.warn(
+          "[patient-register] Confirmation email was not sent:",
+          data?.confirmationEmailError,
+        );
       }
       setShowSuccess(true);
     } catch (e: any) {
@@ -676,9 +843,23 @@ export default function PublicPatientRegisterPage() {
               <h3 className="font-medium text-gray-900 dark:text-gray-100">Address</h3>
               <div className="space-y-2">
                 <Label>Country</Label>
-                <Select value={country} onValueChange={setCountry}>
+                <Select
+                  value={country}
+                  onValueChange={(v) => {
+                    setCountry(v);
+                    setLookupAddresses([]);
+                    setSelectedAddressDetails(null);
+                    setSelectedLookupString(null);
+                    if (v !== "United Kingdom") {
+                      setPostcodeLookupMessage("Royal Mail lookup is only available for United Kingdom addresses.");
+                      setAllowManualAddress(true);
+                    } else {
+                      setPostcodeLookupMessage("");
+                    }
+                  }}
+                >
                   <SelectTrigger>
-                    <SelectValue />
+                    <SelectValue placeholder="Select country first for auto-lookup" />
                   </SelectTrigger>
                   <SelectContent>
                     {COUNTRY_OPTIONS.map((c) => (
@@ -688,27 +869,131 @@ export default function PublicPatientRegisterPage() {
                     ))}
                   </SelectContent>
                 </Select>
+                <p className="text-xs text-muted-foreground">
+                  Select United Kingdom to enable Royal Mail postcode lookup.
+                </p>
               </div>
-              <div className="flex flex-col sm:flex-row gap-2">
-                <div className="flex-1 space-y-2">
-                  <Label htmlFor="postcode">Postcode / ZIP</Label>
-                  <Input id="postcode" value={postcode} onChange={(e) => setPostcode(e.target.value)} placeholder="Postcode" />
+              <div className="space-y-2">
+                <Label htmlFor="postcode">Postal code / ZIP (auto-lookup)</Label>
+                <div className="flex gap-2">
+                  <Input
+                    id="postcode"
+                    value={postcode}
+                    onChange={(e) => {
+                      setPostcode(e.target.value);
+                      setSelectedAddressDetails(null);
+                      setSelectedLookupString(null);
+                    }}
+                    placeholder="Enter postal code"
+                  />
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    onClick={() => void handlePostcodeLookup(postcode)}
+                    disabled={!postcode || postcode.length < 3 || lookupLoading}
+                  >
+                    {lookupLoading ? (
+                      <>
+                        <Loader2 className="h-4 w-4 animate-spin mr-1" />
+                        Looking up...
+                      </>
+                    ) : (
+                      "Lookup"
+                    )}
+                  </Button>
                 </div>
-                {country === "United Kingdom" && (
-                  <div className="flex items-end">
-                    <Button type="button" variant="outline" onClick={handleLookupPostcode} disabled={postcodeLookupLoading}>
-                      {postcodeLookupLoading ? <Loader2 className="h-4 w-4 animate-spin" /> : "Lookup"}
-                    </Button>
+                <p className="text-xs text-muted-foreground">
+                  For UK addresses, use Royal Mail lookup. Enter a postcode to fetch matching addresses.
+                </p>
+                {lookupAddresses.length > 0 && (
+                  <div className="space-y-2 mt-2 rounded-lg bg-slate-50 dark:bg-slate-900/40 p-3 text-sm text-slate-700 dark:text-slate-300 border border-dashed border-slate-200 dark:border-slate-700 max-h-48 overflow-y-auto">
+                    <p className="text-xs font-semibold text-slate-500">Select the matching Royal Mail address:</p>
+                    {lookupAddresses.map((addr) => (
+                      <button
+                        key={addr}
+                        type="button"
+                        className="w-full rounded-md border border-transparent bg-white dark:bg-slate-800 px-3 py-2 text-left text-sm hover:bg-blue-50 dark:hover:bg-blue-900/30"
+                        onClick={() => void applySelectedAddress(addr)}
+                      >
+                        {addr}
+                      </button>
+                    ))}
+                  </div>
+                )}
+                {postcodeLookupMessage && !selectedAddressDetails && (
+                  <p
+                    className={`text-xs mt-2 ${allowManualAddress ? "text-amber-600" : "text-green-600"}`}
+                  >
+                    {postcodeLookupMessage}
+                  </p>
+                )}
+                {!allowManualAddress && selectedLookupString && selectedAddressDetails && (
+                  <div className="mt-3 rounded-lg border border-dashed border-emerald-200 bg-emerald-50 dark:bg-emerald-900/20 px-3 py-2 text-sm text-emerald-900 dark:text-emerald-100 space-y-1">
+                    <p className="font-semibold text-emerald-800 dark:text-emerald-200">Royal Mail address</p>
+                    {selectedAddressDetails.street &&
+                      selectedAddressDetails.street.replace(/\s+/g, "").toLowerCase() !==
+                        (selectedAddressDetails.postcode || "").replace(/\s+/g, "").toLowerCase() && (
+                        <p>{selectedAddressDetails.street}</p>
+                      )}
+                    <p>
+                      {selectedAddressDetails.city} • {selectedAddressDetails.postcode}
+                    </p>
+                    {selectedAddressDetails.county && (
+                      <p className="text-xs text-emerald-700 dark:text-emerald-300">
+                        County: {selectedAddressDetails.county}
+                      </p>
+                    )}
+                    {selectedAddressDetails.building && (
+                      <p className="text-xs text-emerald-700 dark:text-emerald-300">
+                        Building: {selectedAddressDetails.building}
+                      </p>
+                    )}
                   </div>
                 )}
               </div>
               <div className="space-y-2">
+                <Label htmlFor="building">Building number / name (optional)</Label>
+                <Input
+                  id="building"
+                  value={building}
+                  onChange={(e) => setBuilding(e.target.value)}
+                  placeholder="Optional building number or name"
+                  disabled={!allowManualAddress}
+                />
+              </div>
+              <div className="space-y-2">
                 <Label htmlFor="street">Street address</Label>
-                <Input id="street" value={street} onChange={(e) => setStreet(e.target.value)} placeholder="Street" />
+                <Input
+                  id="street"
+                  value={street}
+                  onChange={(e) => setStreet(e.target.value)}
+                  placeholder="Enter street address"
+                />
               </div>
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                <Input value={city} onChange={(e) => setCity(e.target.value)} placeholder="City / town" />
-                <Input value={state} onChange={(e) => setState(e.target.value)} placeholder="State / region" />
+                <div className="space-y-2">
+                  <Label htmlFor="city" className="sr-only">
+                    City / town
+                  </Label>
+                  <Input
+                    id="city"
+                    value={city}
+                    onChange={(e) => setCity(e.target.value)}
+                    placeholder="City / town"
+                  />
+                </div>
+                <div className="space-y-2">
+                  <Label htmlFor="state" className="sr-only">
+                    State / region
+                  </Label>
+                  <Input
+                    id="state"
+                    value={state}
+                    onChange={(e) => setState(e.target.value)}
+                    placeholder="State / region / county"
+                  />
+                </div>
               </div>
             </div>
 
@@ -793,19 +1078,73 @@ export default function PublicPatientRegisterPage() {
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                 <div className="space-y-2">
                   <Label htmlFor="insProvider">Insurance provider</Label>
-                  <Input id="insProvider" value={insuranceProvider} onChange={(e) => setInsuranceProvider(e.target.value)} />
+                  <Select
+                    value={insuranceProvider || undefined}
+                    onValueChange={(v) => setInsuranceProvider(v)}
+                  >
+                    <SelectTrigger id="insProvider">
+                      <SelectValue placeholder="Select insurance provider..." />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {INSURANCE_PROVIDER_OPTIONS.map((provider) => (
+                        <SelectItem
+                          key={provider}
+                          value={provider}
+                          className={
+                            provider === "NHS (National Health Service)"
+                              ? "bg-cyan-300 hover:bg-cyan-400 dark:bg-cyan-500 dark:hover:bg-cyan-600"
+                              : undefined
+                          }
+                        >
+                          {provider}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
                 </div>
                 <div className="space-y-2">
                   <Label htmlFor="insPlan">Plan type</Label>
-                  <Input id="insPlan" value={insurancePlanType} onChange={(e) => setInsurancePlanType(e.target.value)} />
+                  <Select
+                    value={insurancePlanType || undefined}
+                    onValueChange={(v) => setInsurancePlanType(v)}
+                  >
+                    <SelectTrigger id="insPlan">
+                      <SelectValue placeholder="Select plan type" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {INSURANCE_PLAN_TYPE_OPTIONS.map((plan) => (
+                        <SelectItem
+                          key={plan}
+                          value={plan}
+                          className={
+                            plan === "Comprehensive"
+                              ? "bg-cyan-300 hover:bg-cyan-400 dark:bg-cyan-500 dark:hover:bg-cyan-600"
+                              : undefined
+                          }
+                        >
+                          {plan}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
                 </div>
                 <div className="space-y-2">
                   <Label htmlFor="polNum">Policy number</Label>
-                  <Input id="polNum" value={policyNumber} onChange={(e) => setPolicyNumber(e.target.value)} />
+                  <Input
+                    id="polNum"
+                    value={policyNumber}
+                    onChange={(e) => setPolicyNumber(e.target.value)}
+                    placeholder="Enter policy number"
+                  />
                 </div>
                 <div className="space-y-2">
                   <Label htmlFor="memNum">Member number</Label>
-                  <Input id="memNum" value={memberNumber} onChange={(e) => setMemberNumber(e.target.value)} />
+                  <Input
+                    id="memNum"
+                    value={memberNumber}
+                    onChange={(e) => setMemberNumber(e.target.value)}
+                    placeholder="Enter member number"
+                  />
                 </div>
                 <div className="space-y-2 sm:col-span-2">
                   <Label htmlFor="insEff">Effective date</Label>
@@ -923,13 +1262,26 @@ export default function PublicPatientRegisterPage() {
         <DialogContent>
           <DialogHeader>
             <DialogTitle>Registration submitted</DialogTitle>
-            <DialogDescription>Thank you. The clinic has received your details.</DialogDescription>
+            <DialogDescription>
+              {confirmationEmailSent ? (
+                <>
+                  Thank you. The clinic has received your details. A confirmation email has been sent to{" "}
+                  <strong>{emailLocked}</strong>.
+                </>
+              ) : (
+                <>
+                  Thank you. The clinic has received your details. We could not send a confirmation email to{" "}
+                  <strong>{emailLocked}</strong> — please contact the clinic if you need a copy of your registration.
+                </>
+              )}
+            </DialogDescription>
           </DialogHeader>
           <DialogFooter>
             <Button
               onClick={() => {
                 setShowSuccess(false);
-                setLocation("/auth/login");
+                if (subdomain) setLocation(`/${encodeURIComponent(subdomain)}/auth/login`);
+                else setLocation("/auth/login");
               }}
             >
               Continue

@@ -9,7 +9,20 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription } f
 import { Label } from "@/components/ui/label";
 import { Input } from "@/components/ui/input";
 import { Checkbox } from "@/components/ui/checkbox";
-import { Calendar, Clock, Users, CalendarCheck, ChevronLeft, ChevronRight, UserCheck, Trash2, Edit, Settings, Plus, Check, ChevronsUpDown, CheckCircle } from "lucide-react";
+import { Calendar, Clock, Users, CalendarCheck, ChevronLeft, ChevronRight, UserCheck, Trash2, Edit, Settings, Plus, Check, ChevronsUpDown, CheckCircle, CalendarDays, AlertTriangle } from "lucide-react";
+import { Textarea } from "@/components/ui/textarea";
+import { Badge } from "@/components/ui/badge";
+import { Switch } from "@/components/ui/switch";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 import { useToast } from "@/hooks/use-toast";
 import { useAuth } from "@/hooks/use-auth";
 import { isDoctorLike } from "@/lib/role-utils";
@@ -17,6 +30,59 @@ import { useLocation } from "wouter";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Command, CommandEmpty, CommandGroup, CommandInput, CommandItem, CommandList } from "@/components/ui/command";
 import { cn } from "@/lib/utils";
+
+type HolidayEntry = {
+  id: number;
+  holidayDate: string;
+  name: string;
+  holidayType: "national" | "regional" | "company";
+  region?: string | null;
+  allowShifts: boolean;
+  isWorkingDay: boolean;
+  notes?: string | null;
+};
+
+type HolidaySettings = {
+  weekendDays: string[];
+  weekendsNonWorking: boolean;
+  defaultAllowShiftsOnHolidays: boolean;
+};
+
+type DateHolidayStatus = {
+  isNonWorking: boolean;
+  allowShifts: boolean;
+  isWorkingDay: boolean;
+  label: string;
+  holidayType: string;
+  source: "holiday" | "weekend";
+  holidayId?: number;
+};
+
+const HOLIDAY_TYPE_LABELS: Record<string, string> = {
+  national: "National",
+  regional: "Regional / Provincial",
+  company: "Company",
+  weekend: "Weekend",
+};
+
+const HOLIDAY_TYPE_COLORS: Record<string, string> = {
+  national: "bg-amber-100 text-amber-900 border-amber-300 dark:bg-amber-900/40 dark:text-amber-100",
+  regional: "bg-orange-100 text-orange-900 border-orange-300 dark:bg-orange-900/40 dark:text-orange-100",
+  company: "bg-purple-100 text-purple-900 border-purple-300 dark:bg-purple-900/40 dark:text-purple-100",
+  weekend: "bg-slate-200 text-slate-800 border-slate-300 dark:bg-slate-700 dark:text-slate-100",
+};
+
+const normalizeHolidayDate = (value: string) => value.split("T")[0];
+
+const getDayName = (date: Date) =>
+  ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"][date.getDay()];
+
+const getLocalDateString = (date: Date) => {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+};
 
 export default function ShiftsPage() {
   const [showSuccessModal, setShowSuccessModal] = useState(false);
@@ -56,6 +122,17 @@ export default function ShiftsPage() {
   const [shiftToDelete, setShiftToDelete] = useState<any>(null);
   const [rolePopoverOpen, setRolePopoverOpen] = useState(false);
   const [staffPopoverOpen, setStaffPopoverOpen] = useState(false);
+  const [holidayMonth, setHolidayMonth] = useState(new Date());
+  const [holidayFormDate, setHolidayFormDate] = useState("");
+  const [holidayFormName, setHolidayFormName] = useState("");
+  const [holidayFormType, setHolidayFormType] = useState<"national" | "regional" | "company">("national");
+  const [holidayFormRegion, setHolidayFormRegion] = useState("");
+  const [holidayFormAllowShifts, setHolidayFormAllowShifts] = useState(false);
+  const [holidayFormIsWorking, setHolidayFormIsWorking] = useState(false);
+  const [holidayFormNotes, setHolidayFormNotes] = useState("");
+  const [editingHolidayId, setEditingHolidayId] = useState<number | null>(null);
+  const [showHolidayConfirmDialog, setShowHolidayConfirmDialog] = useState(false);
+  const [pendingHolidayAction, setPendingHolidayAction] = useState<"shift" | "absent" | null>(null);
   const { toast } = useToast();
   const queryClient = useQueryClient();
   const { user } = useAuth();
@@ -375,6 +452,263 @@ export default function ShiftsPage() {
     return days;
   }, [currentMonth]);
 
+  const shiftCalendarRange = useMemo(() => {
+    const year = currentMonth.getFullYear();
+    const month = currentMonth.getMonth();
+    const first = new Date(year, month, 1);
+    const start = new Date(first);
+    start.setDate(start.getDate() - first.getDay());
+    const end = new Date(start);
+    end.setDate(end.getDate() + 41);
+    return {
+      from: getLocalDateString(start),
+      to: getLocalDateString(end),
+    };
+  }, [currentMonth]);
+
+  const { data: shiftHolidayCalendar } = useQuery({
+    queryKey: ["/api/holiday-calendar", shiftCalendarRange.from, shiftCalendarRange.to],
+    queryFn: async () => {
+      const response = await apiRequest(
+        "GET",
+        `/api/holiday-calendar?from=${shiftCalendarRange.from}&to=${shiftCalendarRange.to}`,
+      );
+      return response.json() as Promise<{ settings: HolidaySettings; holidays: HolidayEntry[] }>;
+    },
+  });
+
+  const holidaySettings = shiftHolidayCalendar?.settings;
+  const holidaysInShiftMonth = shiftHolidayCalendar?.holidays ?? [];
+
+  const holidayByDate = useMemo(() => {
+    const map = new Map<string, HolidayEntry[]>();
+    for (const h of holidaysInShiftMonth) {
+      const key = normalizeHolidayDate(h.holidayDate);
+      const list = map.get(key) ?? [];
+      list.push(h);
+      map.set(key, list);
+    }
+    return map;
+  }, [holidaysInShiftMonth]);
+
+  const resolveClientDateStatus = (date: Date): DateHolidayStatus | null => {
+    const dateStr = getLocalDateString(date);
+    const entries = holidayByDate.get(dateStr);
+    if (entries?.length) {
+      const primary = entries[0];
+      return {
+        isNonWorking: !primary.isWorkingDay,
+        allowShifts: primary.allowShifts,
+        isWorkingDay: primary.isWorkingDay,
+        label: primary.name,
+        holidayType: primary.holidayType,
+        source: "holiday",
+        holidayId: primary.id,
+      };
+    }
+    if (holidaySettings?.weekendsNonWorking) {
+      const dayName = getDayName(date);
+      if ((holidaySettings.weekendDays ?? ["Saturday", "Sunday"]).includes(dayName)) {
+        return {
+          isNonWorking: true,
+          allowShifts: holidaySettings.defaultAllowShiftsOnHolidays ?? false,
+          isWorkingDay: false,
+          label: `${dayName} (weekend)`,
+          holidayType: "weekend",
+          source: "weekend",
+        };
+      }
+    }
+    return null;
+  };
+
+  const selectedDateHolidayStatus = useMemo(
+    () => resolveClientDateStatus(selectedDate),
+    [selectedDate, holidayByDate, holidaySettings],
+  );
+
+  const runAfterHolidayCheck = (
+    action: "shift" | "absent",
+    runner: (confirmOverride: boolean) => void | Promise<void>,
+  ) => {
+    const status = resolveClientDateStatus(selectedDate);
+    if (
+      status &&
+      status.isNonWorking &&
+      !status.allowShifts &&
+      action === "shift"
+    ) {
+      toast({
+        title: "Holiday — shifts not allowed",
+        description: `${status.label} is configured as non-working. Shifts cannot be assigned on this date.`,
+        variant: "destructive",
+      });
+      return;
+    }
+    if (status && status.isNonWorking && status.allowShifts && action === "shift") {
+      setPendingHolidayAction(action);
+      setShowHolidayConfirmDialog(true);
+      return;
+    }
+    void runner(false);
+  };
+
+  const holidayMonthRange = useMemo(() => {
+    const year = holidayMonth.getFullYear();
+    const month = holidayMonth.getMonth();
+    const from = `${year}-${String(month + 1).padStart(2, "0")}-01`;
+    const lastDay = new Date(year, month + 1, 0).getDate();
+    const to = `${year}-${String(month + 1).padStart(2, "0")}-${String(lastDay).padStart(2, "0")}`;
+    return { from, to };
+  }, [holidayMonth]);
+
+  const { data: adminHolidayCalendar, refetch: refetchHolidayCalendar } = useQuery({
+    queryKey: ["/api/holiday-calendar", "admin", holidayMonthRange.from, holidayMonthRange.to],
+    enabled: activeTab === "holiday-calendar",
+    queryFn: async () => {
+      const response = await apiRequest(
+        "GET",
+        `/api/holiday-calendar?from=${holidayMonthRange.from}&to=${holidayMonthRange.to}`,
+      );
+      return response.json() as Promise<{ settings: HolidaySettings; holidays: HolidayEntry[] }>;
+    },
+  });
+
+  const saveHolidaySettingsMutation = useMutation({
+    mutationFn: async (payload: Partial<HolidaySettings>) => {
+      const response = await apiRequest("PUT", "/api/holiday-calendar/settings", payload);
+      if (!response.ok) throw new Error("Failed to save settings");
+      return response.json();
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["/api/holiday-calendar"] });
+      toast({ title: "Holiday settings saved" });
+    },
+    onError: () => {
+      toast({ title: "Failed to save settings", variant: "destructive" });
+    },
+  });
+
+  const saveHolidayMutation = useMutation({
+    mutationFn: async (payload: Record<string, unknown>) => {
+      const url = editingHolidayId
+        ? `/api/holiday-calendar/holidays/${editingHolidayId}`
+        : "/api/holiday-calendar/holidays";
+      const method = editingHolidayId ? "PUT" : "POST";
+      const response = await apiRequest(method, url, payload);
+      if (!response.ok) {
+        const err = await response.json().catch(() => ({}));
+        throw new Error(err.error || "Failed to save holiday");
+      }
+      return response.json();
+    },
+    onSuccess: () => {
+      setHolidayFormName("");
+      setHolidayFormRegion("");
+      setHolidayFormNotes("");
+      setHolidayFormDate("");
+      setEditingHolidayId(null);
+      queryClient.invalidateQueries({ queryKey: ["/api/holiday-calendar"] });
+      refetchHolidayCalendar();
+      toast({ title: editingHolidayId ? "Holiday updated" : "Holiday added" });
+    },
+    onError: (e: Error) => {
+      toast({ title: e.message || "Failed to save holiday", variant: "destructive" });
+    },
+  });
+
+  const deleteHolidayMutation = useMutation({
+    mutationFn: async (id: number) => {
+      const response = await apiRequest("DELETE", `/api/holiday-calendar/holidays/${id}`);
+      if (!response.ok) throw new Error("Failed to delete");
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["/api/holiday-calendar"] });
+      refetchHolidayCalendar();
+      toast({ title: "Holiday removed" });
+    },
+  });
+
+  const resetHolidayForm = () => {
+    setEditingHolidayId(null);
+    setHolidayFormDate("");
+    setHolidayFormName("");
+    setHolidayFormType("national");
+    setHolidayFormRegion("");
+    setHolidayFormAllowShifts(false);
+    setHolidayFormIsWorking(false);
+    setHolidayFormNotes("");
+  };
+
+  const startEditHoliday = (h: HolidayEntry) => {
+    setEditingHolidayId(h.id);
+    setHolidayFormDate(normalizeHolidayDate(h.holidayDate));
+    setHolidayFormName(h.name);
+    setHolidayFormType(h.holidayType);
+    setHolidayFormRegion(h.region ?? "");
+    setHolidayFormAllowShifts(h.allowShifts);
+    setHolidayFormIsWorking(h.isWorkingDay);
+    setHolidayFormNotes(h.notes ?? "");
+  };
+
+  const adminHolidayByDate = useMemo(() => {
+    const map = new Map<string, HolidayEntry[]>();
+    for (const h of adminHolidayCalendar?.holidays ?? []) {
+      const key = normalizeHolidayDate(h.holidayDate);
+      const list = map.get(key) ?? [];
+      list.push(h);
+      map.set(key, list);
+    }
+    return map;
+  }, [adminHolidayCalendar?.holidays]);
+
+  const resolveAdminDateStatus = (date: Date): DateHolidayStatus | null => {
+    const settings = adminHolidayCalendar?.settings;
+    const dateStr = getLocalDateString(date);
+    const entries = adminHolidayByDate.get(dateStr);
+    if (entries?.length) {
+      const primary = entries[0];
+      return {
+        isNonWorking: !primary.isWorkingDay,
+        allowShifts: primary.allowShifts,
+        isWorkingDay: primary.isWorkingDay,
+        label: primary.name,
+        holidayType: primary.holidayType,
+        source: "holiday",
+        holidayId: primary.id,
+      };
+    }
+    if (settings?.weekendsNonWorking) {
+      const dayName = getDayName(date);
+      if ((settings.weekendDays ?? ["Saturday", "Sunday"]).includes(dayName)) {
+        return {
+          isNonWorking: true,
+          allowShifts: settings.defaultAllowShiftsOnHolidays ?? false,
+          isWorkingDay: false,
+          label: `${dayName} (weekend)`,
+          holidayType: "weekend",
+          source: "weekend",
+        };
+      }
+    }
+    return null;
+  };
+
+  const holidayAdminDays = useMemo(() => {
+    const year = holidayMonth.getFullYear();
+    const month = holidayMonth.getMonth();
+    const firstDay = new Date(year, month, 1);
+    const startDate = new Date(firstDay);
+    startDate.setDate(startDate.getDate() - firstDay.getDay());
+    const days: Date[] = [];
+    const currentDate = new Date(startDate);
+    for (let i = 0; i < 42; i++) {
+      days.push(new Date(currentDate));
+      currentDate.setDate(currentDate.getDate() + 1);
+    }
+    return days;
+  }, [holidayMonth]);
+
   // Fetch all users and filter for staff roles (non-patient users)
   const { data: staff = [], isLoading: staffLoading } = useQuery({
     queryKey: ["/api/users"],
@@ -391,14 +725,6 @@ export default function ShiftsPage() {
       }
     },
   });
-
-  // Helper function to get local date string (avoids timezone issues)
-  const getLocalDateString = (date: Date) => {
-    const year = date.getFullYear();
-    const month = String(date.getMonth() + 1).padStart(2, '0');
-    const day = String(date.getDate()).padStart(2, '0');
-    return `${year}-${month}-${day}`;
-  };
 
   // Fetch all shifts for the selected staff member to determine available dates
   const { data: allStaffShifts = [] } = useQuery({
@@ -682,6 +1008,16 @@ export default function ShiftsPage() {
 
   // Handle time slot selection for shift range creation (stores temporarily, does not save to DB)
   const handleTimeSlotSelection = (slotValue: number) => {
+    const holidayStatus = resolveClientDateStatus(selectedDate);
+    if (holidayStatus?.isNonWorking && !holidayStatus.allowShifts) {
+      toast({
+        title: "Non-working day",
+        description: `${holidayStatus.label} — shifts cannot be assigned on this date.`,
+        variant: "destructive",
+      });
+      return;
+    }
+
     if (!selectedRole) {
       toast({
         title: "Select Role First",
@@ -775,6 +1111,115 @@ export default function ShiftsPage() {
     setShowAvailability(true);
   };
 
+  const executeSavePendingShifts = async (confirmHolidayOverride: boolean) => {
+    if (pendingShifts.length === 0) {
+      toast({
+        title: "No Shifts to Save",
+        description: "Please select time slots first",
+        variant: "destructive",
+      });
+      return;
+    }
+
+    const dateString = getLocalDateString(selectedDate);
+    const updatesTracker: Array<{previous: string, updated: string, staffName: string}> = [];
+
+    const uniquePendingShifts = pendingShifts.filter((shift, index, self) =>
+      index === self.findIndex((s) => 
+        s.startTime === shift.startTime && s.endTime === shift.endTime
+      )
+    );
+
+    try {
+      for (const pendingShift of uniquePendingShifts) {
+        const existingShift = shifts.find((shift: any) => {
+          const shiftDate = typeof shift.date === 'string' 
+            ? shift.date.split('T')[0] 
+            : getLocalDateString(new Date(shift.date));
+          
+          return shift.staffId === parseInt(selectedStaffId) &&
+            shiftDate === dateString &&
+            shift.startTime === pendingShift.startTime &&
+            shift.status !== 'cancelled';
+        });
+
+        if (existingShift) {
+          const updateData = {
+            endTime: pendingShift.endTime,
+            notes: `Updated ${pendingShift.startTime} - ${pendingShift.endTime} via shift management calendar`
+          };
+
+          const response = await apiRequest("PATCH", `/api/shifts/${existingShift.id}`, updateData);
+          if (!response.ok) {
+            throw new Error(`Failed to update shift ${pendingShift.startTime}`);
+          }
+
+          const staffMember = staff.find((s: any) => s.id === parseInt(selectedStaffId));
+          const staffName = staffMember 
+            ? `${getRolePrefix(staffMember.role)} ${staffMember.firstName} ${staffMember.lastName}`
+            : 'Unknown Staff';
+
+          updatesTracker.push({
+            previous: `${existingShift.startTime} - ${existingShift.endTime}`,
+            updated: `${pendingShift.startTime} - ${pendingShift.endTime}`,
+            staffName: staffName
+          });
+        } else {
+          const shiftData = {
+            staffId: parseInt(selectedStaffId),
+            date: dateString,
+            startTime: pendingShift.startTime,
+            endTime: pendingShift.endTime,
+            shiftType: "regular",
+            status: "scheduled",
+            isAvailable: true,
+            notes: `Scheduled ${pendingShift.startTime} - ${pendingShift.endTime} via shift management calendar`,
+            confirmHolidayOverride,
+          };
+
+          const response = await apiRequest("POST", "/api/shifts", shiftData);
+          if (response.status === 409) {
+            const body = await response.json().catch(() => ({}));
+            if (body.error === "HOLIDAY_BLOCKED") {
+              toast({
+                title: "Holiday — shifts not allowed",
+                description: body.message || "Shifts cannot be assigned on this date.",
+                variant: "destructive",
+              });
+              return;
+            }
+          }
+          if (!response.ok) {
+            throw new Error(`Failed to create shift ${pendingShift.startTime} - ${pendingShift.endTime}`);
+          }
+        }
+      }
+
+      if (updatesTracker.length > 0) {
+        setUpdatedShifts(updatesTracker);
+        setShowUpdateModal(true);
+      } else {
+        setSuccessMessage(`Successfully created ${uniquePendingShifts.length} shift(s)`);
+        setShowSuccessModal(true);
+      }
+
+      const newDisabledSlots = uniquePendingShifts.flatMap(extractSlotRange);
+      setDisabledSlots((prev) => Array.from(new Set([...prev, ...newDisabledSlots])));
+      setShiftSummaryList(uniquePendingShifts.map((shift) => `${shift.startTime} - ${shift.endTime}`));
+
+      setPendingShifts([]);
+      setSelectedTimeSlots([]);
+      await queryClient.invalidateQueries({ queryKey: ["/api/shifts"] });
+      await refetchShifts();
+    } catch (error) {
+      toast({
+        title: "Operation Failed",
+        description: "Failed to save shifts. Please try again.",
+        variant: "destructive",
+      });
+    }
+  };
+
   // Handle marking staff as absent for the entire day
   const handleMarkAbsent = async () => {
     console.log("Mark Absent button clicked - Staff ID:", selectedStaffId, "Date:", selectedDate.toDateString());
@@ -849,112 +1294,8 @@ export default function ShiftsPage() {
     }
   };
 
-  // Handle Create Shift button - check for conflicts and save or update
-  const handleSavePendingShifts = async () => {
-    if (pendingShifts.length === 0) {
-      toast({
-        title: "No Shifts to Save",
-        description: "Please select time slots first",
-        variant: "destructive",
-      });
-      return;
-    }
-
-    const dateString = getLocalDateString(selectedDate);
-    const updatesTracker: Array<{previous: string, updated: string, staffName: string}> = [];
-
-    // Remove duplicates within pendingShifts first
-    const uniquePendingShifts = pendingShifts.filter((shift, index, self) =>
-      index === self.findIndex((s) => 
-        s.startTime === shift.startTime && s.endTime === shift.endTime
-      )
-    );
-
-    // Process each pending shift - update if exists, create if new
-    try {
-      for (const pendingShift of uniquePendingShifts) {
-        // Check if shift with same staffId, date, and startTime exists
-        const existingShift = shifts.find((shift: any) => {
-          // Normalize date for comparison
-          const shiftDate = typeof shift.date === 'string' 
-            ? shift.date.split('T')[0] 
-            : getLocalDateString(new Date(shift.date));
-          
-          return shift.staffId === parseInt(selectedStaffId) &&
-            shiftDate === dateString &&
-            shift.startTime === pendingShift.startTime &&
-            shift.status !== 'cancelled';
-        });
-
-        if (existingShift) {
-          // Update existing shift with new endTime
-          const updateData = {
-            endTime: pendingShift.endTime,
-            notes: `Updated ${pendingShift.startTime} - ${pendingShift.endTime} via shift management calendar`
-          };
-
-          const response = await apiRequest("PATCH", `/api/shifts/${existingShift.id}`, updateData);
-          if (!response.ok) {
-            throw new Error(`Failed to update shift ${pendingShift.startTime}`);
-          }
-
-          // Get staff name for modal display
-          const staffMember = staff.find((s: any) => s.id === parseInt(selectedStaffId));
-          const staffName = staffMember 
-            ? `${getRolePrefix(staffMember.role)} ${staffMember.firstName} ${staffMember.lastName}`
-            : 'Unknown Staff';
-
-          // Track the update
-          updatesTracker.push({
-            previous: `${existingShift.startTime} - ${existingShift.endTime}`,
-            updated: `${pendingShift.startTime} - ${pendingShift.endTime}`,
-            staffName: staffName
-          });
-        } else {
-          // Create new shift
-          const shiftData = {
-            staffId: parseInt(selectedStaffId),
-            date: dateString,
-            startTime: pendingShift.startTime,
-            endTime: pendingShift.endTime,
-            shiftType: "regular",
-            status: "scheduled",
-            isAvailable: true,
-            notes: `Scheduled ${pendingShift.startTime} - ${pendingShift.endTime} via shift management calendar`
-          };
-
-          const response = await apiRequest("POST", "/api/shifts", shiftData);
-          if (!response.ok) {
-            throw new Error(`Failed to create shift ${pendingShift.startTime} - ${pendingShift.endTime}`);
-          }
-        }
-      }
-
-      // Show update modal if there were updates
-      if (updatesTracker.length > 0) {
-        setUpdatedShifts(updatesTracker);
-        setShowUpdateModal(true);
-      } else {
-        setSuccessMessage(`Successfully created ${uniquePendingShifts.length} shift(s)`);
-        setShowSuccessModal(true);
-      }
-
-      const newDisabledSlots = uniquePendingShifts.flatMap(extractSlotRange);
-      setDisabledSlots((prev) => Array.from(new Set([...prev, ...newDisabledSlots])));
-      setShiftSummaryList(uniquePendingShifts.map((shift) => `${shift.startTime} - ${shift.endTime}`));
-
-      // Clear pending shifts and refresh
-    setPendingShifts([]);
-    setSelectedTimeSlots([]);
-      await queryClient.invalidateQueries({ queryKey: ["/api/shifts"] });
-      await refetchShifts();
-    } catch (error) {
-      toast({
-        title: "Operation Failed",
-        description: "Failed to save shifts. Please try again.",
-        variant: "destructive",
-      });
-    }
+  const handleSavePendingShifts = () => {
+    runAfterHolidayCheck("shift", (confirm) => executeSavePendingShifts(confirm));
   };
 
   // Navigation functions for calendar
@@ -985,7 +1326,7 @@ export default function ShiftsPage() {
       
       <div className="p-4 flex-1 overflow-auto">
         <Tabs value={activeTab} onValueChange={setActiveTab} className="w-full">
-        <TabsList className="grid w-full grid-cols-2 mb-6">
+        <TabsList className="grid w-full grid-cols-3 mb-6">
           <TabsTrigger value="default-shifts" className="flex items-center gap-2">
             <Settings className="h-4 w-4" />
             Default Shifts
@@ -993,6 +1334,10 @@ export default function ShiftsPage() {
           <TabsTrigger value="custom-shifts" className="flex items-center gap-2">
             <Calendar className="h-4 w-4" />
             Custom Shifts
+          </TabsTrigger>
+          <TabsTrigger value="holiday-calendar" className="flex items-center gap-2">
+            <CalendarDays className="h-4 w-4" />
+            Holiday Calendar
           </TabsTrigger>
         </TabsList>
 
@@ -1105,6 +1450,225 @@ export default function ShiftsPage() {
                 </div>
               )}
             </div>
+          </div>
+        </TabsContent>
+
+        {/* Holiday Calendar Tab — global config for shift planning */}
+        <TabsContent value="holiday-calendar" className="space-y-6">
+          <div className="bg-white dark:bg-slate-800 rounded-lg shadow-sm border dark:border-slate-700 p-6">
+            <div className="flex items-center gap-3 mb-4">
+              <CalendarDays className="h-6 w-6 text-amber-600" />
+              <div>
+                <h2 className="text-lg font-semibold text-gray-900 dark:text-gray-100">Holiday Calendar</h2>
+                <p className="text-sm text-gray-600 dark:text-gray-400">
+                  Configure national, regional, and company holidays. The Custom Shifts calendar uses this automatically.
+                </p>
+              </div>
+            </div>
+
+            {isAdmin ? (
+              <div className="space-y-6">
+                <div className="border dark:border-slate-600 rounded-lg p-4 space-y-4">
+                  <h3 className="font-medium text-gray-900 dark:text-gray-100">Weekend rules</h3>
+                  <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+                    {weekDays.map((day) => (
+                      <div key={day} className="flex items-center space-x-2">
+                        <Checkbox
+                          id={`weekend-${day}`}
+                          checked={(adminHolidayCalendar?.settings?.weekendDays ?? ["Saturday", "Sunday"]).includes(day)}
+                          onCheckedChange={(checked) => {
+                            const current = adminHolidayCalendar?.settings?.weekendDays ?? ["Saturday", "Sunday"];
+                            const next = checked
+                              ? [...current, day]
+                              : current.filter((d) => d !== day);
+                            saveHolidaySettingsMutation.mutate({ weekendDays: next });
+                          }}
+                        />
+                        <label htmlFor={`weekend-${day}`} className="text-sm cursor-pointer">{day}</label>
+                      </div>
+                    ))}
+                  </div>
+                  <div className="flex flex-wrap items-center gap-6">
+                    <div className="flex items-center gap-2">
+                      <Switch
+                        id="weekends-non-working"
+                        checked={adminHolidayCalendar?.settings?.weekendsNonWorking ?? true}
+                        onCheckedChange={(v) =>
+                          saveHolidaySettingsMutation.mutate({ weekendsNonWorking: v })
+                        }
+                      />
+                      <Label htmlFor="weekends-non-working">Treat weekends as non-working days</Label>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <Switch
+                        id="default-allow-shifts"
+                        checked={adminHolidayCalendar?.settings?.defaultAllowShiftsOnHolidays ?? false}
+                        onCheckedChange={(v) =>
+                          saveHolidaySettingsMutation.mutate({ defaultAllowShiftsOnHolidays: v })
+                        }
+                      />
+                      <Label htmlFor="default-allow-shifts">Allow shifts on holidays by default (with warning)</Label>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                  <div className="border dark:border-slate-600 rounded-lg p-4">
+                    <h3 className="font-medium mb-3">{editingHolidayId ? "Edit holiday" : "Add holiday"}</h3>
+                    <div className="space-y-3">
+                      <div>
+                        <Label>Date</Label>
+                        <Input type="date" value={holidayFormDate} onChange={(e) => setHolidayFormDate(e.target.value)} className="mt-1" />
+                      </div>
+                      <div>
+                        <Label>Name</Label>
+                        <Input value={holidayFormName} onChange={(e) => setHolidayFormName(e.target.value)} placeholder="e.g. Christmas Day" className="mt-1" />
+                      </div>
+                      <div>
+                        <Label>Type</Label>
+                        <Select value={holidayFormType} onValueChange={(v) => setHolidayFormType(v as typeof holidayFormType)}>
+                          <SelectTrigger className="mt-1"><SelectValue /></SelectTrigger>
+                          <SelectContent>
+                            <SelectItem value="national">National</SelectItem>
+                            <SelectItem value="regional">Regional / Provincial</SelectItem>
+                            <SelectItem value="company">Company</SelectItem>
+                          </SelectContent>
+                        </Select>
+                      </div>
+                      {holidayFormType === "regional" && (
+                        <div>
+                          <Label>Region / Province</Label>
+                          <Input value={holidayFormRegion} onChange={(e) => setHolidayFormRegion(e.target.value)} className="mt-1" />
+                        </div>
+                      )}
+                      <div className="flex items-center gap-2">
+                        <Switch checked={holidayFormIsWorking} onCheckedChange={setHolidayFormIsWorking} id="holiday-working" />
+                        <Label htmlFor="holiday-working">Working holiday (staff expected)</Label>
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <Switch checked={holidayFormAllowShifts} onCheckedChange={setHolidayFormAllowShifts} id="holiday-allow-shifts" />
+                        <Label htmlFor="holiday-allow-shifts">Allow shift assignment (shows warning if enabled)</Label>
+                      </div>
+                      <div>
+                        <Label>Notes</Label>
+                        <Textarea value={holidayFormNotes} onChange={(e) => setHolidayFormNotes(e.target.value)} className="mt-1" rows={2} />
+                      </div>
+                      <div className="flex gap-2">
+                        <Button
+                          onClick={() => {
+                            if (!holidayFormDate || !holidayFormName.trim()) {
+                              toast({ title: "Date and name are required", variant: "destructive" });
+                              return;
+                            }
+                            saveHolidayMutation.mutate({
+                              holidayDate: holidayFormDate,
+                              name: holidayFormName.trim(),
+                              holidayType: holidayFormType,
+                              region: holidayFormType === "regional" ? holidayFormRegion || undefined : undefined,
+                              allowShifts: holidayFormAllowShifts,
+                              isWorkingDay: holidayFormIsWorking,
+                              notes: holidayFormNotes || undefined,
+                            });
+                          }}
+                          disabled={saveHolidayMutation.isPending}
+                        >
+                          {editingHolidayId ? "Update" : "Add"} holiday
+                        </Button>
+                        {editingHolidayId && (
+                          <Button variant="outline" onClick={resetHolidayForm}>Cancel edit</Button>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="border dark:border-slate-600 rounded-lg p-4">
+                    <div className="flex items-center justify-between mb-3">
+                      <Button variant="outline" size="sm" onClick={() => setHolidayMonth(new Date(holidayMonth.getFullYear(), holidayMonth.getMonth() - 1, 1))}>
+                        <ChevronLeft className="h-4 w-4" />
+                      </Button>
+                      <h3 className="font-medium">{monthNames[holidayMonth.getMonth()]} {holidayMonth.getFullYear()}</h3>
+                      <Button variant="outline" size="sm" onClick={() => setHolidayMonth(new Date(holidayMonth.getFullYear(), holidayMonth.getMonth() + 1, 1))}>
+                        <ChevronRight className="h-4 w-4" />
+                      </Button>
+                    </div>
+                    <div className="grid grid-cols-7 gap-1 mb-1">
+                      {['SUN', 'MON', 'TUE', 'WED', 'THU', 'FRI', 'SAT'].map((d) => (
+                        <div key={d} className="text-center text-xs text-gray-500 p-1">{d}</div>
+                      ))}
+                    </div>
+                    <div className="grid grid-cols-7 gap-1">
+                      {holidayAdminDays.map((day, idx) => {
+                        const inMonth = day.getMonth() === holidayMonth.getMonth();
+                        const dateStr = getLocalDateString(day);
+                        const entries = adminHolidayByDate.get(dateStr) ?? [];
+                        const status = resolveAdminDateStatus(day);
+                        return (
+                          <button
+                            key={idx}
+                            type="button"
+                            className={cn(
+                              "h-10 text-xs rounded relative",
+                              !inMonth && "text-gray-300",
+                              entries.length > 0 && "bg-amber-100 dark:bg-amber-900/30 font-semibold",
+                              status?.holidayType === "weekend" && entries.length === 0 && "bg-slate-100 dark:bg-slate-700/50",
+                            )}
+                            onClick={() => {
+                              setHolidayFormDate(dateStr);
+                              if (entries[0]) startEditHoliday(entries[0]);
+                            }}
+                          >
+                            {day.getDate()}
+                            {entries.length > 0 && (
+                              <span className="absolute bottom-0.5 left-1/2 -translate-x-1/2 w-1 h-1 rounded-full bg-amber-600" />
+                            )}
+                          </button>
+                        );
+                      })}
+                    </div>
+                    <div className="flex flex-wrap gap-2 mt-3 text-xs">
+                      <span className="inline-flex items-center gap-1"><span className="w-3 h-3 rounded bg-amber-200" /> Holiday</span>
+                      <span className="inline-flex items-center gap-1"><span className="w-3 h-3 rounded bg-slate-200" /> Weekend rule</span>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="border dark:border-slate-600 rounded-lg overflow-hidden">
+                  <div className="p-3 bg-gray-50 dark:bg-slate-900 font-medium text-sm">Holidays this month</div>
+                  {(adminHolidayCalendar?.holidays ?? []).length === 0 ? (
+                    <p className="p-4 text-sm text-gray-500">No holidays defined for this month.</p>
+                  ) : (
+                    <ul className="divide-y dark:divide-slate-600">
+                      {(adminHolidayCalendar?.holidays ?? []).map((h) => (
+                        <li key={h.id} className="p-4 flex items-center justify-between gap-4">
+                          <div>
+                            <p className="font-medium">{h.name}</p>
+                            <p className="text-sm text-gray-500">
+                              {normalizeHolidayDate(h.holidayDate)} · {HOLIDAY_TYPE_LABELS[h.holidayType] ?? h.holidayType}
+                              {h.region ? ` · ${h.region}` : ""}
+                            </p>
+                            <div className="flex gap-2 mt-1 flex-wrap">
+                              <Badge variant="outline" className={HOLIDAY_TYPE_COLORS[h.holidayType]}>
+                                {HOLIDAY_TYPE_LABELS[h.holidayType]}
+                              </Badge>
+                              {h.isWorkingDay && <Badge variant="outline">Working</Badge>}
+                              {h.allowShifts ? <Badge variant="outline">Shifts allowed</Badge> : <Badge variant="outline">No shifts</Badge>}
+                            </div>
+                          </div>
+                          <div className="flex gap-2 shrink-0">
+                            <Button size="sm" variant="outline" onClick={() => startEditHoliday(h)}>Edit</Button>
+                            <Button size="sm" variant="destructive" onClick={() => deleteHolidayMutation.mutate(h.id)}>Delete</Button>
+                          </div>
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                </div>
+              </div>
+            ) : (
+              <p className="text-sm text-gray-600 dark:text-gray-400">
+                Only administrators can manage the holiday calendar. You can still see holiday markers on the Custom Shifts tab.
+              </p>
+            )}
           </div>
         </TabsContent>
 
@@ -1361,27 +1925,66 @@ export default function ShiftsPage() {
               const isCurrentMonth = day.getMonth() === currentMonth.getMonth();
               const isSelected = selectedDate.toDateString() === day.toDateString();
               const isToday = day.toDateString() === new Date().toDateString();
+              const dayStatus = resolveClientDateStatus(day);
+              const dayHolidays = holidayByDate.get(getLocalDateString(day)) ?? [];
               
               return (
                 <Button
                   key={index}
                   variant="ghost"
                   size="sm"
-                  className={`
-                    h-10 p-0 font-normal
-                    ${!isCurrentMonth ? 'text-gray-300 dark:text-gray-600' : 'text-gray-900 dark:text-gray-100'}
-                    ${isSelected ? 'bg-blue-600 text-white hover:bg-blue-700' : ''}
-                    ${isToday && !isSelected ? 'bg-blue-100 text-blue-600 dark:bg-blue-900 dark:text-blue-300' : ''}
-                  `}
-                  onClick={() => {
-                    console.log("Calendar day clicked:", day.toDateString(), day);
-                    setSelectedDate(day);
-                  }}
+                  title={dayStatus ? dayStatus.label : undefined}
+                  className={cn(
+                    "h-10 p-0 font-normal flex flex-col items-center justify-center gap-0",
+                    !isCurrentMonth && "text-gray-300 dark:text-gray-600",
+                    isCurrentMonth && !isSelected && !dayStatus && "text-gray-900 dark:text-gray-100",
+                    isSelected && "bg-blue-600 text-white hover:bg-blue-700",
+                    isToday && !isSelected && !dayStatus && "bg-blue-100 text-blue-600 dark:bg-blue-900 dark:text-blue-300",
+                    dayStatus && !isSelected && dayStatus.holidayType === "national" && "bg-amber-100 text-amber-900 hover:bg-amber-200 dark:bg-amber-900/40 dark:text-amber-100",
+                    dayStatus && !isSelected && dayStatus.holidayType === "regional" && "bg-orange-100 text-orange-900 dark:bg-orange-900/40",
+                    dayStatus && !isSelected && dayStatus.holidayType === "company" && "bg-purple-100 text-purple-900 dark:bg-purple-900/40",
+                    dayStatus && !isSelected && dayStatus.holidayType === "weekend" && "bg-slate-100 text-slate-600 dark:bg-slate-700/60",
+                  )}
+                  onClick={() => setSelectedDate(day)}
                 >
-                  {day.getDate()}
+                  <span>{day.getDate()}</span>
+                  {dayHolidays.length > 0 && (
+                    <span className="text-[9px] leading-none truncate max-w-full px-0.5 opacity-90">
+                      {dayHolidays[0].name.slice(0, 6)}
+                    </span>
+                  )}
                 </Button>
               );
             })}
+          </div>
+          {selectedDateHolidayStatus && (
+            <div
+              className={cn(
+                "mt-3 flex items-start gap-2 rounded-md border p-3 text-sm",
+                selectedDateHolidayStatus.allowShifts
+                  ? "border-amber-300 bg-amber-50 text-amber-950 dark:bg-amber-900/20 dark:text-amber-100"
+                  : "border-red-300 bg-red-50 text-red-900 dark:bg-red-900/20 dark:text-red-100",
+              )}
+            >
+              <AlertTriangle className="h-4 w-4 shrink-0 mt-0.5" />
+              <div>
+                <p className="font-medium">
+                  {HOLIDAY_TYPE_LABELS[selectedDateHolidayStatus.holidayType] ?? "Non-working day"}: {selectedDateHolidayStatus.label}
+                </p>
+                <p className="text-xs mt-1 opacity-90">
+                  {selectedDateHolidayStatus.allowShifts
+                    ? "Shifts are allowed with a confirmation warning."
+                    : "Shift assignment is blocked on this date."}
+                  {selectedDateHolidayStatus.isWorkingDay ? " · Marked as a working holiday." : ""}
+                </p>
+              </div>
+            </div>
+          )}
+          <div className="flex flex-wrap gap-3 mt-3 text-xs text-gray-500">
+            <span className="inline-flex items-center gap-1"><span className="w-3 h-3 rounded bg-amber-200" /> National</span>
+            <span className="inline-flex items-center gap-1"><span className="w-3 h-3 rounded bg-orange-200" /> Regional</span>
+            <span className="inline-flex items-center gap-1"><span className="w-3 h-3 rounded bg-purple-200" /> Company</span>
+            <span className="inline-flex items-center gap-1"><span className="w-3 h-3 rounded bg-slate-200" /> Weekend</span>
           </div>
         </div>
 
@@ -2386,6 +2989,33 @@ export default function ShiftsPage() {
           </div>
         </DialogContent>
       </Dialog>
+
+      <AlertDialog open={showHolidayConfirmDialog} onOpenChange={setShowHolidayConfirmDialog}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Holiday date</AlertDialogTitle>
+            <AlertDialogDescription>
+              {selectedDateHolidayStatus
+                ? `This date is marked as ${selectedDateHolidayStatus.label} (${HOLIDAY_TYPE_LABELS[selectedDateHolidayStatus.holidayType]?.toLowerCase() ?? "holiday"}). Do you still want to assign a shift?`
+                : "This date is a non-working day. Do you still want to assign a shift?"}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel onClick={() => setPendingHolidayAction(null)}>Cancel</AlertDialogCancel>
+            <AlertDialogAction
+              onClick={() => {
+                setShowHolidayConfirmDialog(false);
+                if (pendingHolidayAction === "shift") {
+                  void executeSavePendingShifts(true);
+                }
+                setPendingHolidayAction(null);
+              }}
+            >
+              Yes, assign shift
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
 
       {/* Delete All Shifts Confirmation Modal */}
       <Dialog open={showDeleteConfirmModal} onOpenChange={setShowDeleteConfirmModal}>

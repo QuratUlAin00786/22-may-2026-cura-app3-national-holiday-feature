@@ -1,7 +1,12 @@
 import { db } from "./db.js";
 import { organizations, users, patients, appointments, medicalRecords, notifications, prescriptions, subscriptions, aiInsights, roles, saasSubscriptions, saasPackages } from "@shared/schema.js";
+import {
+  ensureSystemRolesForAllOrganizations,
+  ensureSystemRolesForOrganization,
+} from "./default-system-roles.js";
 import { authService } from "./services/auth.js";
 import { storage } from "./storage.js";
+import { preparePatientForStorage, assertEncryptedPatientInsertRow } from "./utils/encryption-sdk.js";
 import { eq, inArray, and, sql } from "drizzle-orm";
 import bcrypt from "bcrypt";
 
@@ -38,6 +43,12 @@ export async function seedDatabase() {
     } else {
       console.log(`Using existing organization: ${org.name} (ID: ${org.id})`);
     }
+
+    // Seed all default system roles for this org first (idempotent)
+    const orgRoleResult = await ensureSystemRolesForOrganization(org.id);
+    console.log(
+      `System roles for "${org.name}": ${orgRoleResult.created} created, ${orgRoleResult.existing} already present`,
+    );
 
     // Create sample users - only create if they don't exist
     const existingUsers = await db.select().from(users).where(eq(users.organizationId, org.id));
@@ -380,21 +391,28 @@ export async function seedDatabase() {
         }
       ];
 
-      createdPatients = await db.insert(patients).values(samplePatients).returning();
-      console.log(`Created ${createdPatients.length} patients linked to user accounts`);
+      const encryptedSamplePatients = samplePatients.map((row) => {
+        const insertData = preparePatientForStorage(row as Record<string, unknown>);
+        assertEncryptedPatientInsertRow(insertData);
+        return insertData;
+      });
+      createdPatients = await db.insert(patients).values(encryptedSamplePatients as any).returning();
+      console.log(`Created ${createdPatients.length} encrypted patients linked to user accounts`);
     } else {
       console.log(`Using existing ${existingPatients.length} patients`);
       
       // Link existing patients to user accounts if not already linked
-      for (const existingPatient of existingPatients) {
-        if (!existingPatient.userId && existingPatient.email) {
+      for (const rawExisting of existingPatients) {
+        const existingPatient = storage.normalizePatientFromRow(rawExisting);
+        if (!existingPatient) continue;
+        if (!rawExisting.userId && existingPatient.email) {
           // Find or create a patient user for this patient
           const existingPatientUser = patientUsers.find(u => u.email === existingPatient.email);
           if (existingPatientUser) {
             // Link the patient to the existing user
             await db.update(patients)
               .set({ userId: existingPatientUser.id })
-              .where(eq(patients.id, existingPatient.id));
+              .where(eq(patients.id, rawExisting.id));
             console.log(`Linked patient ${existingPatient.firstName} ${existingPatient.lastName} to user account`);
           } else {
             // Check if a user with this email already exists
@@ -404,7 +422,7 @@ export async function seedDatabase() {
               // Link to existing user
               await db.update(patients)
                 .set({ userId: existingUserWithEmail.id })
-                .where(eq(patients.id, existingPatient.id));
+                .where(eq(patients.id, rawExisting.id));
               console.log(`Linked patient ${existingPatient.firstName} ${existingPatient.lastName} to existing user account`);
             } else {
               // Create a new patient user and link
@@ -426,7 +444,7 @@ export async function seedDatabase() {
                 
                 await db.update(patients)
                   .set({ userId: newPatientUser.id })
-                  .where(eq(patients.id, existingPatient.id));
+                  .where(eq(patients.id, rawExisting.id));
                 console.log(`Created user account and linked patient ${existingPatient.firstName} ${existingPatient.lastName}`);
               } catch (error: any) {
                 console.log(`Could not create user for patient ${existingPatient.firstName} ${existingPatient.lastName}: ${error.message}`);
@@ -788,175 +806,11 @@ export async function seedDatabase() {
     await storage.seedLabResults(org.id);
     console.log("Created sample lab results");
 
-    // Create system roles if they don't exist
-    const existingRoles = await db.select().from(roles).where(eq(roles.organizationId, org.id));
-    
-    if (existingRoles.length === 0) {
-      const systemRoles = [
-        {
-          organizationId: org.id,
-          name: "admin",
-          displayName: "Administrator",
-          description: "Full system access with all permissions",
-          permissions: {"fields": {"financialData": {"edit": true, "view": true}, "medicalHistory": {"edit": true, "view": true}, "patientSensitiveInfo": {"edit": true, "view": true}}, "modules": {"billing": {"edit": true, "view": true, "create": true, "delete": true}, "patients": {"edit": true, "view": true, "create": true, "delete": true}, "settings": {"edit": true, "view": true, "create": true, "delete": true}, "analytics": {"edit": true, "view": true, "create": true, "delete": true}, "appointments": {"edit": true, "view": true, "create": true, "delete": true}, "prescriptions": {"edit": true, "view": true, "create": true, "delete": true}, "medicalRecords": {"edit": true, "view": true, "create": true, "delete": true}, "userManagement": {"edit": true, "view": true, "create": true, "delete": true}}},
-          isSystem: true
-        },
-        {
-          organizationId: org.id,
-          name: "doctor",
-          displayName: "Doctor",
-          description: "Medical doctor with full clinical access",
-          permissions: {"fields": {"financialData": {"edit": false, "view": true}, "medicalHistory": {"edit": true, "view": true}, "patientSensitiveInfo": {"edit": true, "view": true}}, "modules": {"dashboard": {"edit": false, "view": true, "create": false, "delete": false}, "billing": {"edit": false, "view": true, "create": false, "delete": false}, "patients": {"edit": true, "view": true, "create": true, "delete": false}, "settings": {"edit": false, "view": false, "create": false, "delete": false}, "analytics": {"edit": false, "view": true, "create": false, "delete": false}, "appointments": {"edit": true, "view": true, "create": true, "delete": false}, "prescriptions": {"edit": true, "view": true, "create": true, "delete": false}, "labResults": {"edit": true, "view": true, "create": true, "delete": false}, "medicalImaging": {"edit": true, "view": true, "create": true, "delete": false}, "forms": {"edit": true, "view": true, "create": true, "delete": false}, "messaging": {"edit": true, "view": true, "create": true, "delete": false}, "shiftManagement": {"edit": true, "view": true, "create": true, "delete": false}, "voiceDocumentation": {"edit": true, "view": true, "create": true, "delete": false}, "symptomChecker": {"edit": false, "view": true, "create": false, "delete": false}, "medicalRecords": {"edit": true, "view": true, "create": true, "delete": false}, "userManagement": {"edit": false, "view": false, "create": false, "delete": false}}},
-          isSystem: true
-        },
-        {
-          organizationId: org.id,
-          name: "nurse",
-          displayName: "Nurse",
-          description: "Nursing staff with patient care access",
-          permissions: {"fields": {"financialData": {"edit": false, "view": true}, "medicalHistory": {"edit": true, "view": true}, "patientSensitiveInfo": {"edit": true, "view": true}}, "modules": {"dashboard": {"view": true, "create": false, "edit": false, "delete": false}, "billing": {"edit": false, "view": true, "create": false, "delete": false}, "patients": {"edit": true, "view": true, "create": true, "delete": false}, "settings": {"edit": false, "view": false, "create": false, "delete": false}, "analytics": {"edit": false, "view": true, "create": false, "delete": false}, "appointments": {"edit": true, "view": true, "create": true, "delete": false}, "prescriptions": {"edit": true, "view": true, "create": true, "delete": false}, "medicalRecords": {"edit": true, "view": true, "create": true, "delete": false}, "forms": {"edit": true, "view": true, "create": true, "delete": false}, "messaging": {"edit": true, "view": true, "create": true, "delete": false}, "shiftManagement": {"edit": true, "view": true, "create": true, "delete": false}, "voiceDocumentation": {"edit": true, "view": true, "create": true, "delete": false}, "symptomChecker": {"edit": false, "view": true, "create": false, "delete": false}, "userManagement": {"edit": false, "view": false, "create": false, "delete": false}}},
-          isSystem: true
-        },
-        {
-          organizationId: org.id,
-          name: "patient",
-          displayName: "Patient",
-          description: "Patient with access to own records",
-          permissions: {"fields": {"labResults": {"edit": false, "view": false}, "financialData": {"edit": false, "view": true}, "imagingResults": {"edit": false, "view": false}, "medicalHistory": {"edit": false, "view": true}, "insuranceDetails": {"edit": false, "view": false}, "billingInformation": {"edit": false, "view": false}, "prescriptionDetails": {"edit": false, "view": false}, "patientSensitiveInfo": {"edit": false, "view": true}}, "modules": {"forms": {"edit": false, "view": true, "create": false, "delete": false}, "billing": {"edit": false, "view": true, "create": false, "delete": false}, "patients": {"edit": false, "view": true, "create": false, "delete": false}, "settings": {"edit": false, "view": false, "create": false, "delete": false}, "analytics": {"edit": false, "view": false, "create": false, "delete": false}, "messaging": {"edit": false, "view": true, "create": false, "delete": false}, "aiInsights": {"edit": false, "view": false, "create": false, "delete": false}, "labResults": {"edit": false, "view": true, "create": false, "delete": false}, "appointments": {"edit": true, "view": true, "create": true, "delete": false}, "telemedicine": {"edit": false, "view": true, "create": false, "delete": false}, "prescriptions": {"edit": false, "view": true, "create": false, "delete": false}, "medicalImaging": {"edit": false, "view": true, "create": false, "delete": false}, "medicalRecords": {"edit": false, "view": true, "create": false, "delete": false}, "userManagement": {"edit": false, "view": false, "create": false, "delete": false}}},
-          isSystem: true
-        },
-        {
-          organizationId: org.id,
-          name: "receptionist",
-          displayName: "Receptionist",
-          description: "Front desk staff with appointment management",
-          permissions: {"fields": {"financialData": {"edit": false, "view": false}, "medicalHistory": {"edit": false, "view": false}, "patientSensitiveInfo": {"edit": false, "view": false}}, "modules": {"dashboard": {"view": true, "create": false, "edit": false, "delete": false}, "billing": {"edit": false, "view": true, "create": false, "delete": false}, "patients": {"edit": true, "view": true, "create": true, "delete": false}, "settings": {"edit": false, "view": false, "create": false, "delete": false}, "analytics": {"edit": false, "view": false, "create": false, "delete": false}, "appointments": {"edit": true, "view": true, "create": true, "delete": false}, "prescriptions": {"edit": false, "view": false, "create": false, "delete": false}, "medicalRecords": {"edit": false, "view": false, "create": false, "delete": false}, "userManagement": {"edit": false, "view": false, "create": false, "delete": false}}},
-          isSystem: true
-        },
-        {
-          organizationId: org.id,
-          name: "lab_technician",
-          displayName: "Lab Technician",
-          description: "Laboratory technician with lab results access",
-          permissions: {
-            "fields": {},
-            "modules": {
-              "dashboard": {"view": true, "create": false, "edit": false, "delete": false},
-              "labResults": {"view": true, "create": true, "edit": true, "delete": false}
-            }
-          },
-          isSystem: true
-        },
-        {
-          organizationId: org.id,
-          name: "pharmacist",
-          displayName: "Pharmacist",
-          description: "Pharmacist with prescription access",
-          permissions: {
-            "fields": {
-              "medicalHistory": {"view": true, "edit": false},
-              "patientSensitiveInfo": {"view": false, "edit": false}
-            },
-            "modules": {
-              "dashboard": {"view": true, "create": false, "edit": false, "delete": false},
-              "patients": {"view": true, "create": false, "edit": false, "delete": false},
-              "appointments": {"view": true, "create": false, "edit": false, "delete": false},
-              "prescriptions": {"view": true, "create": true, "edit": true, "delete": false},
-              "medicalRecords": {"view": true, "create": false, "edit": false, "delete": false}
-            }
-          },
-          isSystem: true
-        },
-        {
-          organizationId: org.id,
-          name: "dentist",
-          displayName: "Dentist",
-          description: "Dental professional with clinical access",
-          permissions: {"fields": {"financialData": {"edit": false, "view": true}, "medicalHistory": {"edit": true, "view": true}, "patientSensitiveInfo": {"edit": true, "view": true}}, "modules": {"dashboard": {"view": true, "create": false, "edit": false, "delete": false}, "billing": {"edit": false, "view": true, "create": false, "delete": false}, "patients": {"edit": true, "view": true, "create": true, "delete": false}, "settings": {"edit": false, "view": false, "create": false, "delete": false}, "analytics": {"edit": false, "view": true, "create": false, "delete": false}, "appointments": {"edit": true, "view": true, "create": true, "delete": false}, "prescriptions": {"edit": true, "view": true, "create": true, "delete": false}, "medicalRecords": {"edit": true, "view": true, "create": true, "delete": false}, "userManagement": {"edit": false, "view": false, "create": false, "delete": false}}},
-          isSystem: true
-        },
-        {
-          organizationId: org.id,
-          name: "dental_nurse",
-          displayName: "Dental Nurse",
-          description: "Dental nursing staff with patient care access",
-          permissions: {"fields": {"financialData": {"edit": false, "view": false}, "medicalHistory": {"edit": false, "view": true}, "patientSensitiveInfo": {"edit": false, "view": true}}, "modules": {"dashboard": {"view": true, "create": false, "edit": false, "delete": false}, "billing": {"edit": false, "view": false, "create": false, "delete": false}, "patients": {"edit": true, "view": true, "create": false, "delete": false}, "settings": {"edit": false, "view": false, "create": false, "delete": false}, "analytics": {"edit": false, "view": false, "create": false, "delete": false}, "appointments": {"edit": true, "view": true, "create": true, "delete": false}, "prescriptions": {"edit": false, "view": true, "create": false, "delete": false}, "medicalRecords": {"edit": false, "view": true, "create": true, "delete": false}, "userManagement": {"edit": false, "view": false, "create": false, "delete": false}}},
-          isSystem: true
-        },
-        {
-          organizationId: org.id,
-          name: "phlebotomist",
-          displayName: "Phlebotomist",
-          description: "Blood collection specialist",
-          permissions: {"fields": {"financialData": {"edit": false, "view": false}, "medicalHistory": {"edit": false, "view": true}, "patientSensitiveInfo": {"edit": false, "view": false}}, "modules": {"dashboard": {"view": true, "create": false, "edit": false, "delete": false}, "billing": {"edit": false, "view": false, "create": false, "delete": false}, "patients": {"edit": false, "view": true, "create": false, "delete": false}, "settings": {"edit": false, "view": false, "create": false, "delete": false}, "analytics": {"edit": false, "view": false, "create": false, "delete": false}, "appointments": {"edit": false, "view": true, "create": false, "delete": false}, "prescriptions": {"edit": false, "view": false, "create": false, "delete": false}, "medicalRecords": {"edit": false, "view": true, "create": false, "delete": false}, "userManagement": {"edit": false, "view": false, "create": false, "delete": false}}},
-          isSystem: true
-        },
-        {
-          organizationId: org.id,
-          name: "aesthetician",
-          displayName: "Aesthetician",
-          description: "Aesthetic treatment specialist",
-          permissions: {"fields": {"financialData": {"edit": false, "view": false}, "medicalHistory": {"edit": false, "view": true}, "patientSensitiveInfo": {"edit": false, "view": false}}, "modules": {"dashboard": {"view": true, "create": false, "edit": false, "delete": false}, "billing": {"edit": false, "view": true, "create": false, "delete": false}, "patients": {"edit": true, "view": true, "create": false, "delete": false}, "settings": {"edit": false, "view": false, "create": false, "delete": false}, "analytics": {"edit": false, "view": false, "create": false, "delete": false}, "appointments": {"edit": true, "view": true, "create": true, "delete": false}, "prescriptions": {"edit": false, "view": false, "create": false, "delete": false}, "medicalRecords": {"edit": false, "view": true, "create": true, "delete": false}, "userManagement": {"edit": false, "view": false, "create": false, "delete": false}}},
-          isSystem: true
-        },
-        {
-          organizationId: org.id,
-          name: "optician",
-          displayName: "Optician",
-          description: "Eye care and vision specialist",
-          permissions: {"fields": {"financialData": {"edit": false, "view": true}, "medicalHistory": {"edit": true, "view": true}, "patientSensitiveInfo": {"edit": false, "view": true}}, "modules": {"dashboard": {"view": true, "create": false, "edit": false, "delete": false}, "billing": {"edit": false, "view": true, "create": false, "delete": false}, "patients": {"edit": false, "view": true, "create": false, "delete": false}, "settings": {"edit": false, "view": false, "create": false, "delete": false}, "analytics": {"edit": false, "view": false, "create": false, "delete": false}, "appointments": {"edit": false, "view": true, "create": false, "delete": false}, "prescriptions": {"edit": false, "view": true, "create": false, "delete": false}, "medicalRecords": {"edit": false, "view": true, "create": false, "delete": false}, "userManagement": {"edit": false, "view": false, "create": false, "delete": false}}},
-          isSystem: true
-        },
-        {
-          organizationId: org.id,
-          name: "paramedic",
-          displayName: "Paramedic",
-          description: "Emergency medical services professional",
-          permissions: {"fields": {"financialData": {"edit": false, "view": false}, "medicalHistory": {"edit": true, "view": true}, "patientSensitiveInfo": {"edit": false, "view": true}}, "modules": {"dashboard": {"view": true, "create": false, "edit": false, "delete": false}, "billing": {"edit": false, "view": false, "create": false, "delete": false}, "patients": {"edit": true, "view": true, "create": true, "delete": false}, "settings": {"edit": false, "view": false, "create": false, "delete": false}, "analytics": {"edit": false, "view": false, "create": false, "delete": false}, "appointments": {"edit": true, "view": true, "create": true, "delete": false}, "prescriptions": {"edit": false, "view": false, "create": false, "delete": false}, "medicalRecords": {"edit": true, "view": false, "create": true, "delete": false}, "userManagement": {"edit": false, "view": false, "create": false, "delete": false}}},
-          isSystem: true
-        },
-        {
-          organizationId: org.id,
-          name: "physiotherapist",
-          displayName: "Physiotherapist",
-          description: "Physical therapy specialist",
-          permissions: {"fields": {"financialData": {"edit": false, "view": false}, "medicalHistory": {"edit": true, "view": true}, "patientSensitiveInfo": {"edit": false, "view": true}}, "modules": {"dashboard": {"view": true, "create": false, "edit": false, "delete": false}, "billing": {"edit": false, "view": true, "create": false, "delete": false}, "patients": {"edit": true, "view": true, "create": false, "delete": false}, "settings": {"edit": false, "view": false, "create": false, "delete": false}, "analytics": {"edit": false, "view": false, "create": false, "delete": false}, "appointments": {"edit": true, "view": true, "create": true, "delete": false}, "prescriptions": {"edit": false, "view": true, "create": false, "delete": false}, "medicalRecords": {"edit": true, "view": true, "create": true, "delete": false}, "userManagement": {"edit": false, "view": false, "create": false, "delete": false}}},
-          isSystem: true
-        },
-        {
-          organizationId: org.id,
-          name: "sample_taker",
-          displayName: "Sample Taker",
-          description: "Medical sample collection specialist",
-          permissions: {
-            "fields": {
-              "medicalHistory": {"view": true, "edit": false},
-              "patientSensitiveInfo": {"view": true, "edit": false}
-            },
-            "modules": {
-              "dashboard": {"view": true, "create": false, "edit": false, "delete": false},
-              "patients": {"view": true, "create": false, "edit": false, "delete": false},
-              "labResults": {"view": true, "create": true, "edit": true, "delete": false},
-              "appointments": {"view": true, "create": false, "edit": false, "delete": false}
-            }
-          },
-          isSystem: true
-        },
-        {
-          organizationId: org.id,
-          name: "other",
-          displayName: "Other",
-          description: "Generic role for other healthcare professionals",
-          permissions: {"fields": {"financialData": {"edit": false, "view": false}, "medicalHistory": {"edit": false, "view": true}, "patientSensitiveInfo": {"edit": false, "view": false}}, "modules": {"dashboard": {"view": true, "create": false, "edit": false, "delete": false}, "billing": {"edit": false, "view": false, "create": false, "delete": false}, "patients": {"edit": false, "view": true, "create": false, "delete": false}, "settings": {"edit": false, "view": false, "create": false, "delete": false}, "analytics": {"edit": false, "view": false, "create": false, "delete": false}, "appointments": {"edit": true, "view": true, "create": true, "delete": false}, "prescriptions": {"edit": false, "view": true, "create": false, "delete": false}, "medicalRecords": {"edit": false, "view": true, "create": false, "delete": false}, "userManagement": {"edit": false, "view": false, "create": false, "delete": false}}},
-          isSystem: true
-        }
-      ];
-
-      await db.insert(roles).values(systemRoles);
-      console.log(`Created ${systemRoles.length} system roles`);
-    } else {
-      console.log("System roles already exist for this organization");
-    }
+    // Ensure all default system roles exist for every organization (insert missing only)
+    const roleSeedSummary = await ensureSystemRolesForAllOrganizations();
+    console.log(
+      `System roles: ${roleSeedSummary.created} created, ${roleSeedSummary.existing} already present (${roleSeedSummary.expectedPerOrg} roles per org, ${roleSeedSummary.organizations} orgs)`,
+    );
 
     // CRITICAL: Ensure SaaS admin user exists for administration portal
     console.log("🔐 Creating/updating SaaS admin user for administration portal...");

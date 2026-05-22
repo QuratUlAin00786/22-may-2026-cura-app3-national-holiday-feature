@@ -1,4 +1,5 @@
-import { db } from "../db";
+import { db, pool, activeDbSchema } from "../db";
+import { storage } from "../storage";
 import {
   clinicFooters,
   clinicHeaders,
@@ -13,6 +14,7 @@ import {
   organizations,
   patients,
   users,
+  type Patient,
 } from "@shared/schema";
 import { emailService } from "./email";
 import { eq, and, asc, desc, inArray, sql } from "drizzle-orm";
@@ -21,6 +23,31 @@ import fs from "fs-extra";
 import path from "path";
 import crypto from "crypto";
 import { v4 as uuidv4 } from "uuid";
+import { decryptPatientField, patientEnvelopeJsonFromUnknown } from "../utils/encryption-sdk";
+import { fixFormForeignKeysForActiveSchema, repointFormSharePatientForeignKeys } from "../ensure-db-schema";
+
+/** Plaintext for email/PDF when `patient` may still carry per-column envelopes (decrypt here as a safety net). */
+function patientScalarForEmail(
+  fieldName: "firstName" | "lastName",
+  raw: unknown,
+): string {
+  const envJson = patientEnvelopeJsonFromUnknown(raw);
+  if (envJson) {
+    try {
+      return decryptPatientField(fieldName, envJson).trim();
+    } catch {
+      return "";
+    }
+  }
+  if (typeof raw === "string") {
+    return raw.trim();
+  }
+  return "";
+}
+
+function patientFirstNameForEmail(patient: Patient): string {
+  return patientScalarForEmail("firstName", patient.firstName as unknown) || "Patient";
+}
 
 interface FormFieldInput {
   label: string;
@@ -269,7 +296,27 @@ export class FormService {
     }));
   }
 
+  private async assertPatientExistsForShare(
+    patientId: number,
+    organizationId: number,
+  ): Promise<void> {
+    const row = await db
+      .select({ id: patients.id })
+      .from(patients)
+      .where(and(eq(patients.id, patientId), eq(patients.organizationId, organizationId)))
+      .limit(1);
+    if (row.length === 0) {
+      throw new Error(
+        `Patient ${patientId} not found in organization ${organizationId} (schema ${activeDbSchema})`,
+      );
+    }
+  }
+
   async shareForm(input: ShareFormInput) {
+    await fixFormForeignKeysForActiveSchema(pool, activeDbSchema);
+    await repointFormSharePatientForeignKeys(pool, activeDbSchema);
+    await this.assertPatientExistsForShare(input.patientId, input.organizationId);
+
     const [shared] = await db
       .insert(formShares)
       .values({
@@ -340,7 +387,7 @@ export class FormService {
   }
 
   async getFormShareLogs(formId: number, organizationId: number) {
-    return await db
+    const rows = await db
       .select({
         id: formShareLogs.id,
         link: formShareLogs.link,
@@ -359,6 +406,26 @@ export class FormService {
       .leftJoin(patients, eq(patients.id, formShareLogs.patientId))
       .where(and(eq(formShareLogs.organizationId, organizationId), eq(formShareLogs.formId, formId)))
       .orderBy(desc(formShareLogs.createdAt));
+
+    const patientIds = [...new Set(rows.map((r) => r.patientId).filter((id): id is number => id != null))];
+    const byId = new Map<number, Patient>();
+    await Promise.all(
+      patientIds.map(async (id) => {
+        const p = await storage.getPatient(id, organizationId);
+        if (p) byId.set(id, p);
+      }),
+    );
+
+    return rows.map((row) => {
+      const p = row.patientId != null ? byId.get(row.patientId) : undefined;
+      if (!p) return row;
+      return {
+        ...row,
+        patientFirstName: p.firstName ?? row.patientFirstName,
+        patientLastName: p.lastName ?? row.patientLastName,
+        patientEmail: p.email ?? row.patientEmail,
+      };
+    });
   }
 
   async resendShareEmail(logId: number, organizationId: number, sentById?: number) {
@@ -586,8 +653,11 @@ export class FormService {
     header?: typeof clinicHeaders[number] | null,
     footer?: typeof clinicFooters[number] | null,
   ) {
-    const [patient] = await db.select().from(patients).where(eq(patients.id, share.patientId));
-    const patientName = patient ? `${patient.firstName} ${patient.lastName}` : `Patient ${share.patientId}`;
+    const patient = await storage.getPatient(share.patientId, share.organizationId);
+    const patientName = patient
+      ? `${patientScalarForEmail("firstName", patient.firstName as unknown)} ${patientScalarForEmail("lastName", patient.lastName as unknown)}`.trim() ||
+        `Patient ${share.patientId}`
+      : `Patient ${share.patientId}`;
     const answersMap = this.buildAnswerMap(answers);
     const htmlContent = this.buildFormSummaryHtml(
       form,
@@ -648,7 +718,7 @@ export class FormService {
       updatedAt: new Date(),
     });
 
-    await this.sendResponsePdfToPatient(patient, form, pdfPath, response.id);
+    await this.sendResponsePdfToPatient(patient, share.organizationId, form, pdfPath, response.id);
   }
 
   private buildAnswerMap(answers: AnswerPayload[]) {
@@ -995,14 +1065,15 @@ export class FormService {
   }
 
   private async sendResponsePdfToPatient(
-    patient: typeof patients[number] | undefined,
+    patient: Patient | undefined,
+    organizationId: number,
     form: FormStructure,
     pdfPath: string,
     responseId: number,
   ) {
-    if (!patient?.email) {
-      return;
-    }
+    if (!patient) return;
+    const toEmail = await this.resolveRecipientEmail(patient, organizationId);
+    if (!toEmail) return;
 
     let pdfBuffer: Buffer;
     try {
@@ -1016,13 +1087,13 @@ export class FormService {
     const filename = path.basename(pdfPath);
     const subject = `Your completed ${form.title}`;
     const html = `
-      <p>Hi ${patient.firstName || "Patient"},</p>
+      <p>Hi ${patientFirstNameForEmail(patient)},</p>
       <p>The form <strong>${form.title}</strong> you filled has been processed. You can find a PDF copy attached.</p>
       <p>Regards,<br/>The Cura EMR Team</p>
     `;
 
     const emailReport = await emailService.sendEmailWithReport({
-      to: patient.email,
+      to: toEmail,
       from: process.env.DEFAULT_FROM_EMAIL || "no-reply@curaemr.ai",
       subject,
       html,
@@ -1042,16 +1113,45 @@ export class FormService {
     }
   }
 
-  private buildShareEmailContent(patient: typeof patients[number], link: string) {
+  private buildShareEmailContent(patient: Patient, link: string) {
     const subject = "Your Cura Medical Form";
     const html = `
-      <p>Hi ${patient.firstName || "Patient"},</p>
+      <p>Hi ${patientFirstNameForEmail(patient)},</p>
       <p>Please complete the secure form using the link below. A PDF copy will be generated and stored once you submit.</p>
       <p><a href="${link}">Complete your form securely</a></p>
       <p>If you experience any issues, contact your care team.</p>
     `;
     const text = `Complete your form: ${link}`;
     return { subject, html, text };
+  }
+
+  /** Plaintext inbox for form links: patient row after decrypt, else linked user account email. */
+  private async resolveRecipientEmail(
+    patient: Patient,
+    organizationId: number,
+  ): Promise<string | null> {
+    let raw = typeof patient.email === "string" ? patient.email.trim() : "";
+    const emailEnv = patientEnvelopeJsonFromUnknown(patient.email as unknown);
+    if (emailEnv) {
+      try {
+        raw = decryptPatientField("email", emailEnv).trim();
+      } catch {
+        raw = "";
+      }
+    }
+    if (raw.includes("@") && !raw.startsWith("{")) {
+      return raw;
+    }
+    if (patient.userId != null) {
+      const [u] = await db
+        .select({ email: users.email })
+        .from(users)
+        .where(and(eq(users.id, patient.userId), eq(users.organizationId, organizationId)))
+        .limit(1);
+      const ue = u?.email?.trim();
+      if (ue && ue.includes("@")) return ue;
+    }
+    return null;
   }
 
   private async getFormStructure(formId: number, organizationId: number): Promise<FormStructure | null> {
@@ -1176,29 +1276,15 @@ export class FormService {
     const patientIds = Array.from(new Set(responses.map((response) => response.patientId))).filter(
       Boolean,
     );
-    const patientRecords = patientIds.length
-      ? await db
-          .select({
-            id: patients.id,
-            firstName: patients.firstName,
-            lastName: patients.lastName,
-            email: patients.email,
-            phone: patients.phone,
-            nhsNumber: patients.nhsNumber,
-          })
-          .from(patients)
-          .where(
-            and(
-              eq(patients.organizationId, organizationId),
-              inArray(patients.id, patientIds),
-            ),
-          )
-      : [];
-
-    const patientMap = new Map<number, typeof patients[number]>();
-    patientRecords.forEach((patient) => {
-      patientMap.set(patient.id, patient);
-    });
+    const patientMap = new Map<number, Patient>();
+    if (patientIds.length) {
+      const rows = await Promise.all(
+        patientIds.map((id) => storage.getPatient(id, organizationId)),
+      );
+      rows.forEach((p) => {
+        if (p) patientMap.set(p.id, p);
+      });
+    }
 
     const valuesByResponse = new Map<number, typeof values[number][]>();
     values.forEach((valueRecord) => {
@@ -1247,7 +1333,7 @@ export class FormService {
     organizationId: number;
     subdomain: string;
   }): Promise<ShareEmailResult> {
-    const [patient] = await db.select().from(patients).where(eq(patients.id, params.patientId));
+    const patient = await storage.getPatient(params.patientId, params.organizationId);
     if (!patient) {
       return {
         sent: false,
@@ -1261,18 +1347,19 @@ export class FormService {
     const link = this.buildShareLink(params.subdomain, params.token);
     const { subject, html, text } = this.buildShareEmailContent(patient, link);
 
-    if (!patient.email) {
+    const toEmail = await this.resolveRecipientEmail(patient, params.organizationId);
+    if (!toEmail) {
       return {
         sent: false,
         subject,
         html,
         text,
-        error: "Patient does not have an email address",
+        error: "Patient does not have a usable email address",
       };
     }
 
     const { success, error } = await emailService.sendEmailWithReport({
-      to: patient.email,
+      to: toEmail,
       from: process.env.DEFAULT_FROM_EMAIL || "no-reply@curaemr.ai",
       subject,
       html,
@@ -1281,7 +1368,7 @@ export class FormService {
 
     if (!success) {
       console.warn("[EMAIL] sendEmailWithReport failed for form share", {
-        to: patient.email,
+        to: toEmail,
         formId: params.formId,
         error,
       });
@@ -1307,8 +1394,11 @@ export class FormService {
   }
 
   async previewShareEmail(input: ShareFormInput) {
-    const [patient] = await db.select().from(patients).where(eq(patients.id, input.patientId));
-    if (!patient?.email) {
+    const patient = await storage.getPatient(input.patientId, input.organizationId);
+    const toEmail = patient
+      ? await this.resolveRecipientEmail(patient, input.organizationId)
+      : null;
+    if (!toEmail) {
       throw new Error("Patient must have an email address");
     }
     const previewToken = uuidv4();

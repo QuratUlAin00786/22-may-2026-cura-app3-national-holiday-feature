@@ -1,4 +1,5 @@
-import "dotenv/config";
+// db-config loads project .env from disk first (overrides shell DATABASE_URL / DB_USER)
+import { formatDatabaseConfigLog, getDatabaseConfig } from "./db-config";
 import express, { type Request, Response, NextFunction } from "express";
 import cors from "cors";
 import { registerRoutes } from "./routes";
@@ -49,6 +50,11 @@ console.log("🔐 ENVIRONMENT CHECK:");
 console.log("  - FILE_SECRET exists:", !!process.env.FILE_SECRET);
 console.log("  - NODE_ENV:", process.env.NODE_ENV);
 console.log("  - DATABASE_URL exists:", !!process.env.DATABASE_URL);
+try {
+  console.log("  -", formatDatabaseConfigLog(getDatabaseConfig()));
+} catch (e: any) {
+  console.error("  - Database config error:", e?.message || e);
+}
 
 const app = express();
 app.use(
@@ -130,6 +136,9 @@ app.use((req, res, next) => {
 });
 
 (async () => {
+  const { dbReady } = await import("./db");
+  await dbReady;
+
   const server = await registerRoutes(app);
   registerSaaSRoutes(app);
 
@@ -145,7 +154,9 @@ app.use((req, res, next) => {
   // importantly only setup vite in development and after
   // setting up all the other routes so the catch-all route
   // doesn't interfere with the other routes
-  if (app.get("env") === "development") {
+  const isDev =
+    process.env.NODE_ENV === "development" || app.get("env") === "development";
+  if (isDev) {
     await setupVite(app, server);
   } else {
     serveStatic(app);
@@ -177,11 +188,11 @@ app.use((req, res, next) => {
       try {
         // Step 0: Create missing tables that might not exist in the external database
         console.log("🔧 Step 0: Ensuring required tables exist...");
-        const { pool } = await import("./db");
+        const { pool, dbReady } = await import("./db");
+        await dbReady;
         try {
-          // Try creating in user's schema first (curauser24nov25)
           await pool.query(`
-            CREATE TABLE IF NOT EXISTS curauser24nov25.inventory_tax_rates (
+            CREATE TABLE IF NOT EXISTS inventory_tax_rates (
               id SERIAL PRIMARY KEY,
               organization_id INTEGER NOT NULL,
               name VARCHAR(100) NOT NULL,
@@ -222,7 +233,7 @@ app.use((req, res, next) => {
         // Create organization_integrations table if it doesn't exist
         try {
           await pool.query(`
-            CREATE TABLE IF NOT EXISTS curauser24nov25.organization_integrations (
+            CREATE TABLE IF NOT EXISTS organization_integrations (
               id SERIAL PRIMARY KEY,
               organization_id INTEGER NOT NULL,
               integration_type VARCHAR(50) NOT NULL,

@@ -198,6 +198,40 @@ const SERVICE_TYPE_LABELS: Record<ServiceType, string> = {
   other: "Other"
 };
 
+function formatDateForInput(value: string | Date | undefined | null): string {
+  if (!value) return new Date().toISOString().split("T")[0];
+  const d = new Date(value);
+  if (isNaN(d.getTime())) return new Date().toISOString().split("T")[0];
+  return d.toISOString().split("T")[0];
+}
+
+function normalizeInvoiceServiceType(raw?: string | null): ServiceType {
+  if (!raw) return "other";
+  const s = String(raw).toLowerCase().replace(/[\s-]+/g, "_");
+  if (s === "appointments" || s === "appointment") return "appointments";
+  if (s === "labresults" || s === "lab_result" || s === "lab_results") return "labResults";
+  if (s === "imaging" || s === "medical_image" || s === "medical_images" || s === "medical_imaging") {
+    return "imaging";
+  }
+  return "other";
+}
+
+type InvoiceServiceContext = {
+  serviceType: string;
+  serviceId: string | null;
+  resolvedSelectionId: string | null;
+  details: Record<string, unknown> | null;
+  items: Array<{
+    code: string;
+    description: string;
+    quantity: number;
+    unitPrice: number;
+    total: number;
+    serviceType: string;
+    serviceId?: string;
+  }>;
+};
+
 async function fetchResource<T = any>(path: string): Promise<T> {
   const response = await apiRequest("GET", path);
   return response.json();
@@ -5207,6 +5241,9 @@ export default function BillingPage() {
   const [patientNameFilter, setPatientNameFilter] = useState<string>("");
   const [invoiceIdSearchFilter, setInvoiceIdSearchFilter] = useState<string>("");
   const [showNewInvoice, setShowNewInvoice] = useState(false);
+  const [editingInvoiceId, setEditingInvoiceId] = useState<number | null>(null);
+  const [editingServiceContext, setEditingServiceContext] = useState<InvoiceServiceContext | null>(null);
+  const [invoiceEditLoading, setInvoiceEditLoading] = useState(false);
   const [selectedReport, setSelectedReport] = useState<string>("");
   const [showSuccessModal, setShowSuccessModal] = useState(false);
   const [createdInvoiceNumber, setCreatedInvoiceNumber] = useState("");
@@ -5300,6 +5337,7 @@ export default function BillingPage() {
     setShowInsuranceInfoDialog(true);
   };
   const [isCreatingInvoice, setIsCreatingInvoice] = useState(false);
+  const [isUpdatingInvoice, setIsUpdatingInvoice] = useState(false);
 
   const handleInvoicePaymentMethodChange = (newMethod: "Cash" | "Online Payment" | "Insurance" | "Not Selected") => {
     setInvoicePaymentMethod(newMethod);
@@ -6027,6 +6065,300 @@ export default function BillingPage() {
     setLineItems((prev) => prev.filter((item) => item.id !== lineId));
   };
 
+  const resetNewInvoiceForm = () => {
+    setEditingInvoiceId(null);
+    setSelectedPatient("");
+    setServiceDate(new Date().toISOString().split("T")[0]);
+    setInvoiceDate(new Date().toISOString().split("T")[0]);
+    setDueDate(new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString().split("T")[0]);
+    setTotalAmount("");
+    setInsuranceProvider("");
+    setNhsNumber("");
+    setNotes("");
+    setLineItems([]);
+    setSelectedServiceType("appointments");
+    setSelectedAppointmentId("");
+    setSelectedLabResultId("");
+    setSelectedImagingId("");
+    setManualServiceEntry({
+      code: "",
+      description: "",
+      quantity: "1",
+      unitPrice: "",
+    });
+    setServiceSelectionError("");
+    setInvoicePaymentMethod("Not Selected");
+    setInvoiceStatus("pending");
+    setInsuranceDetails({
+      provider: "",
+      planType: "",
+      policyNumber: "",
+      memberNumber: "",
+      memberName: "",
+      contact: "",
+    });
+    setInsuranceDialogPromptedFor(null);
+    setPatientError("");
+    setTotalAmountError("");
+    setNhsNumberError("");
+    setInvoiceEditLoading(false);
+    setEditingServiceContext(null);
+  };
+
+  const mapPaymentMethodForForm = (invoice: Invoice): "Cash" | "Online Payment" | "Insurance" | "Not Selected" => {
+    const raw = String(invoice.paymentMethod || "Not Selected").trim().toLowerCase();
+    if (invoice.status === "unpaid" && raw === "online payment") return "Not Selected";
+    if (raw === "cash") return "Cash";
+    if (raw === "insurance" || invoice.insurance?.provider) return "Insurance";
+    if (raw === "online payment") return "Online Payment";
+    return "Not Selected";
+  };
+
+  const applyInvoiceEditForm = (
+    invoice: Invoice & { serviceContext?: InvoiceServiceContext },
+    serviceContext?: InvoiceServiceContext | null,
+  ) => {
+    const ctx = serviceContext ?? invoice.serviceContext ?? null;
+    const serviceType = normalizeInvoiceServiceType(ctx?.serviceType ?? invoice.serviceType);
+    const itemsSource = ctx?.items?.length
+      ? ctx.items
+      : Array.isArray(invoice.items)
+        ? invoice.items
+        : [];
+
+    setEditingInvoiceId(invoice.id);
+    setSelectedPatient(invoice.patientId);
+    setServiceDate(formatDateForInput(invoice.dateOfService));
+    setInvoiceDate(formatDateForInput(invoice.invoiceDate));
+    setDueDate(formatDateForInput(invoice.dueDate));
+    setNotes(invoice.notes || "");
+    setNhsNumber((invoice as any).nhsNumber || "");
+
+    const paymentMethod = mapPaymentMethodForForm(invoice);
+    setInvoicePaymentMethod(paymentMethod);
+    if (paymentMethod === "Cash") {
+      setInvoiceStatus("paid");
+    } else {
+      setInvoiceStatus(invoice.status === "paid" ? "paid" : "pending");
+    }
+
+    if (invoice.insurance?.provider) {
+      setInsuranceProvider(invoice.insurance.provider);
+      setInsuranceDetails({
+        provider: invoice.insurance.provider,
+        planType: "",
+        policyNumber: invoice.insurance.claimNumber || "",
+        memberNumber: "",
+        memberName: "",
+        contact: "",
+      });
+    } else {
+      setInsuranceProvider((invoice as any).insuranceProvider || "");
+    }
+
+    setSelectedServiceType(serviceType);
+    setSelectedAppointmentId("");
+    setSelectedLabResultId("");
+    setSelectedImagingId("");
+
+    if (ctx?.resolvedSelectionId) {
+      if (serviceType === "appointments") setSelectedAppointmentId(ctx.resolvedSelectionId);
+      if (serviceType === "labResults") setSelectedLabResultId(ctx.resolvedSelectionId);
+      if (serviceType === "imaging") setSelectedImagingId(ctx.resolvedSelectionId);
+    }
+
+    const providerNameFromDetails =
+      ctx?.details?.type === "labResults" && ctx.details.doctorName
+        ? String(ctx.details.doctorName)
+        : ctx?.details?.type === "appointments" && ctx.details.providerName
+          ? String(ctx.details.providerName)
+          : undefined;
+
+    setLineItems(
+      itemsSource.map((item: any, index: number) => ({
+        id: `edit-${invoice.id}-${index}`,
+        serviceType: normalizeInvoiceServiceType(item.serviceType) || serviceType,
+        serviceId: item.serviceId != null ? String(item.serviceId) : ctx?.serviceId ?? undefined,
+        code: item.code || `SVC-${index + 1}`,
+        description: item.description || "Service",
+        quantity: Number(item.quantity) || 1,
+        unitPrice: Number(item.unitPrice ?? item.amount ?? 0),
+        total: Number(item.total ?? item.amount ?? 0),
+        doctorId: (invoice as any).doctorId,
+        providerName: providerNameFromDetails,
+      })),
+    );
+    setEditingServiceContext(
+      ctx ??
+        (invoice.serviceId
+          ? {
+              serviceType: normalizeInvoiceServiceType(invoice.serviceType),
+              serviceId: String(invoice.serviceId),
+              resolvedSelectionId: null,
+              details: null,
+              items: [],
+            }
+          : null),
+    );
+  };
+
+  const openEditInvoice = async (invoice: Invoice) => {
+    setShowNewInvoice(true);
+    setInvoiceEditLoading(true);
+    try {
+      const response = await apiRequest("GET", `/api/billing/invoices/${invoice.id}`);
+      const data = await response.json();
+      applyInvoiceEditForm(data, data.serviceContext);
+    } catch (error) {
+      console.error("Failed to load invoice for edit:", error);
+      applyInvoiceEditForm(invoice, null);
+      toast({
+        title: "Using cached invoice data",
+        description: "Could not load full service details from the server. Showing saved invoice fields.",
+        variant: "destructive",
+      });
+    } finally {
+      setInvoiceEditLoading(false);
+    }
+  };
+
+  const buildInvoicePayload = () => {
+    const total = lineItems.reduce((acc, item) => acc + item.total, 0);
+    const uniqueServiceTypes = Array.from(new Set(lineItems.map((item) => item.serviceType)));
+    const serviceTypeField = uniqueServiceTypes.length === 1 ? uniqueServiceTypes[0] : "multiple";
+    const serviceIds = lineItems.map((item) => item.serviceId).filter(Boolean) as string[];
+    const doctorId = lineItems.find((item) => item.doctorId)?.doctorId;
+
+    let finalPaymentMethod = invoicePaymentMethod || "Not Selected";
+    if (!invoicePaymentMethod || invoicePaymentMethod === "Not Selected") {
+      finalPaymentMethod = "Not Selected";
+    } else if (invoicePaymentMethod === "Online Payment") {
+      finalPaymentMethod = editingInvoiceId ? invoicePaymentMethod : "Not Selected";
+    }
+
+    const resolvedInsuranceProvider =
+      invoicePaymentMethod === "Insurance"
+        ? insuranceDetails.provider || insuranceProvider
+        : insuranceProvider;
+
+    const insuranceSummaryParts: string[] = [];
+    if (invoicePaymentMethod === "Insurance") {
+      if (insuranceDetails.provider) insuranceSummaryParts.push(`Provider: ${insuranceDetails.provider}`);
+      if (insuranceDetails.planType) insuranceSummaryParts.push(`Plan: ${insuranceDetails.planType}`);
+      if (insuranceDetails.policyNumber) insuranceSummaryParts.push(`Policy: ${insuranceDetails.policyNumber}`);
+      if (insuranceDetails.memberNumber) insuranceSummaryParts.push(`Member #: ${insuranceDetails.memberNumber}`);
+      if (insuranceDetails.memberName) insuranceSummaryParts.push(`Member: ${insuranceDetails.memberName}`);
+      if (insuranceDetails.contact) insuranceSummaryParts.push(`Contact: ${insuranceDetails.contact}`);
+    }
+    const insuranceSummary = insuranceSummaryParts.join(" | ");
+
+    return {
+      patientId: selectedPatient,
+      serviceDate,
+      invoiceDate,
+      dueDate,
+      totalAmount: total.toFixed(2),
+      paymentMethod: finalPaymentMethod,
+      insuranceProvider: resolvedInsuranceProvider,
+      nhsNumber: nhsNumber.trim() || undefined,
+      notes: [notes, insuranceSummary].filter(Boolean).join(" | "),
+      lineItems: lineItems.map((item) => ({
+        code: item.code,
+        description: item.description,
+        quantity: item.quantity,
+        unitPrice: item.unitPrice,
+        total: Number(item.total.toFixed(2)),
+        serviceType: item.serviceType,
+        serviceId: item.serviceId,
+      })),
+      serviceType: serviceTypeField,
+      serviceIds,
+      doctorId: doctorId || undefined,
+      status: invoiceStatus === "paid" ? "paid" : undefined,
+    };
+  };
+
+  const handleUpdateInvoice = async () => {
+    if (!editingInvoiceId) return;
+    setIsUpdatingInvoice(true);
+    setPatientError("");
+    setServiceSelectionError("");
+    setTotalAmountError("");
+    setNhsNumberError("");
+
+    if (!selectedPatient || selectedPatient === "loading" || selectedPatient === "no-patients") {
+      setPatientError("Please select a patient to bill");
+      setIsUpdatingInvoice(false);
+      return;
+    }
+    if (lineItems.length === 0) {
+      setServiceSelectionError("Add at least one service or procedure to invoice.");
+      setIsUpdatingInvoice(false);
+      return;
+    }
+    if (!serviceDate || !invoiceDate || !dueDate) {
+      setServiceSelectionError("Service date, invoice date, and due date are required.");
+      setIsUpdatingInvoice(false);
+      return;
+    }
+
+    const total = lineItems.reduce((acc, item) => acc + item.total, 0);
+    if (total <= 0) {
+      setTotalAmountError("Total amount must be greater than zero");
+      setIsUpdatingInvoice(false);
+      return;
+    }
+
+    if (invoicePaymentMethod === "Insurance" && !insuranceDetails.provider.trim()) {
+      toast({
+        title: "Missing Insurance Provider",
+        description: "Add the insurance provider details before saving the invoice.",
+        variant: "destructive",
+      });
+      openInsuranceDialog();
+      setIsUpdatingInvoice(false);
+      return;
+    }
+
+    try {
+      const response = await apiRequest("PUT", `/api/billing/invoices/${editingInvoiceId}`, buildInvoicePayload());
+      const responseBody = await response.json();
+      const updatedInvoice: Invoice = responseBody.invoice || responseBody;
+
+      setShowNewInvoice(false);
+      resetNewInvoiceForm();
+
+      queryClient.invalidateQueries({ queryKey: ["/api/billing/invoices"] });
+      queryClient.refetchQueries({ queryKey: ["/api/billing/invoices"] });
+
+      toast({
+        title: "Invoice Updated",
+        description: `Invoice ${updatedInvoice.invoiceNumber || updatedInvoice.id} saved successfully.`,
+      });
+
+      try {
+        await handleSaveInvoice(updatedInvoice.id.toString(), updatedInvoice);
+      } catch (pdfErr) {
+        console.error("PDF regeneration after edit failed:", pdfErr);
+        toast({
+          title: "PDF Regeneration Failed",
+          description: "Invoice was updated but the PDF could not be regenerated. Use Save from the actions menu.",
+          variant: "destructive",
+        });
+      }
+    } catch (error) {
+      console.error("Invoice update failed:", error);
+      const errorMessage = error instanceof Error ? error.message : "Unable to update invoice. Please try again.";
+      toast({
+        title: "Update Failed",
+        description: errorMessage,
+        variant: "destructive",
+      });
+    } finally {
+      setIsUpdatingInvoice(false);
+    }
+  };
+
   const handleCreateInvoice = async () => {
     setIsCreatingInvoice(true);
     setPatientError("");
@@ -6125,34 +6457,13 @@ export default function BillingPage() {
       finalPaymentMethod = "Not Selected";
     }
 
-    const payload = {
-      patientId: selectedPatient,
-      serviceDate,
-      invoiceDate,
-      dueDate,
-      totalAmount: total.toFixed(2),
-      // If payment method is "Not Selected", status will be "unpaid" on server
-      // If payment method is "Online Payment", status will be "pending" or "sent"
-      paymentMethod: finalPaymentMethod,
-      insuranceProvider: resolvedInsuranceProvider,
-      nhsNumber: nhsNumber.trim() || undefined,
-      notes: [notes, insuranceSummary].filter(Boolean).join(' | '),
-      lineItems: lineItems.map((item) => ({
-        code: item.code,
-        description: item.description,
-        quantity: item.quantity,
-        unitPrice: item.unitPrice,
-        total: Number(item.total.toFixed(2)),
-        serviceType: item.serviceType,
-        serviceId: item.serviceId
-      })),
-      serviceType: serviceTypeField,
-      serviceIds,
-      doctorId: doctorId || undefined
-    };
-
     try {
-      const response = await apiRequest('POST', '/api/billing/invoices', payload);
+      const response = await apiRequest("POST", "/api/billing/invoices", {
+        ...buildInvoicePayload(),
+        paymentMethod: finalPaymentMethod,
+        insuranceProvider: resolvedInsuranceProvider,
+        notes: [notes, insuranceSummary].filter(Boolean).join(" | "),
+      });
       const responseBody = await response.json();
       const createdInvoice = responseBody.invoice || responseBody;
 
@@ -6160,37 +6471,7 @@ export default function BillingPage() {
       const originalPaymentMethod = invoicePaymentMethod;
 
       setShowNewInvoice(false);
-      setSelectedPatient("");
-      setServiceDate(new Date().toISOString().split('T')[0]);
-      setInvoiceDate(new Date().toISOString().split('T')[0]);
-      setDueDate(new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString().split('T')[0]);
-      setTotalAmount("");
-      setInsuranceProvider("");
-      setNhsNumber("");
-      setNotes("");
-      setLineItems([]);
-      setSelectedServiceType("appointments");
-      setSelectedAppointmentId("");
-      setSelectedLabResultId("");
-      setSelectedImagingId("");
-      setManualServiceEntry({
-        code: "",
-        description: "",
-        quantity: "1",
-        unitPrice: ""
-      });
-      setServiceSelectionError("");
-      setInvoicePaymentMethod("Not Selected");
-      setInvoiceStatus("pending");
-      setInsuranceDetails({
-        provider: "",
-        planType: "",
-        policyNumber: "",
-        memberNumber: "",
-        memberName: "",
-        contact: "",
-      });
-      setInsuranceDialogPromptedFor(null);
+      resetNewInvoiceForm();
 
       queryClient.invalidateQueries({ queryKey: ["/api/billing/invoices"] });
       queryClient.invalidateQueries({ queryKey: ["/api/billing"] });
@@ -6458,12 +6739,14 @@ export default function BillingPage() {
     }
   };
 
-  const handleSaveInvoice = async (invoiceId: string) => {
+  const handleSaveInvoice = async (invoiceId: string, invoiceOverride?: Invoice) => {
     console.log('💾 Save Invoice button clicked for invoice:', invoiceId);
     console.log('📋 Current clinicHeader state:', clinicHeader);
     console.log('📋 Current clinicFooter state:', clinicFooter);
     
-    const invoice = Array.isArray(invoices) ? invoices.find((inv: any) => inv.id === Number(invoiceId)) : null;
+    const invoice =
+      invoiceOverride ??
+      (Array.isArray(invoices) ? invoices.find((inv: any) => inv.id === Number(invoiceId)) : null);
     
     if (!invoice) {
       console.error('❌ Invoice not found:', invoiceId);
@@ -8049,24 +8332,26 @@ export default function BillingPage() {
   const invoicedServiceIds = React.useMemo(() => {
     const serviceIds = new Set<string>();
     allInvoices.forEach((invoice: any) => {
-      // Check if invoice has paid or unpaid status
-      if (invoice.status === 'paid' || invoice.status === 'unpaid' || invoice.status === 'draft') {
-        // Check line items for service IDs
+      if (editingInvoiceId && invoice.id === editingInvoiceId) {
+        return;
+      }
+      if (invoice.status === "paid" || invoice.status === "unpaid" || invoice.status === "draft") {
+        const invServiceType = normalizeInvoiceServiceType(invoice.serviceType);
         if (invoice.items && Array.isArray(invoice.items)) {
           invoice.items.forEach((item: any) => {
             if (item.serviceId) {
-              serviceIds.add(`${item.serviceType || invoice.serviceType || 'appointments'}-${String(item.serviceId)}`);
+              const itemType = normalizeInvoiceServiceType(item.serviceType) || invServiceType;
+              serviceIds.add(`${itemType}-${String(item.serviceId)}`);
             }
           });
         }
-        // Also check top-level serviceId
         if (invoice.serviceId) {
-          serviceIds.add(`${invoice.serviceType || 'appointments'}-${String(invoice.serviceId)}`);
+          serviceIds.add(`${invServiceType}-${String(invoice.serviceId)}`);
         }
       }
     });
     return serviceIds;
-  }, [allInvoices]);
+  }, [allInvoices, editingInvoiceId]);
 
   const { data: patientAppointments = [], isLoading: patientAppointmentsLoading } = useQuery({
     queryKey: ["/api/appointments", selectedPatientRecord?.id],
@@ -8118,6 +8403,94 @@ export default function BillingPage() {
       return !(formattedKey && invoicedServiceIds.has(formattedKey)) && !invoicedServiceIds.has(numericKey);
     });
   }, [patientImaging, invoicedServiceIds]);
+
+  const appointmentsForPicker = React.useMemo(() => {
+    const list = [...availableAppointments];
+    if (editingInvoiceId && selectedAppointmentId) {
+      const linked = patientAppointments.find((apt: any) => String(apt.id) === selectedAppointmentId);
+      if (linked && !list.some((apt: any) => String(apt.id) === String(linked.id))) {
+        list.unshift(linked);
+      }
+    }
+    return list;
+  }, [availableAppointments, patientAppointments, editingInvoiceId, selectedAppointmentId]);
+
+  const labResultsForPicker = React.useMemo(() => {
+    const list = [...availableLabResults];
+    const ctx = editingServiceContext;
+    if (editingInvoiceId && ctx?.details?.type === "labResults") {
+      const d = ctx.details as Record<string, unknown>;
+      const resolvedId = ctx.resolvedSelectionId || (d.id != null ? String(d.id) : "");
+      if (resolvedId) {
+        const fromPatient = patientLabResults.find((lr: any) => String(lr.id) === resolvedId);
+        const entry =
+          fromPatient ||
+          ({
+            id: Number(d.id) || resolvedId,
+            testId: d.testId,
+            testName: d.testName,
+            testType: d.testType,
+            status: d.status,
+            orderedAt: d.orderedAt,
+            orderedDate: d.orderedAt,
+            doctorName: d.doctorName,
+            priority: d.priority,
+          } as any);
+        if (!list.some((lr: any) => String(lr.id) === String(entry.id))) {
+          list.unshift(entry);
+        }
+      }
+    }
+    if (editingInvoiceId && selectedLabResultId) {
+      const linked = patientLabResults.find((lr: any) => String(lr.id) === selectedLabResultId);
+      if (linked && !list.some((lr: any) => String(lr.id) === String(linked.id))) {
+        list.unshift(linked);
+      }
+    }
+    return list;
+  }, [
+    availableLabResults,
+    patientLabResults,
+    editingInvoiceId,
+    selectedLabResultId,
+    editingServiceContext,
+  ]);
+
+  const linkedLabForDisplay = React.useMemo(() => {
+    if (selectedServiceType !== "labResults") return null;
+    if (selectedLabResultId) {
+      const fromPicker = labResultsForPicker.find(
+        (result: any) => String(result.id) === selectedLabResultId,
+      );
+      if (fromPicker) return fromPicker;
+    }
+    const d = editingServiceContext?.details;
+    if (d?.type === "labResults") {
+      return {
+        id: d.id,
+        testId: d.testId,
+        testName: d.testName,
+        testType: d.testType,
+        status: d.status,
+        orderedAt: d.orderedAt,
+        orderedDate: d.orderedAt,
+        doctorName: d.doctorName,
+        priority: d.priority,
+      };
+    }
+    return null;
+  }, [selectedServiceType, selectedLabResultId, labResultsForPicker, editingServiceContext]);
+
+  const imagingForPicker = React.useMemo(() => {
+    const list = [...availableImaging];
+    if (editingInvoiceId && selectedImagingId) {
+      const linked = patientImaging.find((img: any) => String(img.id) === selectedImagingId);
+      if (linked && !list.some((img: any) => String(img.id) === String(linked.id))) {
+        list.unshift(linked);
+      }
+    }
+    return list;
+  }, [availableImaging, patientImaging, editingInvoiceId, selectedImagingId]);
 
   const { data: treatmentsInfoList = [] } = useQuery({
     queryKey: ["/api/treatments-info", "billing"],
@@ -8190,7 +8563,7 @@ export default function BillingPage() {
     let doctorId: number | undefined = undefined;
 
     if (selectedServiceType === "appointments") {
-      const appointment = availableAppointments.find((apt: any) => String(apt.id) === selectedAppointmentId);
+      const appointment = appointmentsForPicker.find((apt: any) => String(apt.id) === selectedAppointmentId);
       if (!appointment) {
         setServiceSelectionError("Select a valid appointment for this patient.");
         return;
@@ -8266,7 +8639,7 @@ export default function BillingPage() {
 
       setSelectedAppointmentId("");
     } else if (selectedServiceType === "labResults") {
-      const labResult = availableLabResults.find((result: any) => String(result.id) === selectedLabResultId);
+      const labResult = labResultsForPicker.find((result: any) => String(result.id) === selectedLabResultId);
       if (!labResult) {
         setServiceSelectionError("Select a lab result for this patient.");
         return;
@@ -8312,7 +8685,7 @@ export default function BillingPage() {
 
       setSelectedLabResultId("");
     } else if (selectedServiceType === "imaging") {
-      const imagingRecord = availableImaging.find((img: any) => String(img.id) === selectedImagingId);
+      const imagingRecord = imagingForPicker.find((img: any) => String(img.id) === selectedImagingId);
       if (!imagingRecord) {
         setServiceSelectionError("Select an imaging record for this patient.");
         return;
@@ -8403,6 +8776,9 @@ export default function BillingPage() {
     selectedLabResultId,
     selectedImagingId,
     selectedAppointmentId,
+    appointmentsForPicker,
+    labResultsForPicker,
+    imagingForPicker,
     allUsers,
     user?.role
   ]);
@@ -8428,6 +8804,7 @@ export default function BillingPage() {
   }, [selectedAppointmentId, selectedServiceType, availableAppointments, patientAppointmentsLoading]);
 
   useEffect(() => {
+    if (editingInvoiceId && lineItems.length > 0) return;
     if (
       selectedServiceType === "appointments" &&
       selectedAppointmentId &&
@@ -8435,9 +8812,17 @@ export default function BillingPage() {
     ) {
       handleAddService();
     }
-  }, [selectedAppointmentId, selectedServiceType, handleAddService, patientAppointmentsLoading]);
+  }, [
+    selectedAppointmentId,
+    selectedServiceType,
+    handleAddService,
+    patientAppointmentsLoading,
+    editingInvoiceId,
+    lineItems.length,
+  ]);
 
   useEffect(() => {
+    if (editingInvoiceId && lineItems.length > 0) return;
     if (
       selectedServiceType === "labResults" &&
       selectedLabResultId &&
@@ -8445,9 +8830,17 @@ export default function BillingPage() {
     ) {
       handleAddService();
     }
-  }, [selectedLabResultId, selectedServiceType, handleAddService, patientLabResultsLoading]);
+  }, [
+    selectedLabResultId,
+    selectedServiceType,
+    handleAddService,
+    patientLabResultsLoading,
+    editingInvoiceId,
+    lineItems.length,
+  ]);
 
   useEffect(() => {
+    if (editingInvoiceId && lineItems.length > 0) return;
     if (
       selectedServiceType === "imaging" &&
       selectedImagingId &&
@@ -8455,7 +8848,36 @@ export default function BillingPage() {
     ) {
       handleAddService();
     }
-  }, [selectedImagingId, selectedServiceType, handleAddService, patientImagingLoading]);
+  }, [
+    selectedImagingId,
+    selectedServiceType,
+    handleAddService,
+    patientImagingLoading,
+    editingInvoiceId,
+    lineItems.length,
+  ]);
+
+  useEffect(() => {
+    if (!editingInvoiceId || !editingServiceContext) return;
+    if (normalizeInvoiceServiceType(editingServiceContext.serviceType) !== "labResults") return;
+    if (selectedLabResultId) return;
+    if (editingServiceContext.resolvedSelectionId) {
+      setSelectedLabResultId(editingServiceContext.resolvedSelectionId);
+      return;
+    }
+    const sid = editingServiceContext.serviceId;
+    if (!sid || patientLabResultsLoading) return;
+    const match = patientLabResults.find(
+      (lr: any) => lr.testId === sid || String(lr.id) === sid,
+    );
+    if (match) setSelectedLabResultId(String(match.id));
+  }, [
+    editingInvoiceId,
+    editingServiceContext,
+    patientLabResults,
+    patientLabResultsLoading,
+    selectedLabResultId,
+  ]);
 
   // Set appointment ID once appointments are loaded (for auto-fill from URL)
   useEffect(() => {
@@ -8553,6 +8975,7 @@ export default function BillingPage() {
   }, [selectedPatient, patients]);
 
   useEffect(() => {
+    if (editingInvoiceId) return;
     setLineItems([]);
     setSelectedAppointmentId("");
     setSelectedLabResultId("");
@@ -8564,7 +8987,7 @@ export default function BillingPage() {
       unitPrice: ""
     });
     setServiceSelectionError("");
-  }, [selectedPatient]);
+  }, [selectedPatient, editingInvoiceId]);
 
   useEffect(() => {
     const sum = lineItems.reduce((acc, item) => acc + item.total, 0);
@@ -9973,13 +10396,35 @@ export default function BillingPage() {
                                   )}
                                 </td>
                                 <td className="px-2 py-1.5 text-[11px]">
-                                  <DropdownMenu>
+                                  <div className="flex items-center justify-end gap-0.5">
+                                    {!isPatient && canEdit("billing") && (
+                                      <Button
+                                        variant="ghost"
+                                        size="sm"
+                                        className="h-8 w-8 p-0"
+                                        onClick={() => openEditInvoice(invoice)}
+                                        title="Edit invoice"
+                                        data-testid={`button-edit-invoice-${invoice.id}`}
+                                      >
+                                        <Edit className="h-4 w-4" />
+                                      </Button>
+                                    )}
+                                    <DropdownMenu>
                                     <DropdownMenuTrigger asChild>
                                       <Button variant="ghost" size="sm" className="h-8 w-8 p-0" data-testid="button-actions-menu" title="Actions">
                                         <MoreVertical className="h-4 w-4" />
                                       </Button>
                                     </DropdownMenuTrigger>
                                     <DropdownMenuContent align="end">
+                                      {!isPatient && canEdit("billing") && (
+                                        <DropdownMenuItem
+                                          onClick={() => openEditInvoice(invoice)}
+                                          data-testid={`button-edit-invoice-menu-${invoice.id}`}
+                                        >
+                                          <Edit className="h-4 w-4 mr-2" />
+                                          Edit
+                                        </DropdownMenuItem>
+                                      )}
                                       <DropdownMenuItem onClick={() => handleViewInvoice(invoice)} data-testid="button-view-invoice">
                                         <Eye className="h-4 w-4 mr-2" />
                                         View
@@ -10005,6 +10450,7 @@ export default function BillingPage() {
                                       )}
                                     </DropdownMenuContent>
                                   </DropdownMenu>
+                                  </div>
                                 </td>
                               </tr>
                             ))}
@@ -10691,13 +11137,35 @@ export default function BillingPage() {
                                     )}
                                   </td>
                                   <td className="px-2 py-1.5 text-[11px]">
-                                    <DropdownMenu>
+                                    <div className="flex items-center justify-end gap-0.5">
+                                      {canEdit("billing") && (
+                                        <Button
+                                          variant="ghost"
+                                          size="sm"
+                                          className="h-8 w-8 p-0"
+                                          onClick={() => openEditInvoice(invoice)}
+                                          title="Edit invoice"
+                                          data-testid={`button-edit-invoice-admin-${invoice.id}`}
+                                        >
+                                          <Edit className="h-4 w-4" />
+                                        </Button>
+                                      )}
+                                      <DropdownMenu>
                                       <DropdownMenuTrigger asChild>
                                         <Button variant="ghost" size="sm" className="h-8 w-8 p-0" data-testid="button-actions-menu-admin" title="Actions">
                                           <MoreVertical className="h-4 w-4" />
                                         </Button>
                                       </DropdownMenuTrigger>
                                       <DropdownMenuContent align="end">
+                                        {canEdit("billing") && (
+                                          <DropdownMenuItem
+                                            onClick={() => openEditInvoice(invoice)}
+                                            data-testid={`button-edit-invoice-menu-admin-${invoice.id}`}
+                                          >
+                                            <Edit className="h-4 w-4 mr-2" />
+                                            Edit
+                                          </DropdownMenuItem>
+                                        )}
                                         <DropdownMenuItem onClick={() => handleViewInvoice(invoice)} data-testid="button-view-invoice">
                                           <Eye className="h-4 w-4 mr-2" />
                                           View
@@ -10714,6 +11182,7 @@ export default function BillingPage() {
                                         )}
                                       </DropdownMenuContent>
                                     </DropdownMenu>
+                                    </div>
                                   </td>
                                 </tr>
                                 );
@@ -11993,17 +12462,38 @@ export default function BillingPage() {
       </Dialog>
 
       {/* New Invoice Dialog */}
-      <Dialog open={showNewInvoice} onOpenChange={setShowNewInvoice}>
+      <Dialog
+        open={showNewInvoice}
+        onOpenChange={(open) => {
+          setShowNewInvoice(open);
+          if (!open) resetNewInvoiceForm();
+        }}
+      >
         <DialogContent className="max-w-4xl max-h-[90vh] flex flex-col overflow-hidden">
           <DialogHeader className="flex-shrink-0">
-            <DialogTitle>Create New Invoice</DialogTitle>
+            <DialogTitle>{editingInvoiceId ? "Edit Invoice" : "Create New Invoice"}</DialogTitle>
+            <DialogDescription>
+              {editingInvoiceId
+                ? "Update invoice details, line items, and dates. Saving will update the database and regenerate the PDF."
+                : "Create a new invoice with services, dates, and payment details."}
+            </DialogDescription>
           </DialogHeader>
           
           <div className="space-y-4 overflow-y-auto flex-1 pr-2 min-h-0">
+            {invoiceEditLoading && (
+              <div className="flex items-center gap-2 text-sm text-muted-foreground py-2">
+                <Loader2 className="h-4 w-4 animate-spin" />
+                Loading invoice and linked service details…
+              </div>
+            )}
             <div className="grid grid-cols-2 gap-4">
               <div>
                 <Label htmlFor="patient">Patient</Label>
-                <Select value={selectedPatient} onValueChange={setSelectedPatient}>
+                <Select
+                  value={selectedPatient}
+                  onValueChange={setSelectedPatient}
+                  disabled={!!editingInvoiceId}
+                >
                   <SelectTrigger>
                     <SelectValue placeholder={patientsLoading ? "Loading patients..." : "Select patient"} />
                   </SelectTrigger>
@@ -12151,8 +12641,8 @@ export default function BillingPage() {
                       >
                         {patientAppointmentsLoading ? (
                           <SelectItem value="loading" disabled>Loading...</SelectItem>
-                        ) : availableAppointments.length > 0 ? (
-                          availableAppointments.map((appointment: any) => {
+                        ) : appointmentsForPicker.length > 0 ? (
+                          appointmentsForPicker.map((appointment: any) => {
                             // Format datetime for display in UTC (parse as UTC when ISO string has no Z)
                             let datetimeStr = '';
                             if (appointment.scheduledAt) {
@@ -12201,7 +12691,7 @@ export default function BillingPage() {
                     
                     {/* Appointment Details Card */}
                     {selectedAppointmentId && (() => {
-                      const selectedAppointment = availableAppointments.find((apt: any) => String(apt.id) === selectedAppointmentId);
+                      const selectedAppointment = appointmentsForPicker.find((apt: any) => String(apt.id) === selectedAppointmentId);
                       if (!selectedAppointment) return null;
 
                       // Extract dates directly to avoid timezone conversion
@@ -12319,8 +12809,19 @@ export default function BillingPage() {
 
                 {selectedServiceType === "labResults" && (
                   <div className="space-y-2">
+                    {editingInvoiceId && editingServiceContext?.serviceId && (
+                      <div>
+                        <Label htmlFor="invoice-service-id">Service ID</Label>
+                        <Input
+                          id="invoice-service-id"
+                          readOnly
+                          className="bg-muted font-mono text-sm"
+                          value={editingServiceContext.serviceId}
+                        />
+                      </div>
+                    )}
                     <Label>Lab Result</Label>
-                    <Select value={selectedLabResultId} onValueChange={setSelectedLabResultId}>
+                    <Select value={selectedLabResultId || undefined} onValueChange={setSelectedLabResultId}>
                       <SelectTrigger>
                         <SelectValue placeholder={patientLabResultsLoading ? "Loading lab results..." : "Select lab result"} />
                       </SelectTrigger>
@@ -12333,8 +12834,8 @@ export default function BillingPage() {
                       >
                         {patientLabResultsLoading ? (
                           <SelectItem value="loading" disabled>Loading...</SelectItem>
-                        ) : availableLabResults.length > 0 ? (
-                          availableLabResults.map((result: any) => {
+                        ) : labResultsForPicker.length > 0 ? (
+                          labResultsForPicker.map((result: any) => {
                             // Extract date directly from orderedDate or createdAt to avoid timezone conversion
                             let dueDateStr = '';
                             if (result.orderedDate) {
@@ -12378,6 +12879,59 @@ export default function BillingPage() {
                         )}
                       </SelectContent>
                     </Select>
+
+                    {linkedLabForDisplay && (() => {
+                      const selectedLab = linkedLabForDisplay;
+                      const orderedRaw = selectedLab.orderedAt || selectedLab.orderedDate || selectedLab.createdAt;
+                      const orderedLabel = orderedRaw
+                        ? format(new Date(orderedRaw), "dd MMM yyyy")
+                        : "N/A";
+                      return (
+                        <Card className="border-emerald-200 bg-emerald-50/30 dark:bg-emerald-900/10 mt-2">
+                          <CardHeader className="pb-3">
+                            <CardTitle className="text-sm font-semibold">Lab Result Details</CardTitle>
+                          </CardHeader>
+                          <CardContent className="space-y-2 text-sm">
+                            <div className="grid grid-cols-2 gap-4">
+                              <div>
+                                <span className="font-medium text-gray-700 dark:text-gray-300">Test ID:</span>
+                                <span className="ml-2 text-gray-900 dark:text-gray-100 font-mono">
+                                  {selectedLab.testId || `LR-${selectedLab.id}`}
+                                </span>
+                              </div>
+                              <div>
+                                <span className="font-medium text-gray-700 dark:text-gray-300">Test Name:</span>
+                                <span className="ml-2 text-gray-900 dark:text-gray-100">
+                                  {selectedLab.testName || selectedLab.testType || "—"}
+                                </span>
+                              </div>
+                              <div>
+                                <span className="font-medium text-gray-700 dark:text-gray-300">Status:</span>
+                                <span className="ml-2 text-gray-900 dark:text-gray-100 capitalize">
+                                  {selectedLab.status || "N/A"}
+                                </span>
+                              </div>
+                              <div>
+                                <span className="font-medium text-gray-700 dark:text-gray-300">Ordered:</span>
+                                <span className="ml-2 text-gray-900 dark:text-gray-100">{orderedLabel}</span>
+                              </div>
+                              {selectedLab.doctorName && (
+                                <div>
+                                  <span className="font-medium text-gray-700 dark:text-gray-300">Doctor:</span>
+                                  <span className="ml-2 text-gray-900 dark:text-gray-100">{selectedLab.doctorName}</span>
+                                </div>
+                              )}
+                              {selectedLab.priority && (
+                                <div>
+                                  <span className="font-medium text-gray-700 dark:text-gray-300">Priority:</span>
+                                  <span className="ml-2 text-gray-900 dark:text-gray-100">{selectedLab.priority}</span>
+                                </div>
+                              )}
+                            </div>
+                          </CardContent>
+                        </Card>
+                      );
+                    })()}
                   </div>
                 )}
 
@@ -12397,8 +12951,8 @@ export default function BillingPage() {
                       >
                         {patientImagingLoading ? (
                           <SelectItem value="loading" disabled>Loading...</SelectItem>
-                        ) : availableImaging.length > 0 ? (
-                          availableImaging.map((study: any) => {
+                        ) : imagingForPicker.length > 0 ? (
+                          imagingForPicker.map((study: any) => {
                             // Extract date directly from studyDate or createdAt to avoid timezone conversion
                             let dueDateStr = '';
                             if (study.studyDate) {
@@ -12697,12 +13251,29 @@ export default function BillingPage() {
           </div>
 
           <DialogFooter className="flex gap-2 flex-shrink-0 border-t pt-4 mt-4">
-            <Button variant="outline" onClick={() => setShowNewInvoice(false)}>
+            <Button
+              variant="outline"
+              onClick={() => {
+                setShowNewInvoice(false);
+                resetNewInvoiceForm();
+              }}
+            >
               Cancel
             </Button>
-            <Button onClick={handleCreateInvoice} disabled={isCreatingInvoice} variant="default">
-              {isCreatingInvoice ? "Processing..." : "Review & Confirm"}
-            </Button>
+            {editingInvoiceId ? (
+              <Button
+                onClick={handleUpdateInvoice}
+                disabled={isUpdatingInvoice}
+                variant="default"
+                data-testid="button-save-invoice-edit"
+              >
+                {isUpdatingInvoice ? "Saving..." : "Save & Regenerate PDF"}
+              </Button>
+            ) : (
+              <Button onClick={handleCreateInvoice} disabled={isCreatingInvoice} variant="default">
+                {isCreatingInvoice ? "Processing..." : "Review & Confirm"}
+              </Button>
+            )}
           </DialogFooter>
         </DialogContent>
       </Dialog>

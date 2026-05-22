@@ -1,12 +1,24 @@
 import { isDoctorLike } from './utils/role-utils.js';
 import {
+  decryptPatientFromStorageRow,
+  ENCRYPTED_PATIENT_PAYLOAD_KEY,
+  isEncryptedPatientStorageRow,
+  mergePerColumnDecryptedPatientFields,
+  patientMatchesSearchQuery,
+  preparePatientForStorage,
+  needsPatientColumnBackfill,
+  rebuildPatientStorageRowFromBlob,
+  assertEncryptedPatientInsertRow,
+  isEncryptedScalarField,
+} from './utils/encryption-sdk.js';
+import {
   appointmentWallClockOverlaps,
   formatAppointmentScheduledAtForApi,
   parseAppointmentWallClock,
   wallClockDateStringFromScheduled,
 } from "./appointment-wall-clock.js";
 import { 
-  organizations, users, patients, medicalRecords, medicalRecordsFiles, appointments, invoices, payments, aiInsights, subscriptions, patientCommunications, consultations, notifications, prescriptions, documents, medicalImages, clinicalPhotos, labResults, riskAssessments, claims, revenueRecords, insuranceVerifications, clinicalProcedures, emergencyProtocols, medicationsDatabase, roles, staffShifts, doctorDefaultShifts, gdprConsents, gdprDataRequests, gdprAuditTrail, gdprProcessingActivities, conversations as conversationsTable, messages, messageCampaigns, messageTemplates, userConversationFavorites, messageTags, messageTagAssignments, voiceNotes, saasOwners, saasPackages, saasSubscriptions, saasPayments, saasInvoices, saasSettings, chatbotConfigs, chatbotSessions, chatbotMessages, chatbotAnalytics, musclePositions, userDocumentPreferences, letterDrafts, forecastModels, financialForecasts, quickbooksConnections, quickbooksSyncLogs, quickbooksCustomerMappings, quickbooksInvoiceMappings, quickbooksPaymentMappings, quickbooksAccountMappings, quickbooksItemMappings, quickbooksSyncConfigs, doctorsFee, labTestPricing, imagingPricing, treatments, treatmentsInfo, clinicHeaders, clinicFooters, symptomChecks,   forms, formSections, formFields, formShares, formShareLogs, formResponses, formResponseValues, prescriptionShareLogs,
+  organizations, users, patients, medicalRecords, medicalRecordsFiles, appointments, invoices, payments, aiInsights, subscriptions, patientCommunications, consultations, notifications, prescriptions, documents, medicalImages, clinicalPhotos, labResults, riskAssessments, claims, revenueRecords, insuranceVerifications, clinicalProcedures, emergencyProtocols, medicationsDatabase, roles, staffShifts, doctorDefaultShifts, organizationHolidaySettings, organizationHolidays, gdprConsents, gdprDataRequests, gdprAuditTrail, gdprProcessingActivities, conversations as conversationsTable, messages, messageCampaigns, messageTemplates, userConversationFavorites, messageTags, messageTagAssignments, voiceNotes, saasOwners, saasPackages, saasSubscriptions, saasPayments, saasInvoices, saasSettings, chatbotConfigs, chatbotSessions, chatbotMessages, chatbotAnalytics, musclePositions, userDocumentPreferences, letterDrafts, forecastModels, financialForecasts, quickbooksConnections, quickbooksSyncLogs, quickbooksCustomerMappings, quickbooksInvoiceMappings, quickbooksPaymentMappings, quickbooksAccountMappings, quickbooksItemMappings, quickbooksSyncConfigs, doctorsFee, labTestPricing, imagingPricing, treatments, treatmentsInfo, clinicHeaders, clinicFooters, symptomChecks,   forms, formSections, formFields, formShares, formShareLogs, formResponses, formResponseValues, prescriptionShareLogs,
   type Organization, type InsertOrganization,
   type User, type InsertUser,
   type Role, type InsertRole,
@@ -34,6 +46,8 @@ import {
   type MedicationsDatabase, type InsertMedicationsDatabase,
   type StaffShift, type InsertStaffShift,
   type DoctorDefaultShift, type InsertDoctorDefaultShift,
+  type OrganizationHolidaySettings, type InsertOrganizationHolidaySettings,
+  type OrganizationHoliday, type InsertOrganizationHoliday,
   type GdprConsent, type InsertGdprConsent,
   type GdprDataRequest, type InsertGdprDataRequest,
   type GdprAuditTrail, type InsertGdprAuditTrail,
@@ -74,7 +88,8 @@ import {
   type ClinicHeader, type InsertClinicHeader,
   type ClinicFooter, type InsertClinicFooter
 } from "@shared/schema";
-import { db } from "./db";
+import { activeDbSchema, db, pool } from "./db";
+import { ensureAiInsightsIdSequence } from "./ensure-db-schema";
 import { eq, and, desc, asc, count, not, sql, gte, lt, lte, isNotNull, isNull, or, ilike, ne, inArray } from "drizzle-orm";
 
 const GRACE_PERIOD_DAYS = 13;
@@ -210,6 +225,8 @@ export interface IStorage {
   getPatientByEmail(email: string, organizationId: number): Promise<Patient | undefined>;
   getPatientsByOrganization(organizationId: number, limit?: number, isActive?: boolean): Promise<Patient[]>;
   getPatientsByUserId(organizationId: number, userId: number): Promise<Patient[]>;
+  /** Decrypt/normalize a raw patients table row (for direct SQL/drizzle reads outside helpers). */
+  normalizePatientFromRow(rawPatient: unknown): Patient | undefined;
   createPatient(patient: InsertPatient): Promise<Patient>;
   updatePatient(id: number, organizationId: number, updates: Partial<InsertPatient>): Promise<Patient | undefined>;
   deletePatient(id: number, organizationId: number): Promise<boolean>;
@@ -453,6 +470,24 @@ export interface IStorage {
   initializeDefaultShifts(organizationId: number): Promise<{ created: number; skipped: number }>;
   deleteDefaultShift(userId: number, organizationId: number): Promise<boolean>;
   deleteAllDefaultShifts(organizationId: number): Promise<{ deleted: number }>;
+
+  // Holiday calendar (organization-wide)
+  getHolidayCalendarSettings(organizationId: number): Promise<OrganizationHolidaySettings>;
+  upsertHolidayCalendarSettings(organizationId: number, updates: Partial<InsertOrganizationHolidaySettings>): Promise<OrganizationHolidaySettings>;
+  getOrganizationHolidaysInRange(organizationId: number, fromDate: string, toDate: string): Promise<OrganizationHoliday[]>;
+  getOrganizationHoliday(id: number, organizationId: number): Promise<OrganizationHoliday | undefined>;
+  createOrganizationHoliday(holiday: InsertOrganizationHoliday): Promise<OrganizationHoliday>;
+  updateOrganizationHoliday(id: number, organizationId: number, updates: Partial<InsertOrganizationHoliday>): Promise<OrganizationHoliday | undefined>;
+  deleteOrganizationHoliday(id: number, organizationId: number): Promise<boolean>;
+  resolveDateHolidayStatus(organizationId: number, dateStr: string): Promise<{
+    isNonWorking: boolean;
+    allowShifts: boolean;
+    isWorkingDay: boolean;
+    label: string;
+    holidayType: string;
+    source: "holiday" | "weekend";
+    holidayId?: number;
+  } | null>;
 
   // GDPR Compliance
   createGdprConsent(consent: InsertGdprConsent): Promise<GdprConsent>;
@@ -1210,8 +1245,54 @@ export class DatabaseStorage implements IStorage {
     return result.length > 0;
   }
 
-  // Production compatibility layer - normalize legacy flat structure to expected JSONB format
+  /** Upgrade legacy blob-only rows so email, DOB, etc. have per-column envelopes in patients table. */
+  private async backfillPatientPhiColumnsIfNeeded(rawPatient: any): Promise<any> {
+    if (!rawPatient?.id || !needsPatientColumnBackfill(rawPatient as Record<string, unknown>)) {
+      return rawPatient;
+    }
+    try {
+      const rebuilt = rebuildPatientStorageRowFromBlob(rawPatient as Record<string, unknown>);
+      const [updated] = await db
+        .update(patients)
+        .set({ ...rebuilt, updatedAt: new Date() } as any)
+        .where(
+          and(
+            eq(patients.id, rawPatient.id),
+            eq(patients.organizationId, rawPatient.organizationId),
+          ),
+        )
+        .returning();
+      console.log(
+        `[PATIENT-ENCRYPT] Backfilled per-column PHI envelopes for patient id=${rawPatient.id}`,
+      );
+      return updated ?? rawPatient;
+    } catch (err: unknown) {
+      console.warn(
+        `[PATIENT-ENCRYPT] Column backfill skipped for patient id=${rawPatient.id}:`,
+        err instanceof Error ? err.message : err,
+      );
+      return rawPatient;
+    }
+  }
+
+  // Production compatibility layer - decrypt encrypted rows, then normalize legacy plaintext
   private normalizePatientData(rawPatient: any): Patient | undefined {
+    if (!rawPatient) return undefined;
+
+    const decrypted = decryptPatientFromStorageRow(rawPatient as Record<string, unknown>);
+    if (decrypted) {
+      return this.normalizeLegacyPatientData(decrypted);
+    }
+
+    const perColumn = mergePerColumnDecryptedPatientFields(rawPatient as Record<string, unknown>);
+    if (perColumn) {
+      return this.normalizeLegacyPatientData(perColumn);
+    }
+
+    return this.normalizeLegacyPatientData(rawPatient);
+  }
+
+  private normalizeLegacyPatientData(rawPatient: any): Patient | undefined {
     if (!rawPatient) return undefined;
     
     // Helper function to safely parse JSON or return default
@@ -1298,40 +1379,56 @@ export class DatabaseStorage implements IStorage {
     } as Patient;
   }
 
-  // Patients
+  // Patients — all public reads must return decrypted PHI via decryptPatientRow / normalizePatientData.
+  normalizePatientFromRow(rawPatient: unknown): Patient | undefined {
+    return this.normalizePatientData(rawPatient);
+  }
+
+  /** Decrypt (+ optional legacy column backfill) before returning patient data to callers. */
+  private async decryptPatientRow(raw: unknown): Promise<Patient | undefined> {
+    if (!raw) return undefined;
+    const row = await this.backfillPatientPhiColumnsIfNeeded(raw);
+    return this.normalizePatientData(row);
+  }
+
+  private async decryptPatientRows(rows: unknown[]): Promise<Patient[]> {
+    const decrypted = await Promise.all(rows.map((row) => this.decryptPatientRow(row)));
+    return decrypted.filter(Boolean) as Patient[];
+  }
+
   async getPatient(id: number, organizationId: number): Promise<Patient | undefined> {
     const [patient] = await db.select().from(patients).where(and(eq(patients.id, id), eq(patients.organizationId, organizationId)));
-    return this.normalizePatientData(patient);
+    return this.decryptPatientRow(patient);
   }
 
   async getPatientByPatientId(patientId: string, organizationId: number): Promise<Patient | undefined> {
     const [patient] = await db.select().from(patients).where(and(eq(patients.patientId, patientId), eq(patients.organizationId, organizationId)));
-    return this.normalizePatientData(patient);
+    return this.decryptPatientRow(patient);
   }
 
   async getPatientByUserId(userId: number, organizationId: number): Promise<Patient | undefined> {
-    // Get the user's email to find the corresponding patient record
     const [user] = await db.select().from(users)
       .where(and(eq(users.id, userId), eq(users.organizationId, organizationId)));
     
     if (!user || !user.email) {
       return undefined;
     }
-    
-    // Find patient by matching email
-    const [patient] = await db.select().from(patients)
-      .where(and(
-        eq(patients.email, user.email), 
-        eq(patients.organizationId, organizationId)
-      ));
-    
-    return this.normalizePatientData(patient);
+
+    return this.getPatientByEmail(user.email, organizationId);
   }
 
   async getPatientByEmail(email: string, organizationId: number): Promise<Patient | undefined> {
-    const [patient] = await db.select().from(patients)
-      .where(and(eq(patients.email, email), eq(patients.organizationId, organizationId)));
-    return this.normalizePatientData(patient);
+    const rows = await db.select().from(patients)
+      .where(eq(patients.organizationId, organizationId));
+
+    const normalizedEmail = email.trim().toLowerCase();
+    for (const row of rows) {
+      const patient = await this.decryptPatientRow(row);
+      if (patient?.email && patient.email.trim().toLowerCase() === normalizedEmail) {
+        return patient;
+      }
+    }
+    return undefined;
   }
 
   async getPatientsByOrganization(organizationId: number, limit?: number, isActive?: boolean): Promise<Patient[]> {
@@ -1353,9 +1450,8 @@ export class DatabaseStorage implements IStorage {
     const uniqueResults = results.filter((patient, index, self) => 
       index === self.findIndex(p => p.id === patient.id)
     );
-    
-    // Normalize all patient data before returning
-    return uniqueResults.map(patient => this.normalizePatientData(patient)).filter(Boolean) as Patient[];
+
+    return this.decryptPatientRows(uniqueResults);
   }
 
   async getPatientsByUserId(organizationId: number, userId: number): Promise<Patient[]> {
@@ -1365,53 +1461,134 @@ export class DatabaseStorage implements IStorage {
       .where(and(eq(patients.organizationId, organizationId), eq(patients.userId, userId)))
       .orderBy(desc(patients.updatedAt));
 
-    return results.map(patient => this.normalizePatientData(patient)).filter(Boolean) as Patient[];
+    return this.decryptPatientRows(results);
+  }
+
+  async backfillAllPatientPhiColumns(): Promise<{ updated: number; skipped: number }> {
+    const rows = await db.select().from(patients);
+    let updated = 0;
+    let skipped = 0;
+    for (const row of rows) {
+      if (!needsPatientColumnBackfill(row as Record<string, unknown>)) {
+        skipped++;
+        continue;
+      }
+      await this.backfillPatientPhiColumnsIfNeeded(row);
+      updated++;
+    }
+    return { updated, skipped };
   }
 
   async createPatient(patient: InsertPatient): Promise<Patient> {
     console.log("🔍 [STORAGE] createPatient called with userId:", (patient as any).userId);
-    const { address, medicalHistory, communicationPreferences, ...baseFields } = patient;
-    console.log("🔍 [STORAGE] baseFields.userId:", (baseFields as any).userId);
-    const insertData = {
-      ...baseFields,
-      address: address ? JSON.parse(JSON.stringify(address)) : null,
-      medicalHistory: medicalHistory ? JSON.parse(JSON.stringify(medicalHistory)) : null,
-      communicationPreferences: communicationPreferences ? JSON.parse(JSON.stringify(communicationPreferences)) : null
-    };
+
+    const patientPayload = {
+      ...patient,
+      email: patient.email != null ? String(patient.email).trim() : "",
+      relation:
+        (patient as { relation?: string | null }).relation ??
+        ((patient as { userId?: number | null }).userId ? "Self" : null),
+      address: patient.address ? JSON.parse(JSON.stringify(patient.address)) : {},
+      medicalHistory: patient.medicalHistory ? JSON.parse(JSON.stringify(patient.medicalHistory)) : {},
+      communicationPreferences: patient.communicationPreferences
+        ? JSON.parse(JSON.stringify(patient.communicationPreferences))
+        : {},
+      insuranceInfo: patient.insuranceInfo ? JSON.parse(JSON.stringify(patient.insuranceInfo)) : {},
+      emergencyContact: patient.emergencyContact
+        ? JSON.parse(JSON.stringify(patient.emergencyContact))
+        : {},
+      flags: Array.isArray(patient.flags) ? patient.flags : [],
+    } as Record<string, unknown>;
+
+    const insertData = preparePatientForStorage(patientPayload);
+    assertEncryptedPatientInsertRow(insertData);
+
     console.log("🔍 [STORAGE] insertData.userId before insert:", (insertData as any).userId);
     const [created] = await db.insert(patients).values([insertData as any]).returning();
     console.log("🔍 [STORAGE] created patient userId:", created.userId);
-    return created;
+
+    let row = await this.backfillPatientPhiColumnsIfNeeded(created);
+    if (needsPatientColumnBackfill(row as Record<string, unknown>)) {
+      throw new Error(
+        `Patient PHI columns were not stored correctly (patient id=${row?.id}). Check ENCRYPTION_KEY and server logs.`,
+      );
+    }
+    if (!isEncryptedScalarField(row.email)) {
+      throw new Error(
+        `Patient email column is missing after insert (patient id=${row?.id}).`,
+      );
+    }
+
+    const normalized = await this.decryptPatientRow(row);
+    if (!normalized) {
+      throw new Error("Failed to normalize patient after create");
+    }
+    return normalized;
   }
 
   async updatePatient(id: number, organizationId: number, updates: Partial<InsertPatient>): Promise<Patient | undefined> {
-    const { address, medicalHistory, communicationPreferences, insuranceInfo, emergencyContact, flags, ...baseUpdates } = updates;
-    const updateData = {
-      ...baseUpdates,
-      updatedAt: new Date(),
-      ...(address && { address: JSON.parse(JSON.stringify(address)) }),
-      ...(medicalHistory && { medicalHistory: JSON.parse(JSON.stringify(medicalHistory)) }),
-      ...(communicationPreferences && { communicationPreferences: JSON.parse(JSON.stringify(communicationPreferences)) }),
-      ...(insuranceInfo && { insuranceInfo: JSON.parse(JSON.stringify(insuranceInfo)) }),
-      ...(emergencyContact && { emergencyContact: JSON.parse(JSON.stringify(emergencyContact)) }),
-      ...(flags !== undefined && { flags: Array.isArray(flags) ? flags : [] })
-    };
+    const [existing] = await db.select().from(patients)
+      .where(and(eq(patients.id, id), eq(patients.organizationId, organizationId)));
+
+    if (!existing) {
+      return undefined;
+    }
+
+    const current = this.normalizePatientData(existing);
+    if (!current) {
+      return undefined;
+    }
+
+    const mergedPatient = {
+      ...current,
+      ...updates,
+      id: current.id,
+      organizationId: current.organizationId,
+      address: updates.address !== undefined
+        ? (updates.address ? JSON.parse(JSON.stringify(updates.address)) : {})
+        : current.address,
+      medicalHistory: updates.medicalHistory !== undefined
+        ? (updates.medicalHistory ? JSON.parse(JSON.stringify(updates.medicalHistory)) : {})
+        : current.medicalHistory,
+      communicationPreferences: updates.communicationPreferences !== undefined
+        ? (updates.communicationPreferences
+          ? JSON.parse(JSON.stringify(updates.communicationPreferences))
+          : {})
+        : current.communicationPreferences,
+      insuranceInfo: updates.insuranceInfo !== undefined
+        ? (updates.insuranceInfo ? JSON.parse(JSON.stringify(updates.insuranceInfo)) : {})
+        : current.insuranceInfo,
+      emergencyContact: updates.emergencyContact !== undefined
+        ? (updates.emergencyContact ? JSON.parse(JSON.stringify(updates.emergencyContact)) : {})
+        : current.emergencyContact,
+      flags: updates.flags !== undefined
+        ? (Array.isArray(updates.flags) ? updates.flags : [])
+        : current.flags,
+    } as Record<string, unknown>;
+
+    // Normalized UI merge can still carry the blob key inside medicalHistory JSON — strip before re-encrypt.
+    const mh = mergedPatient.medicalHistory;
+    if (mh && typeof mh === "object" && !Array.isArray(mh)) {
+      const copy = { ...(mh as Record<string, unknown>) };
+      delete copy[ENCRYPTED_PATIENT_PAYLOAD_KEY];
+      mergedPatient.medicalHistory = copy;
+    }
+
+    if (isEncryptedPatientStorageRow(mergedPatient)) {
+      throw new Error("Refusing to re-encrypt an already encrypted patient payload");
+    }
+
+    const encryptedRow = preparePatientForStorage(mergedPatient);
     const [updated] = await db.update(patients)
-      .set(updateData as any)
+      .set({ ...encryptedRow, updatedAt: new Date() } as any)
       .where(and(eq(patients.id, id), eq(patients.organizationId, organizationId)))
       .returning();
-    return updated || undefined;
+
+    return updated ? await this.decryptPatientRow(updated) : undefined;
   }
 
   async updatePatientInsuranceStatus(patientId: number, organizationId: number, isInsured: boolean): Promise<Patient | undefined> {
-    const [updated] = await db.update(patients)
-      .set({ 
-        isInsured,
-        updatedAt: new Date()
-      })
-      .where(and(eq(patients.id, patientId), eq(patients.organizationId, organizationId)))
-      .returning();
-    return updated || undefined;
+    return this.updatePatient(patientId, organizationId, { isInsured });
   }
 
   async deletePatient(id: number, organizationId: number): Promise<boolean> {
@@ -1522,11 +1699,21 @@ export class DatabaseStorage implements IStorage {
   }
 
   async searchPatients(organizationId: number, query: string): Promise<Patient[]> {
-    return await db.select().from(patients)
+    const rows = await db.select().from(patients)
       .where(and(
         eq(patients.organizationId, organizationId),
         eq(patients.isActive, true)
       ));
+
+    const decryptedPatients = await this.decryptPatientRows(rows);
+
+    if (!query?.trim()) {
+      return decryptedPatients;
+    }
+
+    return decryptedPatients.filter((patient) =>
+      patientMatchesSearchQuery(patient as unknown as Record<string, unknown>, query),
+    );
   }
 
   // Medical Records
@@ -2134,37 +2321,67 @@ export class DatabaseStorage implements IStorage {
   }
 
   async createAiInsight(insight: InsertAiInsight): Promise<AiInsight> {
-    const sanitizedMetadata = insight.metadata
-      ? JSON.parse(JSON.stringify(insight.metadata))
-      : null;
+    let sanitizedMetadata: Record<string, unknown> = {};
+    if (insight.metadata != null && typeof insight.metadata === "object" && !Array.isArray(insight.metadata)) {
+      try {
+        sanitizedMetadata = JSON.parse(JSON.stringify(insight.metadata)) as Record<string, unknown>;
+      } catch (metaErr) {
+        console.warn("[AI-INSIGHTS] metadata clone failed, using {}:", metaErr);
+        sanitizedMetadata = {};
+      }
+    }
+
+    const normalizeAiConfidence = (raw: unknown): string | null => {
+      if (raw == null || raw === "") return null;
+      const n = typeof raw === "number" ? raw : parseFloat(String(raw).trim());
+      if (!Number.isFinite(n)) return "0";
+      const clamped = Math.max(0, Math.min(1, n));
+      return clamped.toFixed(2);
+    };
 
     const insertData = {
       organizationId: insight.organizationId,
-      patientId: insight.patientId,
+      patientId: insight.patientId ?? null,
       type: insight.type,
       title: insight.title,
       description: insight.description,
-      severity: insight.severity,
-      actionRequired: insight.actionRequired,
-      confidence: insight.confidence,
+      severity: insight.severity ?? "medium",
+      actionRequired: insight.actionRequired ?? false,
+      confidence: normalizeAiConfidence(insight.confidence),
       metadata: sanitizedMetadata,
-      status: insight.status,
-      aiStatus: insight.aiStatus,
+      status: insight.status ?? "active",
+      aiStatus: insight.aiStatus ?? "pending",
     };
 
-    console.log('[AI-INSIGHTS] inserting payload:', insertData);
+    console.log("[AI-INSIGHTS] inserting payload:", insertData);
 
-    const insertPayload = {
-
-      
-
-
-      ...insertData,
-      id: sql<number>`nextval('curauser24nov25.ai_insights_id_seq'::regclass)`,
+    const insertRow = async () => {
+      const [created] = await db.insert(aiInsights).values([insertData as any]).returning();
+      if (!created) {
+        throw new Error("Insert returned no row");
+      }
+      return created;
     };
 
-    const [created] = await db.insert(aiInsights).values([insertPayload as any]).returning();
-    return created;
+    try {
+      return await insertRow();
+    } catch (error: unknown) {
+      const pgCode = (error as { code?: string })?.code;
+      const message = error instanceof Error ? error.message : String(error);
+      if (pgCode === "23502" && message.includes('column "id"')) {
+        console.warn("[AI-INSIGHTS] repairing id sequence, retrying insert");
+        await ensureAiInsightsIdSequence(pool, activeDbSchema);
+        try {
+          return await insertRow();
+        } catch (retryErr: unknown) {
+          const retryMsg = retryErr instanceof Error ? retryErr.message : String(retryErr);
+          console.error("[AI-INSIGHTS] insert failed after sequence repair:", retryMsg, insertData);
+          throw retryErr;
+        }
+      }
+      console.error("[AI-INSIGHTS] insert failed:", message, insertData);
+      throw error;
+    }
   }
 
   async updateAiInsight(id: number, organizationId: number, updates: Partial<InsertAiInsight>): Promise<AiInsight | undefined> {
@@ -2584,14 +2801,24 @@ export class DatabaseStorage implements IStorage {
   }
 
   async findPatientByPhone(phoneVariants: string[]): Promise<Patient | undefined> {
-    // Try to find a patient with any of the phone number variants
-    for (const phone of phoneVariants) {
-      const [patient] = await db
-        .select()
-        .from(patients)
-        .where(sql`${patients.phone} ILIKE ${`%${phone.replace(/[^0-9]/g, '').slice(-10)}%`}`)
-        .limit(1);
-      if (patient) return patient;
+    const digitsVariants = phoneVariants
+      .map((phone) => phone.replace(/[^0-9]/g, "").slice(-10))
+      .filter((digits) => digits.length > 0);
+
+    if (digitsVariants.length === 0) {
+      return undefined;
+    }
+
+    const rows = await db.select().from(patients);
+    for (const row of rows) {
+      // Global scan — decrypt without per-row DB backfill for performance
+      const patient = this.normalizePatientData(row);
+      if (!patient?.phone) continue;
+
+      const storedDigits = patient.phone.replace(/[^0-9]/g, "").slice(-10);
+      if (digitsVariants.some((digits) => storedDigits.includes(digits) || digits.includes(storedDigits))) {
+        return patient;
+      }
     }
     return undefined;
   }
@@ -2915,7 +3142,8 @@ export class DatabaseStorage implements IStorage {
   async getAnalytics(organizationId: number): Promise<any> {
     try {
       // Get real patient data from database
-      const patientsList = await db.select().from(patients).where(eq(patients.organizationId, organizationId));
+      const patientRows = await db.select().from(patients).where(eq(patients.organizationId, organizationId));
+      const patientsList = await this.decryptPatientRows(patientRows);
       const appointmentsList = await db.select().from(appointments).where(eq(appointments.organizationId, organizationId));
       
       // Get clinical data from database
@@ -5671,17 +5899,10 @@ export class DatabaseStorage implements IStorage {
         // Try to look up patient by recipientId if it's a number
         if (msg.recipientId && /^\d+$/.test(msg.recipientId)) {
           const patientId = parseInt(msg.recipientId, 10);
-          const [patient] = await db.select({
-            firstName: patients.firstName,
-            lastName: patients.lastName
-          })
-            .from(patients)
-            .where(eq(patients.id, patientId))
-            .limit(1);
-          
-          if (patient) {
-            patientFirstName = patient.firstName;
-            patientLastName = patient.lastName;
+          const decrypted = await this.getPatient(patientId, organizationId);
+          if (decrypted) {
+            patientFirstName = decrypted.firstName;
+            patientLastName = decrypted.lastName;
           }
         }
         
@@ -6440,6 +6661,125 @@ export class DatabaseStorage implements IStorage {
     return (result.rowCount ?? 0) > 0;
   }
 
+  // Holiday calendar
+  async getHolidayCalendarSettings(organizationId: number): Promise<OrganizationHolidaySettings> {
+    const [row] = await db.select()
+      .from(organizationHolidaySettings)
+      .where(eq(organizationHolidaySettings.organizationId, organizationId));
+    if (row) return row;
+    const [created] = await db.insert(organizationHolidaySettings)
+      .values({ organizationId })
+      .returning();
+    return created;
+  }
+
+  async upsertHolidayCalendarSettings(
+    organizationId: number,
+    updates: Partial<InsertOrganizationHolidaySettings>,
+  ): Promise<OrganizationHolidaySettings> {
+    await this.getHolidayCalendarSettings(organizationId);
+    const [row] = await db.update(organizationHolidaySettings)
+      .set({ ...updates, updatedAt: new Date() })
+      .where(eq(organizationHolidaySettings.organizationId, organizationId))
+      .returning();
+    return row;
+  }
+
+  async getOrganizationHolidaysInRange(
+    organizationId: number,
+    fromDate: string,
+    toDate: string,
+  ): Promise<OrganizationHoliday[]> {
+    return await db.select()
+      .from(organizationHolidays)
+      .where(and(
+        eq(organizationHolidays.organizationId, organizationId),
+        gte(organizationHolidays.holidayDate, fromDate),
+        lte(organizationHolidays.holidayDate, toDate),
+      ))
+      .orderBy(asc(organizationHolidays.holidayDate), asc(organizationHolidays.name));
+  }
+
+  async getOrganizationHoliday(id: number, organizationId: number): Promise<OrganizationHoliday | undefined> {
+    const [row] = await db.select()
+      .from(organizationHolidays)
+      .where(and(eq(organizationHolidays.id, id), eq(organizationHolidays.organizationId, organizationId)));
+    return row || undefined;
+  }
+
+  async createOrganizationHoliday(holiday: InsertOrganizationHoliday): Promise<OrganizationHoliday> {
+    const [row] = await db.insert(organizationHolidays).values(holiday).returning();
+    return row;
+  }
+
+  async updateOrganizationHoliday(
+    id: number,
+    organizationId: number,
+    updates: Partial<InsertOrganizationHoliday>,
+  ): Promise<OrganizationHoliday | undefined> {
+    const [row] = await db.update(organizationHolidays)
+      .set({ ...updates, updatedAt: new Date() })
+      .where(and(eq(organizationHolidays.id, id), eq(organizationHolidays.organizationId, organizationId)))
+      .returning();
+    return row || undefined;
+  }
+
+  async deleteOrganizationHoliday(id: number, organizationId: number): Promise<boolean> {
+    const result = await db.delete(organizationHolidays)
+      .where(and(eq(organizationHolidays.id, id), eq(organizationHolidays.organizationId, organizationId)));
+    return (result.rowCount ?? 0) > 0;
+  }
+
+  async resolveDateHolidayStatus(organizationId: number, dateStr: string): Promise<{
+    isNonWorking: boolean;
+    allowShifts: boolean;
+    isWorkingDay: boolean;
+    label: string;
+    holidayType: string;
+    source: "holiday" | "weekend";
+    holidayId?: number;
+  } | null> {
+    const settings = await this.getHolidayCalendarSettings(organizationId);
+    const [explicit] = await db.select()
+      .from(organizationHolidays)
+      .where(and(
+        eq(organizationHolidays.organizationId, organizationId),
+        eq(organizationHolidays.holidayDate, dateStr),
+      ))
+      .limit(1);
+
+    if (explicit) {
+      const allowShifts = explicit.allowShifts ?? settings.defaultAllowShiftsOnHolidays;
+      const isWorkingDay = explicit.isWorkingDay;
+      const isNonWorking = !isWorkingDay;
+      return {
+        isNonWorking,
+        allowShifts,
+        isWorkingDay,
+        label: explicit.name,
+        holidayType: explicit.holidayType,
+        source: "holiday",
+        holidayId: explicit.id,
+      };
+    }
+
+    const dayNames = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+    const dayName = dayNames[new Date(`${dateStr}T12:00:00`).getDay()];
+    const weekendDays = settings.weekendDays ?? ["Saturday", "Sunday"];
+    if (settings.weekendsNonWorking && weekendDays.includes(dayName)) {
+      return {
+        isNonWorking: true,
+        allowShifts: settings.defaultAllowShiftsOnHolidays,
+        isWorkingDay: false,
+        label: `${dayName} (weekend)`,
+        holidayType: "weekend",
+        source: "weekend",
+      };
+    }
+
+    return null;
+  }
+
   // Default Shifts Methods
   async getDefaultShiftsByOrganization(organizationId: number): Promise<DoctorDefaultShift[]> {
     return await db.select()
@@ -6965,173 +7305,15 @@ export class DatabaseStorage implements IStorage {
         throw new Error('Failed to retrieve created organization');
       }
 
-      // Helper function to ensure all modules have view: true (only include specified modules)
-      const ensureAllModulesView = (existingModules: any) => {
-        // Only include the specified modules (removed: medicalRecords, integrations, automation, 
-        // patientPortal, aiInsights, populationHealth, gdprCompliance, userManagement)
-        const allowedModules = [
-          'dashboard', 'patients', 'appointments', 'prescriptions', 'labResults',
-          'medicalImaging', 'forms', 'messaging', 'analytics', 'clinicalDecision',
-          'symptomChecker', 'telemedicine', 'voiceDocumentation', 'financialIntelligence',
-          'billing', 'quickbooks', 'inventory', 'shiftManagement', 'settings',
-          'subscription', 'userManual'
-        ];
-        
-        const updatedModules: any = {};
-        
-        // Only include modules from the allowed list and ensure view is true
-        for (const module of allowedModules) {
-          if (existingModules[module]) {
-            // Preserve existing permissions but ensure view is true
-            updatedModules[module] = {
-              ...existingModules[module],
-              view: true
-            };
-          } else {
-            // Add missing modules with view: true
-            updatedModules[module] = { view: true, edit: false, create: false, delete: false };
-          }
-        }
-        
-        // Any modules not in the allowed list are excluded (removed)
-        return updatedModules;
-      };
-
       // Create default roles for the new organization
       console.log('🎭 [CUSTOMER-CREATE] Creating default roles for organization...');
-      const defaultRoles: InsertRole[] = [
-        {
-          organizationId: organization.id,
-          name: 'admin',
-          displayName: 'Administrator',
-          description: 'Full system access with all permissions',
-          permissions: {"fields": {"financialData": {"edit": true, "view": true}, "medicalHistory": {"edit": true, "view": true}, "patientSensitiveInfo": {"edit": true, "view": true}}, "modules": ensureAllModulesView({"billing": {"edit": true, "view": true, "create": true, "delete": true}, "patients": {"edit": true, "view": true, "create": true, "delete": true}, "settings": {"edit": true, "view": true, "create": true, "delete": true}, "analytics": {"edit": true, "view": true, "create": true, "delete": true}, "appointments": {"edit": true, "view": true, "create": true, "delete": true}, "prescriptions": {"edit": true, "view": true, "create": true, "delete": true}, "medicalRecords": {"edit": true, "view": true, "create": true, "delete": true}, "userManagement": {"edit": true, "view": true, "create": true, "delete": true}})},
-          isSystem: true
-        },
-        {
-          organizationId: organization.id,
-          name: 'doctor',
-          displayName: 'Doctor',
-          description: 'Medical doctor with full clinical access',
-          permissions: {"fields": {"financialData": {"edit": false, "view": true}, "medicalHistory": {"edit": true, "view": true}, "patientSensitiveInfo": {"edit": true, "view": true}}, "modules": ensureAllModulesView({"dashboard": {"edit": false, "view": true, "create": false, "delete": false}, "billing": {"edit": false, "view": true, "create": false, "delete": false}, "patients": {"edit": true, "view": true, "create": true, "delete": false}, "settings": {"edit": false, "view": true, "create": false, "delete": false}, "analytics": {"edit": false, "view": true, "create": false, "delete": false}, "appointments": {"edit": true, "view": true, "create": true, "delete": false}, "prescriptions": {"edit": true, "view": true, "create": true, "delete": false}, "labResults": {"edit": true, "view": true, "create": true, "delete": false}, "medicalImaging": {"edit": true, "view": true, "create": true, "delete": false}, "forms": {"edit": true, "view": true, "create": true, "delete": false}, "messaging": {"edit": true, "view": true, "create": true, "delete": false}, "shiftManagement": {"edit": true, "view": true, "create": true, "delete": false}, "voiceDocumentation": {"edit": true, "view": true, "create": true, "delete": false}, "symptomChecker": {"edit": false, "view": true, "create": false, "delete": false}, "medicalRecords": {"edit": true, "view": true, "create": true, "delete": false}, "userManagement": {"edit": false, "view": true, "create": false, "delete": false}})},
-          isSystem: true
-        },
-        {
-          organizationId: organization.id,
-          name: 'nurse',
-          displayName: 'Nurse',
-          description: 'Nursing staff with patient care access',
-          permissions: {"fields": {"financialData": {"edit": false, "view": false}, "medicalHistory": {"edit": false, "view": true}, "patientSensitiveInfo": {"edit": false, "view": true}}, "modules": ensureAllModulesView({"billing": {"edit": false, "view": true, "create": false, "delete": false}, "patients": {"edit": true, "view": true, "create": false, "delete": false}, "settings": {"edit": false, "view": true, "create": false, "delete": false}, "analytics": {"edit": false, "view": true, "create": false, "delete": false}, "appointments": {"edit": true, "view": true, "create": true, "delete": false}, "prescriptions": {"edit": false, "view": true, "create": false, "delete": false}, "medicalRecords": {"edit": false, "view": true, "create": true, "delete": false}, "userManagement": {"edit": false, "view": true, "create": false, "delete": false}})},
-          isSystem: true
-        },
-        {
-          organizationId: organization.id,
-          name: 'patient',
-          displayName: 'Patient',
-          description: 'Patient with access to own records',
-          permissions: {"fields": {"labResults": {"edit": false, "view": false}, "financialData": {"edit": false, "view": true}, "imagingResults": {"edit": false, "view": false}, "medicalHistory": {"edit": false, "view": true}, "insuranceDetails": {"edit": false, "view": false}, "billingInformation": {"edit": false, "view": false}, "prescriptionDetails": {"edit": false, "view": false}, "patientSensitiveInfo": {"edit": false, "view": true}}, "modules": ensureAllModulesView({"forms": {"edit": false, "view": true, "create": false, "delete": false}, "billing": {"edit": false, "view": true, "create": false, "delete": false}, "patients": {"edit": false, "view": true, "create": false, "delete": false}, "settings": {"edit": false, "view": true, "create": false, "delete": false}, "analytics": {"edit": false, "view": true, "create": false, "delete": false}, "messaging": {"edit": false, "view": true, "create": false, "delete": false}, "aiInsights": {"edit": false, "view": true, "create": false, "delete": false}, "labResults": {"edit": false, "view": true, "create": false, "delete": false}, "appointments": {"edit": true, "view": true, "create": true, "delete": false}, "telemedicine": {"edit": false, "view": true, "create": false, "delete": false}, "prescriptions": {"edit": false, "view": true, "create": false, "delete": false}, "medicalImaging": {"edit": false, "view": true, "create": false, "delete": false}, "medicalRecords": {"edit": false, "view": true, "create": false, "delete": false}, "userManagement": {"edit": false, "view": true, "create": false, "delete": false}})},
-          isSystem: true
-        },
-        {
-          organizationId: organization.id,
-          name: 'receptionist',
-          displayName: 'Receptionist',
-          description: 'Front desk staff with appointment management',
-          permissions: {"fields": {"financialData": {"edit": false, "view": false}, "medicalHistory": {"edit": false, "view": false}, "patientSensitiveInfo": {"edit": false, "view": false}}, "modules": ensureAllModulesView({"billing": {"edit": false, "view": true, "create": false, "delete": false}, "patients": {"edit": true, "view": true, "create": true, "delete": false}, "settings": {"edit": false, "view": true, "create": false, "delete": false}, "analytics": {"edit": false, "view": true, "create": false, "delete": false}, "appointments": {"edit": true, "view": true, "create": true, "delete": false}, "prescriptions": {"edit": false, "view": true, "create": false, "delete": false}, "medicalRecords": {"edit": false, "view": true, "create": false, "delete": false}, "userManagement": {"edit": false, "view": true, "create": false, "delete": false}})},
-          isSystem: true
-        },
-        {
-          organizationId: organization.id,
-          name: 'lab_technician',
-          displayName: 'Lab Technician',
-          description: 'Laboratory technician with lab results access',
-          permissions: {"fields": {}, "modules": ensureAllModulesView({"dashboard": {"edit": false, "view": true, "create": false, "delete": false}})},
-          isSystem: true
-        },
-        {
-          organizationId: organization.id,
-          name: 'pharmacist',
-          displayName: 'Pharmacist',
-          description: 'Pharmacist with prescription access',
-          permissions: {"fields": {"financialData": {"edit": false, "view": false}, "medicalHistory": {"edit": false, "view": true}, "patientSensitiveInfo": {"edit": false, "view": false}}, "modules": ensureAllModulesView({"billing": {"edit": false, "view": true, "create": false, "delete": false}, "patients": {"edit": false, "view": true, "create": false, "delete": false}, "settings": {"edit": false, "view": true, "create": false, "delete": false}, "analytics": {"edit": false, "view": true, "create": false, "delete": false}, "appointments": {"edit": false, "view": true, "create": false, "delete": false}, "prescriptions": {"edit": true, "view": true, "create": false, "delete": false}, "medicalRecords": {"edit": false, "view": true, "create": false, "delete": false}, "userManagement": {"edit": false, "view": true, "create": false, "delete": false}})},
-          isSystem: true
-        },
-        {
-          organizationId: organization.id,
-          name: 'dentist',
-          displayName: 'Dentist',
-          description: 'Dental professional with clinical access',
-          permissions: {"fields": {"financialData": {"edit": false, "view": true}, "medicalHistory": {"edit": true, "view": true}, "patientSensitiveInfo": {"edit": true, "view": true}}, "modules": ensureAllModulesView({"billing": {"edit": false, "view": true, "create": false, "delete": false}, "patients": {"edit": true, "view": true, "create": true, "delete": false}, "settings": {"edit": false, "view": true, "create": false, "delete": false}, "analytics": {"edit": false, "view": true, "create": false, "delete": false}, "appointments": {"edit": true, "view": true, "create": true, "delete": false}, "prescriptions": {"edit": true, "view": true, "create": true, "delete": false}, "medicalRecords": {"edit": true, "view": true, "create": true, "delete": false}, "userManagement": {"edit": false, "view": true, "create": false, "delete": false}})},
-          isSystem: true
-        },
-        {
-          organizationId: organization.id,
-          name: 'dental_nurse',
-          displayName: 'Dental Nurse',
-          description: 'Dental nursing staff with patient care access',
-          permissions: {"fields": {"financialData": {"edit": false, "view": false}, "medicalHistory": {"edit": false, "view": true}, "patientSensitiveInfo": {"edit": false, "view": true}}, "modules": ensureAllModulesView({"billing": {"edit": false, "view": true, "create": false, "delete": false}, "patients": {"edit": true, "view": true, "create": false, "delete": false}, "settings": {"edit": false, "view": true, "create": false, "delete": false}, "analytics": {"edit": false, "view": true, "create": false, "delete": false}, "appointments": {"edit": true, "view": true, "create": true, "delete": false}, "prescriptions": {"edit": false, "view": true, "create": false, "delete": false}, "medicalRecords": {"edit": false, "view": true, "create": true, "delete": false}, "userManagement": {"edit": false, "view": true, "create": false, "delete": false}})},
-          isSystem: true
-        },
-        {
-          organizationId: organization.id,
-          name: 'phlebotomist',
-          displayName: 'Phlebotomist',
-          description: 'Blood collection specialist',
-          permissions: {"fields": {"financialData": {"edit": false, "view": false}, "medicalHistory": {"edit": false, "view": true}, "patientSensitiveInfo": {"edit": false, "view": false}}, "modules": ensureAllModulesView({"billing": {"edit": false, "view": true, "create": false, "delete": false}, "patients": {"edit": false, "view": true, "create": false, "delete": false}, "settings": {"edit": false, "view": true, "create": false, "delete": false}, "analytics": {"edit": false, "view": true, "create": false, "delete": false}, "appointments": {"edit": false, "view": true, "create": false, "delete": false}, "prescriptions": {"edit": false, "view": true, "create": false, "delete": false}, "medicalRecords": {"edit": false, "view": true, "create": false, "delete": false}, "userManagement": {"edit": false, "view": true, "create": false, "delete": false}})},
-          isSystem: true
-        },
-        {
-          organizationId: organization.id,
-          name: 'aesthetician',
-          displayName: 'Aesthetician',
-          description: 'Aesthetic treatment specialist',
-          permissions: {"fields": {"financialData": {"edit": false, "view": false}, "medicalHistory": {"edit": false, "view": true}, "patientSensitiveInfo": {"edit": false, "view": false}}, "modules": ensureAllModulesView({"billing": {"edit": false, "view": true, "create": false, "delete": false}, "patients": {"edit": true, "view": true, "create": false, "delete": false}, "settings": {"edit": false, "view": true, "create": false, "delete": false}, "analytics": {"edit": false, "view": true, "create": false, "delete": false}, "appointments": {"edit": true, "view": true, "create": true, "delete": false}, "prescriptions": {"edit": false, "view": true, "create": false, "delete": false}, "medicalRecords": {"edit": false, "view": true, "create": true, "delete": false}, "userManagement": {"edit": false, "view": true, "create": false, "delete": false}})},
-          isSystem: true
-        },
-        {
-          organizationId: organization.id,
-          name: 'optician',
-          displayName: 'Optician',
-          description: 'Eye care and vision specialist',
-          permissions: {"fields": {"financialData": {"edit": false, "view": true}, "medicalHistory": {"edit": true, "view": true}, "patientSensitiveInfo": {"edit": false, "view": true}}, "modules": ensureAllModulesView({"billing": {"edit": false, "view": true, "create": false, "delete": false}, "patients": {"edit": false, "view": true, "create": false, "delete": false}, "settings": {"edit": false, "view": true, "create": false, "delete": false}, "analytics": {"edit": false, "view": true, "create": false, "delete": false}, "appointments": {"edit": false, "view": true, "create": false, "delete": false}, "prescriptions": {"edit": false, "view": true, "create": false, "delete": false}, "medicalRecords": {"edit": false, "view": true, "create": false, "delete": false}, "userManagement": {"edit": false, "view": true, "create": false, "delete": false}})},
-          isSystem: true
-        },
-        {
-          organizationId: organization.id,
-          name: 'paramedic',
-          displayName: 'Paramedic',
-          description: 'Emergency medical services professional',
-          permissions: {"fields": {"financialData": {"edit": false, "view": false}, "medicalHistory": {"edit": true, "view": true}, "patientSensitiveInfo": {"edit": false, "view": true}}, "modules": ensureAllModulesView({"billing": {"edit": false, "view": true, "create": false, "delete": false}, "patients": {"edit": true, "view": true, "create": true, "delete": false}, "settings": {"edit": false, "view": true, "create": false, "delete": false}, "analytics": {"edit": false, "view": true, "create": false, "delete": false}, "appointments": {"edit": true, "view": true, "create": true, "delete": false}, "prescriptions": {"edit": false, "view": true, "create": false, "delete": false}, "medicalRecords": {"edit": true, "view": true, "create": true, "delete": false}, "userManagement": {"edit": false, "view": true, "create": false, "delete": false}})},
-          isSystem: true
-        },
-        {
-          organizationId: organization.id,
-          name: 'physiotherapist',
-          displayName: 'Physiotherapist',
-          description: 'Physical therapy specialist',
-          permissions: {"fields": {"financialData": {"edit": false, "view": false}, "medicalHistory": {"edit": true, "view": true}, "patientSensitiveInfo": {"edit": false, "view": true}}, "modules": ensureAllModulesView({"billing": {"edit": false, "view": true, "create": false, "delete": false}, "patients": {"edit": true, "view": true, "create": false, "delete": false}, "settings": {"edit": false, "view": true, "create": false, "delete": false}, "analytics": {"edit": false, "view": true, "create": false, "delete": false}, "appointments": {"edit": true, "view": true, "create": true, "delete": false}, "prescriptions": {"edit": false, "view": true, "create": false, "delete": false}, "medicalRecords": {"edit": true, "view": true, "create": true, "delete": false}, "userManagement": {"edit": false, "view": true, "create": false, "delete": false}})},
-          isSystem: true
-        },
-        {
-          organizationId: organization.id,
-          name: 'sample_taker',
-          displayName: 'Sample Taker',
-          description: 'Medical sample collection specialist',
-          permissions: {"fields": {}, "modules": ensureAllModulesView({"dashboard": {"edit": false, "view": true, "create": false, "delete": false}})},
-          isSystem: true
-        },
-        {
-          organizationId: organization.id,
-          name: 'other',
-          displayName: 'Other',
-          description: 'Generic role for other healthcare professionals',
-          permissions: {"fields": {"financialData": {"edit": false, "view": false}, "medicalHistory": {"edit": false, "view": true}, "patientSensitiveInfo": {"edit": false, "view": false}}, "modules": ensureAllModulesView({"billing": {"edit": false, "view": true, "create": false, "delete": false}, "patients": {"edit": false, "view": true, "create": false, "delete": false}, "settings": {"edit": false, "view": true, "create": false, "delete": false}, "analytics": {"edit": false, "view": true, "create": false, "delete": false}, "appointments": {"edit": true, "view": true, "create": true, "delete": false}, "prescriptions": {"edit": false, "view": true, "create": false, "delete": false}, "medicalRecords": {"edit": false, "view": true, "create": false, "delete": false}, "userManagement": {"edit": false, "view": true, "create": false, "delete": false}})},
-          isSystem: true
-        }
-      ];
-
-      await db.insert(roles).values(defaultRoles);
-      console.log(`✅ [CUSTOMER-CREATE] Created ${defaultRoles.length} default roles for organization`);
+      const { ensureSystemRolesForOrganization } = await import(
+        "./default-system-roles.js"
+      );
+      const roleResult = await ensureSystemRolesForOrganization(organization.id);
+      console.log(
+        `✅ [CUSTOMER-CREATE] System roles ready (${roleResult.created} created, ${roleResult.existing} existing)`,
+      );
 
       // Generate temporary password for admin user
       const crypto = await import('crypto');

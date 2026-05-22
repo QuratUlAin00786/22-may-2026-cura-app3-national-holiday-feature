@@ -213,6 +213,10 @@ interface PatientListProps {
   viewMode?: "grid" | "list";
   canEditPatient?: boolean;
   canDeletePatient?: boolean;
+  listPage?: number;
+  listPageSize?: number;
+  onListPageChange?: (page: number) => void;
+  onListPaginationInfo?: (info: { totalRows: number; totalPages: number }) => void;
 }
 
 interface PatientDetailsModalProps {
@@ -2285,7 +2289,17 @@ function PatientDetailsModal({
   );
 }
 
-export function PatientList({ onSelectPatient, genderFilter = null, viewMode = "grid", canEditPatient = true, canDeletePatient = true }: PatientListProps = {}) {
+export function PatientList({
+  onSelectPatient,
+  genderFilter = null,
+  viewMode = "grid",
+  canEditPatient = true,
+  canDeletePatient = true,
+  listPage,
+  listPageSize,
+  onListPageChange,
+  onListPaginationInfo,
+}: PatientListProps = {}) {
   const [, setLocation] = useLocation();
   const { toast } = useToast();
   const { user, loading: authLoading } = useAuth();
@@ -2798,17 +2812,6 @@ export function PatientList({ onSelectPatient, genderFilter = null, viewMode = "
     setLocation(`/${subdomain}/calendar?patientId=${patient.id}`);
   };
 
-  if (error) {
-    console.error("Patient list error:", error);
-    return (
-      <div className="text-center py-8">
-        <AlertTriangle className="h-12 w-12 text-red-500 mx-auto mb-4" />
-        <p className="text-red-600">Failed to load patients</p>
-        <p className="text-sm text-gray-500 mt-2">{error.message}</p>
-      </div>
-    );
-  }
-
   // Check if any filters are actually applied (not just default values)
   const hasActiveFilters =
     searchQuery ||
@@ -2877,6 +2880,47 @@ export function PatientList({ onSelectPatient, genderFilter = null, viewMode = "
 
     return groups;
   })();
+
+  const listRows = patientGroups.flatMap(({ main, relatives }) => [
+    { patient: main, isChild: false },
+    ...relatives.map((p) => ({ patient: p, isChild: true })),
+  ]);
+
+  const listPaginationEnabled =
+    viewMode === "list" &&
+    listPage !== undefined &&
+    listPageSize !== undefined &&
+    listPageSize > 0;
+
+  const listTotalRows = listRows.length;
+  const listTotalPages = listPaginationEnabled
+    ? Math.max(1, Math.ceil(listTotalRows / listPageSize))
+    : 1;
+
+  const paginatedListRows = listPaginationEnabled
+    ? listRows.slice((listPage - 1) * listPageSize, listPage * listPageSize)
+    : listRows;
+
+  useEffect(() => {
+    if (!onListPaginationInfo) return;
+    onListPaginationInfo({ totalRows: listTotalRows, totalPages: listTotalPages });
+  }, [listTotalRows, listTotalPages, onListPaginationInfo]);
+
+  useEffect(() => {
+    if (!onListPageChange) return;
+    onListPageChange(1);
+  }, [searchQuery, searchFilters, genderFilter, onListPageChange]);
+
+  if (error) {
+    console.error("Patient list error:", error);
+    return (
+      <div className="text-center py-8">
+        <AlertTriangle className="h-12 w-12 text-red-500 mx-auto mb-4" />
+        <p className="text-red-600">Failed to load patients</p>
+        <p className="text-sm text-gray-500 mt-2">{error.message}</p>
+      </div>
+    );
+  }
 
   return (
     <div className="space-y-4">
@@ -3060,13 +3104,7 @@ export function PatientList({ onSelectPatient, genderFilter = null, viewMode = "
                 </tr>
               </thead>
               <tbody className="divide-y divide-gray-200 dark:divide-gray-700">
-                {patientGroups.flatMap(({ main, relatives }) => {
-                  const rows = [
-                    { patient: main, isChild: false },
-                    ...relatives.map((p) => ({ patient: p, isChild: true })),
-                  ];
-
-                  return rows.map(({ patient, isChild }) => (
+                {paginatedListRows.map(({ patient, isChild }) => (
                     <tr 
                       key={patient.id} 
                       className={`transition-colors ${isChild ? "bg-gray-50/40 dark:bg-gray-900/20" : ""} hover:bg-gray-50 dark:hover:bg-gray-900`}
@@ -3276,8 +3314,7 @@ export function PatientList({ onSelectPatient, genderFilter = null, viewMode = "
                       </div>
                     </td>
                   </tr>
-                  ));
-                })}
+                ))}
               </tbody>
             </table>
           </div>

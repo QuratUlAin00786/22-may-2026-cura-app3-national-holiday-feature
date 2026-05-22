@@ -1,4 +1,4 @@
-import React, { useState } from "react";
+import React, { useState, useMemo } from "react";
 import { useQuery, useMutation } from "@tanstack/react-query";
 import { useLocation } from "wouter";
 import { useForm } from "react-hook-form";
@@ -17,7 +17,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Command, CommandEmpty, CommandGroup, CommandInput, CommandItem, CommandList } from "@/components/ui/command";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
-import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger } from "@/components/ui/dialog";
+import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle, DialogTrigger } from "@/components/ui/dialog";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Form, FormControl, FormField, FormItem, FormLabel, FormMessage } from "@/components/ui/form";
 import { Switch } from "@/components/ui/switch";
@@ -60,7 +60,7 @@ import jsPDF from "jspdf";
 // Use a focused schema for the insight creation form
 const createInsightSchema = z
   .object({
-  patientId: z.number().optional(),
+  patientId: z.coerce.number().int().positive().optional(),
   type: z.enum([
     "risk_alert",
     "drug_interaction",
@@ -71,13 +71,19 @@ const createInsightSchema = z
   description: z.string().min(1),
   severity: z.enum(["low", "medium", "high", "critical"]),
   actionRequired: z.boolean(),
-  confidence: z.string().regex(/^(0(\.\d+)?|1(\.0+)?)$/, "Confidence must be between 0 and 1"),
+  confidence: z
+    .union([z.string(), z.number()])
+    .transform((v) => {
+      const n = typeof v === "number" ? v : parseFloat(String(v ?? "").trim());
+      if (!Number.isFinite(n)) return "0.80";
+      const c = Math.max(0, Math.min(1, n));
+      return c.toFixed(2);
+    }),
   symptoms: z.string().optional().nullable(),
   history: z.string().optional().nullable(),
-  status: z.string().default("active"),
-  aiStatus: z.string().default("pending"),
-  })
-  .passthrough();
+  status: z.string().max(20).default("active"),
+  aiStatus: z.string().max(20).default("pending"),
+  });
 
 type CreateInsightForm = z.infer<typeof createInsightSchema>;
 
@@ -139,7 +145,6 @@ export default function ClinicalDecisionSupport() {
   const [selectedGuideline, setSelectedGuideline] = useState<any>(null);
   const [guidelineViewOpen, setGuidelineViewOpen] = useState(false);
   const [patientSearchOpen, setPatientSearchOpen] = useState(false);
-  const [patientSearch, setPatientSearch] = useState<string>("");
   const [createInsightOpen, setCreateInsightOpen] = useState(false);
   const [symptoms, setSymptoms] = useState<string>("");
   const [history, setHistory] = useState<string>("");
@@ -196,7 +201,6 @@ export default function ClinicalDecisionSupport() {
       actionRequired: false,
       confidence: "0.8", // String as per database schema
       patientId: undefined, // Required field for form validation
-      metadata: {},
       status: "active",
       aiStatus: "pending"
     }
@@ -220,14 +224,58 @@ export default function ClinicalDecisionSupport() {
     staleTime: 30000
   });
 
-  // Filter patients based on search
-  const filteredPatients = patients.filter((patient: any) => {
-    const fullName = `${patient.firstName} ${patient.lastName}`.toLowerCase();
-    const patientId = patient.patientId?.toLowerCase() || "";
-    const email = patient.email?.toLowerCase() || "";
-    const searchTerm = patientSearch.toLowerCase();
-    return fullName.includes(searchTerm) || patientId.includes(searchTerm) || email.includes(searchTerm);
-  });
+  const patientRelationRank = (relation?: string | null) => {
+    if (!relation) return 50;
+    const r = String(relation).toLowerCase();
+    if (r === "self") return 0;
+    if (r === "spouse") return 10;
+    if (r === "father") return 20;
+    if (r === "mother") return 21;
+    if (r === "son") return 30;
+    if (r === "daughter") return 31;
+    if (r === "dependent child") return 32;
+    if (r === "other") return 40;
+    return 45;
+  };
+
+  const patientDropdownGroups = useMemo(() => {
+    if (!Array.isArray(patients) || patients.length === 0) return [];
+
+    const map = new Map<number | string, any[]>();
+    for (const p of patients) {
+      const key = p?.userId ?? `no-user-${p?.id ?? Math.random()}`;
+      const list = map.get(key) ?? [];
+      list.push(p);
+      map.set(key, list);
+    }
+
+    const groups = Array.from(map.values()).map((members) => {
+      const sorted = [...members].sort((a, b) => {
+        const rr = patientRelationRank(a?.relation) - patientRelationRank(b?.relation);
+        if (rr !== 0) return rr;
+        const na = `${a?.firstName ?? ""} ${a?.lastName ?? ""}`.trim().toLowerCase();
+        const nb = `${b?.firstName ?? ""} ${b?.lastName ?? ""}`.trim().toLowerCase();
+        return na.localeCompare(nb);
+      });
+
+      const main =
+        sorted.find((m) => String(m?.relation ?? "").trim().toLowerCase() === "self") ??
+        sorted[0];
+      const relatives = sorted.filter((m) => m !== main);
+      return { main, relatives };
+    });
+
+    groups.sort((a, b) => {
+      const na = `${a.main?.firstName ?? ""} ${a.main?.lastName ?? ""}`.trim().toLowerCase();
+      const nb = `${b.main?.firstName ?? ""} ${b.main?.lastName ?? ""}`.trim().toLowerCase();
+      return na.localeCompare(nb);
+    });
+
+    return groups;
+  }, [patients]);
+
+  const formatPatientDropdownLabel = (patient: any) =>
+    `${patient?.firstName ?? ""} ${patient?.lastName ?? ""}`.trim();
 
   // Get selected patient name for display
   const selectedPatientData = patients.find((p: any) => p.id.toString() === selectedPatient);
@@ -591,7 +639,20 @@ export default function ClinicalDecisionSupport() {
 
   const createInsightMutation = useMutation({
     mutationFn: async (data: CreateInsightForm) => {
-      const response = await apiRequest("POST", `/api/ai-insights`, data);
+      const payload = {
+        patientId: data.patientId,
+        type: data.type,
+        title: data.title.trim(),
+        description: data.description.trim(),
+        severity: data.severity,
+        actionRequired: data.actionRequired,
+        confidence: data.confidence,
+        symptoms: data.symptoms?.trim() || undefined,
+        history: data.history?.trim() || undefined,
+        status: data.status,
+        aiStatus: data.aiStatus,
+      };
+      const response = await apiRequest("POST", `/api/ai-insights`, payload);
       return response.json();
     },
     onSuccess: (data) => {
@@ -913,7 +974,13 @@ export default function ClinicalDecisionSupport() {
       
   <div className="w-full flex-1 overflow-auto px-3 sm:px-4 lg:px-5 py-4 space-y-4">
         <div className="flex flex-wrap justify-end gap-2 sm:gap-3 mb-4">
-          <Dialog open={createInsightOpen} onOpenChange={setCreateInsightOpen}>
+          <Dialog
+            open={createInsightOpen}
+            onOpenChange={(open) => {
+              setCreateInsightOpen(open);
+              if (!open) setPatientSearchOpen(false);
+            }}
+          >
             <DialogTrigger asChild>
               <Button data-testid="button-create-insight">
                 <Plus className="w-4 h-4 mr-2" />
@@ -923,6 +990,9 @@ export default function ClinicalDecisionSupport() {
             <DialogContent className="max-w-2xl max-h-[90vh] overflow-y-auto">
               <DialogHeader>
                 <DialogTitle>Create New AI Insight</DialogTitle>
+                <DialogDescription>
+                  Select a patient and enter clinical details to generate a structured AI insight.
+                </DialogDescription>
               </DialogHeader>
               <Form {...form}>
                 <form onSubmit={form.handleSubmit((data) => createInsightMutation.mutate(data))} className="space-y-4">
@@ -933,53 +1003,96 @@ export default function ClinicalDecisionSupport() {
                       render={({ field }) => (
                         <FormItem>
                           <FormLabel>Patient</FormLabel>
-                          <Select open={patientSearchOpen} onOpenChange={setPatientSearchOpen} 
-                                  value={field.value?.toString()} 
-                                  onValueChange={(value) => field.onChange(value ? parseInt(value) : undefined)}>
-                            <FormControl>
-                              <SelectTrigger data-testid="select-patient">
-                                <SelectValue placeholder="Select patient">
-                                  {(() => {
-                                    const selectedPatient = patients.find((p: any) => p.id === field.value);
-                                    if (!selectedPatient) return "Select patient";
-                                    return selectedPatient.email
-                                      ? `${selectedPatient.firstName} ${selectedPatient.lastName} (${selectedPatient.email})`
-                                      : `${selectedPatient.firstName} ${selectedPatient.lastName}`;
-                                  })()}
-                                </SelectValue>
-                              </SelectTrigger>
-                            </FormControl>
-                            <SelectContent>
-                              <div className="p-2">
-                                <Input
+                          <Popover open={patientSearchOpen} onOpenChange={setPatientSearchOpen}>
+                            <PopoverTrigger asChild>
+                              <FormControl>
+                                <Button
+                                  type="button"
+                                  variant="outline"
+                                  role="combobox"
+                                  aria-expanded={patientSearchOpen}
+                                  data-testid="select-patient"
+                                  className="w-full justify-between h-auto min-h-10 py-2 font-normal"
+                                >
+                                  <span className="flex-1 min-w-0 text-left truncate">
+                                    {field.value
+                                      ? (() => {
+                                          const selectedPatient = patients.find(
+                                            (p: any) => p.id === field.value,
+                                          );
+                                          if (!selectedPatient) return "Select patient";
+                                          return formatPatientDropdownLabel(selectedPatient);
+                                        })()
+                                      : "Select patient"}
+                                  </span>
+                                  <ChevronsUpDown className="ml-2 h-4 w-4 shrink-0 opacity-50" />
+                                </Button>
+                              </FormControl>
+                            </PopoverTrigger>
+                            <PopoverContent
+                              className="w-[var(--radix-popover-trigger-width)] min-w-[280px] p-0"
+                              align="start"
+                            >
+                              <Command>
+                                <CommandInput
                                   placeholder="Search patients..."
-                                  value={patientSearch}
-                                  onChange={(e) => setPatientSearch(e.target.value)}
-                                  className="mb-2"
+                                  className="h-9"
                                   data-testid="input-patient-search"
                                 />
-                              </div>
-                              {patientsLoading ? (
-                                <SelectItem value="loading" disabled>Loading patients...</SelectItem>
-                              ) : (
-                                filteredPatients.map((patient: any) => (
-                                  <SelectItem key={patient.id} value={patient.id.toString()}>
-                                    <div className="flex flex-col">
-                                      <span>{patient.firstName} {patient.lastName}</span>
-                                      <div className="flex items-center gap-2 text-xs text-gray-500 dark:text-gray-400">
-                                        {patient.email && (
-                                          <span>{patient.email}</span>
-                                        )}
-                                        {patient.patientId && (
-                                          <span>({patient.patientId})</span>
-                                        )}
-                                      </div>
-                                    </div>
-                                  </SelectItem>
-                                ))
-                              )}
-                            </SelectContent>
-                          </Select>
+                                <CommandList>
+                                  <CommandEmpty>No patient found.</CommandEmpty>
+                                  <CommandGroup>
+                                    {patientsLoading ? (
+                                      <CommandItem disabled>Loading patients...</CommandItem>
+                                    ) : patientDropdownGroups.length > 0 ? (
+                                      patientDropdownGroups.flatMap(({ main, relatives }) => {
+                                        const rows = [
+                                          { patient: main, isChild: false },
+                                          ...relatives.map((p: any) => ({
+                                            patient: p,
+                                            isChild: true,
+                                          })),
+                                        ];
+                                        return rows.map(({ patient, isChild }) => (
+                                          <CommandItem
+                                            key={patient.id}
+                                            value={`${patient.firstName} ${patient.lastName} ${patient.patientId ?? ""} ${patient.email ?? ""}`}
+                                            onSelect={() => {
+                                              field.onChange(patient.id);
+                                              setPatientSearchOpen(false);
+                                            }}
+                                            className="py-2"
+                                          >
+                                            <Check
+                                              className={`mr-2 h-4 w-4 shrink-0 ${
+                                                field.value === patient.id
+                                                  ? "opacity-100"
+                                                  : "opacity-0"
+                                              }`}
+                                            />
+                                            <div className="flex flex-col min-w-0">
+                                              <span className={isChild ? "pl-1" : ""}>
+                                                {isChild ? "↳ " : ""}
+                                                {formatPatientDropdownLabel(patient)}
+                                              </span>
+                                              <div className="flex flex-wrap items-center gap-x-2 text-xs text-gray-500 dark:text-gray-400">
+                                                {patient.email && <span>{patient.email}</span>}
+                                                {patient.patientId && (
+                                                  <span>({patient.patientId})</span>
+                                                )}
+                                              </div>
+                                            </div>
+                                          </CommandItem>
+                                        ));
+                                      })
+                                    ) : (
+                                      <CommandItem disabled>No patients available</CommandItem>
+                                    )}
+                                  </CommandGroup>
+                                </CommandList>
+                              </Command>
+                            </PopoverContent>
+                          </Popover>
                           <FormMessage />
                         </FormItem>
                       )}
@@ -991,7 +1104,7 @@ export default function ClinicalDecisionSupport() {
                       render={({ field }) => (
                         <FormItem>
                           <FormLabel>Type</FormLabel>
-                          <Select onValueChange={field.onChange} defaultValue={field.value}>
+                          <Select onValueChange={field.onChange} value={field.value}>
                             <FormControl>
                               <SelectTrigger data-testid="select-type">
                                 <SelectValue placeholder="Select type" />
@@ -1050,7 +1163,7 @@ export default function ClinicalDecisionSupport() {
                       render={({ field }) => (
                         <FormItem>
                           <FormLabel>Severity</FormLabel>
-                          <Select onValueChange={field.onChange} defaultValue={field.value}>
+                          <Select onValueChange={field.onChange} value={field.value}>
                             <FormControl>
                               <SelectTrigger data-testid="select-severity">
                                 <SelectValue placeholder="Select severity" />

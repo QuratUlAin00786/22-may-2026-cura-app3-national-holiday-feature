@@ -17,6 +17,10 @@ import { format, isBefore, startOfDay, addMonths, isAfter } from "date-fns";
 import { useLocation } from "wouter";
 import { useMutation, useQueryClient, useQuery } from "@tanstack/react-query";
 import { useToast } from "@/hooks/use-toast";
+import {
+  useBookingHolidayCalendar,
+  BookingHolidayTimeSlotPanel,
+} from "@/hooks/use-booking-holiday-calendar";
 import { apiRequest } from "@/lib/queryClient";
 import { useAuth } from "@/hooks/use-auth";
 import { isDoctorLike } from "@/lib/role-utils";
@@ -1687,6 +1691,37 @@ const getAppointmentTypeLabel = (appointment: any): string => {
     return false;
   };
 
+  const scheduleBookingHoliday = useBookingHolidayCalendar({
+    enabled: showNewAppointmentModal,
+    selectedDate,
+    setSelectedDate,
+  });
+
+  const isSchedulePickerDateDisabled = useCallback(
+    (date: Date) => {
+      if (isBefore(startOfDay(date), startOfDay(new Date()))) return true;
+      if (isAfter(date, addMonths(new Date(), 3))) return true;
+      if (selectedProviderId && !hasShiftsOnDate(date)) return true;
+      return scheduleBookingHoliday.isDateHolidayBlocked(date);
+    },
+    [selectedProviderId, scheduleBookingHoliday.isDateHolidayBlocked],
+  );
+
+  const filterHolidayCalendar = useBookingHolidayCalendar({
+    enabled: showFilterPanel,
+    selectedDate: filterDate,
+    setSelectedDate: setFilterDate,
+  });
+
+  const isFilterDateDisabled = useCallback(
+    (date: Date) => {
+      if (isBefore(startOfDay(date), startOfDay(new Date()))) return true;
+      if (isAfter(date, addMonths(new Date(), 3))) return true;
+      return false;
+    },
+    [],
+  );
+
   // Generate time slots based on shifts for the selected provider on the selected date
   // Uses two-tier system: custom shifts (staff_shifts) take priority, then default shifts (doctor_default_shifts)
   const timeSlots = useMemo(() => {
@@ -2398,11 +2433,13 @@ const getAppointmentTypeLabel = (appointment: any): string => {
   // Auto-select current date and first available time slot for doctors
   useEffect(() => {
     if (showNewAppointmentModal && isDoctorLike(user?.role) && !selectedDate) {
-      const today = new Date();
-      setSelectedDate(today);
-      console.log('📅 DOCTOR AUTO-SELECT: Set current date:', format(today, 'yyyy-MM-dd'));
+      const today = startOfDay(new Date());
+      if (!scheduleBookingHoliday.isDateHolidayBlocked(today)) {
+        setSelectedDate(today);
+        console.log('📅 DOCTOR AUTO-SELECT: Set current date:', format(today, 'yyyy-MM-dd'));
+      }
     }
-  }, [showNewAppointmentModal, user, selectedDate]);
+  }, [showNewAppointmentModal, user, selectedDate, scheduleBookingHoliday.isDateHolidayBlocked]);
 
   // Auto-select first available time slot when time slots are loaded for doctors
   useEffect(() => {
@@ -2523,6 +2560,7 @@ const getAppointmentTypeLabel = (appointment: any): string => {
       
       // Reset forms
       setShowNewAppointmentModal(false);
+      scheduleBookingHoliday.resetHolidayState();
       setSelectedSpecialty("");
       setSelectedSubSpecialty("");
       setFilteredDoctors([]);
@@ -2729,6 +2767,7 @@ const getAppointmentTypeLabel = (appointment: any): string => {
       queryClient.invalidateQueries({ queryKey: ["/api/appointments", "doctor", user?.id] });
       setShowSuccessModal(true);
       setShowNewAppointmentModal(false);
+      scheduleBookingHoliday.resetHolidayState();
       setSelectedDoctor(null);
       setSelectedDate(undefined);
       setSelectedTimeSlot("");
@@ -3349,16 +3388,17 @@ const getAppointmentTypeLabel = (appointment: any): string => {
                             <CalendarComponent
                               mode="single"
                               selected={filterDate}
-                              onSelect={setFilterDate}
-                              disabled={(date) => {
-                                // Disable past dates
-                                if (isBefore(date, startOfDay(new Date()))) return true;
-                                // Disable dates beyond 3 months
-                                if (isAfter(date, addMonths(new Date(), 3))) return true;
-                                return false;
+                              onSelect={(date) => {
+                                setFilterDate(date);
+                                if (date && filterHolidayCalendar.needsHolidayAcknowledgement) {
+                                  filterHolidayCalendar.setHolidayAcknowledged(false);
+                                }
                               }}
+                              disabled={isFilterDateDisabled}
                               initialFocus
+                              {...filterHolidayCalendar.calendarProps}
                             />
+                            <div className="px-3 pb-2">{filterHolidayCalendar.legend}</div>
                           </PopoverContent>
                         </Popover>
                         <Button
@@ -3524,16 +3564,17 @@ const getAppointmentTypeLabel = (appointment: any): string => {
                             <CalendarComponent
                               mode="single"
                               selected={filterDate}
-                              onSelect={setFilterDate}
-                              disabled={(date) => {
-                                // Disable past dates
-                                if (isBefore(date, startOfDay(new Date()))) return true;
-                                // Disable dates beyond 3 months
-                                if (isAfter(date, addMonths(new Date(), 3))) return true;
-                                return false;
+                              onSelect={(date) => {
+                                setFilterDate(date);
+                                if (date && filterHolidayCalendar.needsHolidayAcknowledgement) {
+                                  filterHolidayCalendar.setHolidayAcknowledged(false);
+                                }
                               }}
+                              disabled={isFilterDateDisabled}
                               initialFocus
+                              {...filterHolidayCalendar.calendarProps}
                             />
+                            <div className="px-3 pb-2">{filterHolidayCalendar.legend}</div>
                           </PopoverContent>
                         </Popover>
                         <Button
@@ -3965,6 +4006,7 @@ const getAppointmentTypeLabel = (appointment: any): string => {
                     size="sm"
                     onClick={() => {
                       setShowNewAppointmentModal(false);
+                      scheduleBookingHoliday.resetHolidayState();
                       setSelectedSpecialty("");
                       setSelectedSubSpecialty("");
                       setFilteredDoctors([]);
@@ -4115,6 +4157,12 @@ const getAppointmentTypeLabel = (appointment: any): string => {
                                             setSelectedProviderId(provider.id.toString());
                                             setProviderError(""); // Clear error on selection
                                             setOpenProviderCombo(false);
+                                            if (!selectedDate) {
+                                              const today = startOfDay(new Date());
+                                              if (!scheduleBookingHoliday.isDateHolidayBlocked(today)) {
+                                                setSelectedDate(today);
+                                              }
+                                            }
                                           }}
                                         >
                                           <Check
@@ -4570,7 +4618,6 @@ const getAppointmentTypeLabel = (appointment: any): string => {
                           mode="single"
                           selected={selectedDate}
                           onSelect={(date) => {
-                            // Validate that role and provider are selected first
                             if (!selectedRole) {
                               setRoleError("please select Role first");
                               return;
@@ -4579,28 +4626,16 @@ const getAppointmentTypeLabel = (appointment: any): string => {
                               setProviderError("please select name first");
                               return;
                             }
-                            // Clear errors and set date if validation passes
                             setRoleError("");
                             setProviderError("");
-                            setSelectedDate(date);
+                            scheduleBookingHoliday.handleDateSelect(date);
                           }}
-                          disabled={(date) => {
-                            // Disable past dates (but allow today)
-                            if (isBefore(startOfDay(date), startOfDay(new Date()))) return true;
-                            
-                            // Disable dates beyond 3 months
-                            if (isAfter(date, addMonths(new Date(), 3))) return true;
-                            
-                            // Disable dates without shifts for selected provider
-                            if (selectedProviderId && !hasShiftsOnDate(date)) {
-                              return true;
-                            }
-                            
-                            return false;
-                          }}
+                          disabled={isSchedulePickerDateDisabled}
                           className="rounded-md border"
                           data-testid="calendar-date-picker"
+                          {...scheduleBookingHoliday.calendarProps}
                         />
+                        {scheduleBookingHoliday.legend}
                       </div>
 
                       {/* Column 2: Select Time Slot */}
@@ -4609,6 +4644,11 @@ const getAppointmentTypeLabel = (appointment: any): string => {
                           Select Time Slot
                         </Label>
                         {selectedProviderId && selectedDate ? (
+                          <BookingHolidayTimeSlotPanel
+                            selectedDate={selectedDate}
+                            bookingHoliday={scheduleBookingHoliday}
+                            emptyMessage="No available time slots for this date."
+                          >
                           <div 
                             key={`${selectedProviderId}-${format(selectedDate, 'yyyy-MM-dd')}`}
                             className="grid grid-cols-3 gap-2 max-h-60 overflow-y-auto"
@@ -4662,6 +4702,7 @@ const getAppointmentTypeLabel = (appointment: any): string => {
                               </div>
                             )}
                           </div>
+                          </BookingHolidayTimeSlotPanel>
                         ) : (
                           <div className="mt-2 p-3 bg-gray-50 border border-gray-200 rounded-md">
                             <p className="text-sm text-gray-600">
@@ -5189,24 +5230,13 @@ const getAppointmentTypeLabel = (appointment: any): string => {
                         <CalendarComponent
                           mode="single"
                           selected={selectedDate}
-                          onSelect={setSelectedDate}
-                          disabled={(date) => {
-                            // Disable past dates (but allow today)
-                            if (isBefore(startOfDay(date), startOfDay(new Date()))) return true;
-                            
-                            // Disable dates beyond 3 months
-                            if (isAfter(date, addMonths(new Date(), 3))) return true;
-                            
-                            // Disable dates without shifts for selected provider
-                            if (selectedProviderId && !hasShiftsOnDate(date)) {
-                              return true;
-                            }
-                            
-                            return false;
-                          }}
+                          onSelect={scheduleBookingHoliday.handleDateSelect}
+                          disabled={isSchedulePickerDateDisabled}
                           className="rounded-md border"
                           data-testid="calendar-date-picker"
+                          {...scheduleBookingHoliday.calendarProps}
                         />
+                        {scheduleBookingHoliday.legend}
                       </div>
 
                       {/* Column 2: Select Time Slot */}
@@ -5215,6 +5245,11 @@ const getAppointmentTypeLabel = (appointment: any): string => {
                           Select Time Slot
                         </Label>
                         {selectedProviderId && selectedDate ? (
+                          <BookingHolidayTimeSlotPanel
+                            selectedDate={selectedDate}
+                            bookingHoliday={scheduleBookingHoliday}
+                            emptyMessage="No available time slots for this date."
+                          >
                           <div 
                             key={`${selectedProviderId}-${format(selectedDate, 'yyyy-MM-dd')}`}
                             className="grid grid-cols-3 gap-2 max-h-60 overflow-y-auto"
@@ -5268,6 +5303,7 @@ const getAppointmentTypeLabel = (appointment: any): string => {
                               </div>
                             )}
                           </div>
+                          </BookingHolidayTimeSlotPanel>
                         ) : (
                     <Card className="mt-2 min-h-[300px]">
                       <CardContent className="p-4 h-full flex items-center justify-center">
@@ -5457,7 +5493,10 @@ const getAppointmentTypeLabel = (appointment: any): string => {
                                           setProviderError("");
                                           // Auto-set current date when doctor is selected for patient bookings (only if no date selected yet)
                                           if (user?.role === 'patient' && !selectedDate) {
-                                            setSelectedDate(new Date());
+                                            const today = startOfDay(new Date());
+                                            if (!scheduleBookingHoliday.isDateHolidayBlocked(today)) {
+                                              setSelectedDate(today);
+                                            }
                                           }
                                         }}
                                       >
@@ -5602,24 +5641,13 @@ const getAppointmentTypeLabel = (appointment: any): string => {
                         <CalendarComponent
                           mode="single"
                           selected={selectedDate}
-                          onSelect={setSelectedDate}
-                          disabled={(date) => {
-                            // Disable past dates (but allow today)
-                            if (isBefore(startOfDay(date), startOfDay(new Date()))) return true;
-                            
-                            // Disable dates beyond 3 months
-                            if (isAfter(date, addMonths(new Date(), 3))) return true;
-                            
-                            // Disable dates without shifts for selected provider
-                            if (selectedProviderId && !hasShiftsOnDate(date)) {
-                              return true;
-                            }
-                            
-                            return false;
-                          }}
+                          onSelect={scheduleBookingHoliday.handleDateSelect}
+                          disabled={isSchedulePickerDateDisabled}
                           className="rounded-md border"
                           data-testid="calendar-date-picker"
+                          {...scheduleBookingHoliday.calendarProps}
                         />
+                        {scheduleBookingHoliday.legend}
                       </div>
 
                       {/* Select Time Slot */}
@@ -5628,6 +5656,11 @@ const getAppointmentTypeLabel = (appointment: any): string => {
                           Select Time Slot
                         </Label>
                         {selectedProviderId && selectedDate ? (
+                          <BookingHolidayTimeSlotPanel
+                            selectedDate={selectedDate}
+                            bookingHoliday={scheduleBookingHoliday}
+                            emptyMessage="No available time slots for this date."
+                          >
                           <div 
                             key={`${selectedProviderId}-${format(selectedDate, 'yyyy-MM-dd')}`}
                             className="grid grid-cols-3 gap-2 max-h-60 overflow-y-auto"
@@ -5681,6 +5714,7 @@ const getAppointmentTypeLabel = (appointment: any): string => {
                               </div>
                             )}
                           </div>
+                          </BookingHolidayTimeSlotPanel>
                         ) : (
                           <div className="mt-2 p-3 bg-gray-50 border border-gray-200 rounded-md">
                             <p className="text-sm text-gray-600">
@@ -5705,6 +5739,7 @@ const getAppointmentTypeLabel = (appointment: any): string => {
                       variant="outline"
                       onClick={() => {
                         setShowNewAppointmentModal(false);
+                        scheduleBookingHoliday.resetHolidayState();
                         setSelectedSpecialty("");
                         setSelectedSubSpecialty("");
                         setFilteredDoctors([]);

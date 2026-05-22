@@ -867,6 +867,21 @@ function ViewClinicInfo({ user, onLoadHeader, onLoadFooter }: { user: any; onLoa
   );
 }
 
+/** `apiRequest` failures look like `400: {"error":"...","detail":"..."}`. */
+function parseApiFailurePayload(message: string): { error?: string; detail?: string } {
+  const m = /^(\d{3}):\s*([\s\S]+)$/.exec(message.trim());
+  if (!m) return {};
+  try {
+    const body = JSON.parse(m[2]) as { error?: string; detail?: string };
+    return {
+      error: typeof body?.error === "string" ? body.error : undefined,
+      detail: typeof body?.detail === "string" ? body.detail : undefined,
+    };
+  } catch {
+    return {};
+  }
+}
+
 export default function Forms() {
   const { currencySymbol } = useCurrency();
   const { user, logout } = useAuth();
@@ -2532,12 +2547,12 @@ Coverage Details: [Insurance Coverage]`;
       if (!selectedFormForShare) {
         throw new Error("Select a form first");
       }
-      const patientId = Number(selectedFormPatientId);
-      if (!patientId) {
+      const patientId = Number.parseInt(String(selectedFormPatientId), 10);
+      if (!Number.isFinite(patientId) || patientId <= 0) {
         throw new Error("Select a patient to share with");
       }
-      const patient = patientsFromTable.find((patient) => patient.id === patientId);
-      if (!patient?.email) {
+      const patient = patientsFromTable.find((patient) => Number(patient.id) === patientId);
+      if (!getPatientCanReceiveFormShare(patient)) {
         throw new Error("Patient must have an email address before sharing");
       }
 
@@ -2579,21 +2594,35 @@ Coverage Details: [Insurance Coverage]`;
       let errorMessage = "Unable to share the form. Please try again.";
 
       if (error instanceof Error) {
-        const errorText = error.message;
+        const { error: primary, detail } = parseApiFailurePayload(error.message);
+        const haystack = `${primary ?? ""} ${detail ?? ""} ${error.message}`;
 
-        // Check for foreign key constraint error
-        if (errorText.includes("foreign key constraint") && errorText.includes("patient_id")) {
-          errorMessage = "The selected patient is not found in the system. Please select a different patient or contact support if this issue persists.";
-        } else if (errorText.includes("404") || errorText.includes("not found")) {
+        if (primary?.includes("Could not link this patient")) {
+          errorMessage = primary;
+        } else if (primary?.includes("Patient with ID") && primary.includes("not found")) {
           errorMessage = "The selected patient could not be found. Please select a different patient.";
-        } else if (errorText.includes("500")) {
-          // Try to parse JSON error from 500 response
+        } else if (
+          haystack.includes("foreign key constraint") &&
+          haystack.includes("patient_id") &&
+          !primary?.includes("Could not link this patient")
+        ) {
+          errorMessage =
+            "The selected patient is not found in the system. Please select a different patient or contact support if this issue persists.";
+        } else if (error.message.includes("404") || (primary && primary.toLowerCase().includes("not found"))) {
+          errorMessage = primary?.includes("Patient with ID")
+            ? "The selected patient could not be found. Please select a different patient."
+            : primary || "The selected patient could not be found. Please select a different patient.";
+        } else if (error.message.includes("500")) {
           try {
-            const jsonMatch = errorText.match(/\{.*\}/);
+            const jsonMatch = error.message.match(/\{[\s\S]*\}/);
             if (jsonMatch) {
-              const errorObj = JSON.parse(jsonMatch[0]);
-              if (errorObj.error?.includes("foreign key constraint") && errorObj.error?.includes("patient_id")) {
-                errorMessage = "The selected patient is not found in the system. Please select a different patient or contact support if this issue persists.";
+              const errorObj = JSON.parse(jsonMatch[0]) as { error?: string };
+              if (
+                errorObj.error?.includes("foreign key constraint") &&
+                errorObj.error?.includes("patient_id")
+              ) {
+                errorMessage =
+                  "The selected patient is not found in the system. Please select a different patient or contact support if this issue persists.";
               } else {
                 errorMessage = errorObj.error || "An error occurred while sharing the form. Please try again.";
               }
@@ -2603,8 +2632,10 @@ Coverage Details: [Insurance Coverage]`;
           } catch {
             errorMessage = "An error occurred while sharing the form. Please try again.";
           }
+        } else if (primary) {
+          errorMessage = primary;
         } else {
-          errorMessage = errorText;
+          errorMessage = error.message;
         }
       }
 
@@ -2618,8 +2649,8 @@ Coverage Details: [Insurance Coverage]`;
       if (!selectedFormForShare) {
         throw new Error("Select a form first");
       }
-      const patientId = Number(selectedFormPatientId);
-      if (!patientId) {
+      const patientId = Number.parseInt(String(selectedFormPatientId), 10);
+      if (!Number.isFinite(patientId) || patientId <= 0) {
         throw new Error("Select a patient to preview email for");
       }
 
@@ -2720,6 +2751,31 @@ Coverage Details: [Insurance Coverage]`;
   const selectedPatient = useMemo(() => {
     return patientsFromTable.find((patient) => String(patient.id) === selectedFormPatientId);
   }, [patientsFromTable, selectedFormPatientId]);
+
+  /** Plaintext patient email, linked user inbox from API (`linkedUserEmail`), or empty when still unknown. */
+  const getPatientShareEmailHint = (p: (typeof patientsFromTable)[number] | undefined): string => {
+    if (!p) return "";
+    const e = typeof p.email === "string" ? p.email.trim() : "";
+    if (e.includes("@") && !e.startsWith("{")) return e;
+    const linked = (p as { linkedUserEmail?: string }).linkedUserEmail?.trim();
+    if (linked && linked.includes("@")) return linked;
+    return "";
+  };
+
+  const getPatientCanReceiveFormShare = (p: (typeof patientsFromTable)[number] | undefined) => {
+    if (!p) return false;
+    if (getPatientShareEmailHint(p)) return true;
+    return p.userId != null;
+  };
+
+  const shareRecipientPreviewLabel = useMemo(() => {
+    const p = selectedPatient;
+    if (!p) return "the patient";
+    const hint = getPatientShareEmailHint(p);
+    if (hint) return hint;
+    if (p.userId != null) return "the linked account email on file";
+    return "the patient";
+  }, [selectedPatient]);
   const {
     data: shareLinks = [],
     refetch: refetchShareLinks,
@@ -7785,14 +7841,26 @@ Coverage Details: [Insurance Coverage]`;
                     ) : (
                       patientsFromTable.map((patient) => (
                         <SelectItem key={patient.id} value={String(patient.id)}>
-                          {patient.firstName} {patient.lastName} ({patient.email || "no email"})
+                          {(() => {
+                            const pemail = typeof patient.email === "string" ? patient.email.trim() : "";
+                            const linked = (patient as { linkedUserEmail?: string }).linkedUserEmail?.trim();
+                            const emailPart =
+                              pemail.includes("@") && !pemail.startsWith("{")
+                                ? pemail
+                                : linked && linked.includes("@")
+                                  ? linked
+                                  : patient.userId != null
+                                    ? "linked account"
+                                    : "no email";
+                            return `${patient.firstName} ${patient.lastName} (${emailPart})`;
+                          })()}
                         </SelectItem>
                       ))
                     )}
                   </SelectContent>
                 </Select>
                 <p
-                  className={`text-xs ${selectedFormPatientId && selectedPatient?.email
+                  className={`text-xs ${selectedFormPatientId && getPatientCanReceiveFormShare(selectedPatient)
                     ? "text-emerald-600"
                     : selectedFormPatientId
                       ? "text-orange-500"
@@ -7800,8 +7868,14 @@ Coverage Details: [Insurance Coverage]`;
                     }`}
                 >
                   {selectedFormPatientId
-                    ? selectedPatient?.email
-                      ? `Will email ${selectedPatient.email}`
+                    ? getPatientCanReceiveFormShare(selectedPatient)
+                      ? (() => {
+                          const hint = getPatientShareEmailHint(selectedPatient);
+                          if (hint) {
+                            return `Will email ${hint}`;
+                          }
+                          return "Will email the linked account address on file for this patient.";
+                        })()
                       : "This patient does not have an email on file."
                     : "Select a patient to see their contact email."}
                 </p>
@@ -7817,7 +7891,7 @@ Coverage Details: [Insurance Coverage]`;
                 <Button
                   onClick={() => previewEmailMutation.mutate()}
                   variant="outline"
-                  disabled={previewEmailMutation.isPending || !selectedFormPatientId || !selectedPatient?.email || !formSharedSuccessfully}
+                  disabled={previewEmailMutation.isPending || !selectedFormPatientId || !getPatientCanReceiveFormShare(selectedPatient) || !formSharedSuccessfully}
                 >
                   {previewEmailMutation.isPending ? "Generating…" : "Preview email"}
                 </Button>
@@ -7826,7 +7900,7 @@ Coverage Details: [Insurance Coverage]`;
                   disabled={
                     shareFormMutation.isPending ||
                     !selectedFormPatientId ||
-                    !selectedPatient?.email
+                    !getPatientCanReceiveFormShare(selectedPatient)
                   }
                 >
                   {shareFormMutation.isPending ? "Sending…" : "Send form"}
@@ -8069,7 +8143,7 @@ Coverage Details: [Insurance Coverage]`;
             </DialogHeader>
             <div className="space-y-4">
               <p className="text-sm text-muted-foreground">
-                This is the exact email that will be sent to {selectedPatient?.email} once shared.
+                This is the exact email that will be sent to {shareRecipientPreviewLabel} once shared.
               </p>
               <Card className="border border-dashed border-slate-200 dark:border-slate-700 shadow-none">
                 <CardContent className="p-4">

@@ -9,9 +9,30 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Command, CommandEmpty, CommandGroup, CommandInput, CommandItem, CommandList } from "@/components/ui/command";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
-import { Calendar, Clock, User, Video, Stethoscope, Plus, ArrowRight, Edit, Search, X, Filter, FileText, MapPin, ChevronsUpDown, ChevronLeft, ChevronRight, Check, Loader2, CheckCircle } from "lucide-react";
+import { Calendar as CalendarComponent } from "@/components/ui/calendar";
+import { Calendar, Clock, User, Video, Stethoscope, Plus, ArrowRight, Edit, Search, X, Filter, FileText, MapPin, ChevronsUpDown, ChevronLeft, ChevronRight, Check, Loader2, CheckCircle, AlertTriangle } from "lucide-react";
 import { AppointmentInvoiceInfo } from "./AppointmentInvoiceInfo";
-import { format, startOfWeek, endOfWeek, eachDayOfInterval, isSameDay, isToday, isPast, isFuture, parseISO } from "date-fns";
+import {
+  format,
+  startOfWeek,
+  endOfWeek,
+  startOfMonth,
+  endOfMonth,
+  eachDayOfInterval,
+  isSameDay,
+  isToday,
+  isPast,
+  isFuture,
+  parseISO,
+  addMonths,
+  subMonths,
+} from "date-fns";
+import {
+  useBookingHolidayCalendar,
+  BookingHolidayTimeSlotPanel,
+  type BookingHolidayStatus,
+} from "@/hooks/use-booking-holiday-calendar";
+import { cn } from "@/lib/utils";
 import { useQuery, useMutation } from "@tanstack/react-query";
 import { apiRequest, queryClient } from "@/lib/queryClient";
 import { useAuth } from "@/hooks/use-auth";
@@ -155,7 +176,7 @@ function PatientFaceAvatar({
 
 export default function DoctorAppointments({ onNewAppointment }: { onNewAppointment?: () => void }) {
   const [selectedDate, setSelectedDate] = useState(new Date());
-  const [viewMode, setViewMode] = useState<"week" | "day">("week");
+  const [viewMode, setViewMode] = useState<"week" | "day" | "month">("week");
   const [appointmentFilter, setAppointmentFilter] = useState<"all" | "upcoming" | "past">("upcoming");
   /** Default: only scheduled, confirmed, and in-progress (active work). */
   const [listStatusFilter, setListStatusFilter] = useState<ListStatusFilter>("active");
@@ -177,6 +198,10 @@ export default function DoctorAppointments({ onNewAppointment }: { onNewAppointm
   
   // Success modal state
   const [showSuccessModal, setShowSuccessModal] = useState(false);
+  const [weekHolidayNotice, setWeekHolidayNotice] = useState<{
+    day: Date;
+    status: BookingHolidayStatus;
+  } | null>(null);
   const [successMessage, setSuccessMessage] = useState("");
   const [detailsAppointment, setDetailsAppointment] = useState<any>(null);
   
@@ -494,6 +519,107 @@ export default function DoctorAppointments({ onNewAppointment }: { onNewAppointm
     }
   }, [editingAppointment?.scheduledAt, editingAppointment?.id]);
 
+  const editPickerDate = useMemo(() => {
+    if (!editingAppointment?.scheduledAt) return undefined;
+    const d = parseScheduledAtAsLocal(editingAppointment.scheduledAt);
+    return new Date(d.getFullYear(), d.getMonth(), d.getDate());
+  }, [editingAppointment?.scheduledAt]);
+
+  const setEditPickerDate = useCallback(
+    (date: Date | undefined) => {
+      if (!editingAppointment || !date) return;
+      const current = parseScheduledAtAsLocal(editingAppointment.scheduledAt);
+      const merged = new Date(
+        date.getFullYear(),
+        date.getMonth(),
+        date.getDate(),
+        current.getHours(),
+        current.getMinutes(),
+        current.getSeconds(),
+        0,
+      );
+      setEditingAppointment({
+        ...editingAppointment,
+        scheduledAt: merged,
+      });
+      void fetchAppointmentsForDate(merged);
+    },
+    [editingAppointment],
+  );
+
+  const editBookingHoliday = useBookingHolidayCalendar({
+    enabled: !!editingAppointment,
+    selectedDate: editPickerDate,
+    setSelectedDate: setEditPickerDate,
+  });
+
+  const scheduleViewHoliday = useBookingHolidayCalendar({
+    enabled: true,
+    selectedDate,
+    setSelectedDate,
+  });
+
+  const HOLIDAY_TYPE_LABELS: Record<string, string> = {
+    national: "National",
+    regional: "Regional",
+    company: "Company",
+    weekend: "Weekend",
+  };
+
+  const weekDayHolidayCardClass = (day: Date) => {
+    const status = scheduleViewHoliday.resolveHolidayStatus(day);
+    if (!status) return "";
+    if (status.holidayType === "national") {
+      return "border-amber-400 bg-amber-50/90 dark:bg-amber-900/25 dark:border-amber-600";
+    }
+    if (status.holidayType === "regional") {
+      return "border-orange-400 bg-orange-50/90 dark:bg-orange-900/25 dark:border-orange-600";
+    }
+    if (status.holidayType === "company") {
+      return "border-purple-400 bg-purple-50/90 dark:bg-purple-900/25 dark:border-purple-600";
+    }
+    return "border-slate-400 bg-slate-50/90 dark:bg-slate-800/40 dark:border-slate-600";
+  };
+
+  const handleScheduleDayClick = (day: Date) => {
+    const status = scheduleViewHoliday.resolveHolidayStatus(day);
+    if (status) {
+      setWeekHolidayNotice({ day, status });
+      if (scheduleViewHoliday.isDateHolidayBlocked(day)) return;
+      if (!status.allowShifts) {
+        setSelectedDate(day);
+        setWeekHolidayNotice(null);
+      }
+      return;
+    }
+    setWeekHolidayNotice(null);
+    setSelectedDate(day);
+  };
+
+  const monthDayHolidayCellClass = (
+    holidayType: BookingHolidayStatus["holidayType"] | undefined,
+    isSelected: boolean,
+  ) => {
+    if (isSelected || !holidayType) return "";
+    if (holidayType === "national") {
+      return "bg-amber-100 dark:bg-amber-900/40 border-amber-300 dark:border-amber-500";
+    }
+    if (holidayType === "regional") {
+      return "bg-orange-100 dark:bg-orange-900/40 border-orange-300 dark:border-orange-500";
+    }
+    if (holidayType === "company") {
+      return "bg-purple-100 dark:bg-purple-900/40 border-purple-300 dark:border-purple-500";
+    }
+    return "bg-slate-100 dark:bg-slate-700/60 border-slate-200 dark:border-slate-600";
+  };
+
+  const monthDayHolidayLabelClass = (holidayType: BookingHolidayStatus["holidayType"]) => {
+    if (holidayType === "national") return "text-amber-900 dark:text-amber-100";
+    if (holidayType === "regional") return "text-orange-900 dark:text-orange-100";
+    if (holidayType === "company") return "text-purple-900 dark:text-purple-100";
+    return "";
+  };
+
   // Edit appointment mutation
   const editAppointmentMutation = useMutation({
     mutationFn: async (appointmentData: any) => {
@@ -563,6 +689,7 @@ export default function DoctorAppointments({ onNewAppointment }: { onNewAppointm
       queryClient.invalidateQueries({ queryKey: ["/api/appointments"] });
       queryClient.refetchQueries({ queryKey: ["/api/appointments"] });
       setEditingAppointment(null);
+      editBookingHoliday.resetHolidayState();
       setEditAppointmentType("");
       setEditAppointmentSelectedTreatment(null);
       setEditAppointmentSelectedConsultation(null);
@@ -1349,6 +1476,17 @@ export default function DoctorAppointments({ onNewAppointment }: { onNewAppointm
   const weekEnd = endOfWeek(selectedDate);
   const weekDays = eachDayOfInterval({ start: weekStart, end: weekEnd });
 
+  const monthStart = startOfMonth(selectedDate);
+  const monthEnd = endOfMonth(selectedDate);
+  const monthCalendarStart = startOfWeek(monthStart, { weekStartsOn: 1 });
+  const monthCalendarEnd = endOfWeek(monthEnd, { weekStartsOn: 1 });
+  const monthCalendarDays = eachDayOfInterval({
+    start: monthCalendarStart,
+    end: monthCalendarEnd,
+  });
+
+  const selectedDayHolidayStatus = scheduleViewHoliday.resolveHolidayStatus(selectedDate);
+
   if (isLoading || usersLoading || patientsLoading) {
     return (
       <Card>
@@ -1391,6 +1529,14 @@ export default function DoctorAppointments({ onNewAppointment }: { onNewAppointm
             onClick={() => setViewMode("day")}
           >
             Day View
+          </Button>
+          <Button
+            variant={viewMode === "month" ? "default" : "outline"}
+            size="sm"
+            onClick={() => setViewMode("month")}
+            data-testid="button-month-view"
+          >
+            Month View
           </Button>
           <Button 
             onClick={() => onNewAppointment?.()}
@@ -1613,14 +1759,21 @@ export default function DoctorAppointments({ onNewAppointment }: { onNewAppointm
             const dayAppointments = getAppointmentsForDate(day);
             const isSelected = isSameDay(day, selectedDate);
             const isCurrentDay = isToday(day);
+            const dayHolidayStatus = scheduleViewHoliday.resolveHolidayStatus(day);
+            const holidayLabel =
+              dayHolidayStatus?.source === "holiday" ? dayHolidayStatus.label : "";
             
             return (
               <Card 
                 key={day.toString()} 
-                className={`h-96 cursor-pointer transition-colors ${
-                  isSelected ? 'border-blue-500 bg-blue-50 dark:bg-blue-900/20 dark:border-blue-400' : ''
-                } ${isCurrentDay ? 'border-yellow-400 bg-yellow-50 dark:bg-yellow-900/20 dark:border-yellow-600' : ''}`}
-                onClick={() => setSelectedDate(day)}
+                title={holidayLabel || undefined}
+                className={cn(
+                  "h-96 cursor-pointer transition-colors",
+                  weekDayHolidayCardClass(day),
+                  isSelected && "border-blue-500 bg-blue-50 dark:bg-blue-900/20 dark:border-blue-400",
+                  isCurrentDay && !dayHolidayStatus && "border-yellow-400 bg-yellow-50 dark:bg-yellow-900/20 dark:border-yellow-600",
+                )}
+                onClick={() => handleScheduleDayClick(day)}
               >
                 <CardHeader className="pb-1 pt-2 px-2">
                   <CardTitle className="text-xs font-medium text-gray-900 dark:text-gray-100">
@@ -1629,6 +1782,11 @@ export default function DoctorAppointments({ onNewAppointment }: { onNewAppointm
                     <span className={`text-base ${isCurrentDay ? 'text-yellow-800 dark:text-yellow-200 font-bold' : 'text-gray-900 dark:text-gray-100'}`}>
                       {format(day, "d")}
                     </span>
+                    {holidayLabel && (
+                      <span className="block text-[9px] font-normal text-amber-800 dark:text-amber-200 truncate mt-0.5">
+                        {holidayLabel.length > 10 ? `${holidayLabel.slice(0, 9)}…` : holidayLabel}
+                      </span>
+                    )}
                   </CardTitle>
                 </CardHeader>
                 <CardContent className="pt-0 px-2 pb-2 space-y-1">
@@ -1698,6 +1856,154 @@ export default function DoctorAppointments({ onNewAppointment }: { onNewAppointm
         </div>
       )}
 
+      {/* Month View */}
+      {viewMode === "month" && (
+        <Card>
+          <CardHeader className="pb-3">
+            <CardTitle className="flex flex-wrap items-center justify-between gap-2 text-gray-900 dark:text-gray-100">
+              <div className="flex items-center gap-2">
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => setSelectedDate(subMonths(selectedDate, 1))}
+                >
+                  <ChevronLeft className="h-4 w-4" />
+                </Button>
+                <span className="text-lg font-bold min-w-[140px] text-center">
+                  {format(selectedDate, "MMMM yyyy")}
+                </span>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => setSelectedDate(addMonths(selectedDate, 1))}
+                >
+                  <ChevronRight className="h-4 w-4" />
+                </Button>
+              </div>
+              <Button variant="outline" size="sm" onClick={() => setViewMode("day")}>
+                View day schedule
+              </Button>
+            </CardTitle>
+          </CardHeader>
+          <CardContent className="pt-0">
+            <div className="grid grid-cols-7 gap-2 mb-2">
+              {["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"].map((day) => (
+                <div
+                  key={day}
+                  className="text-center text-xs font-semibold text-gray-600 dark:text-gray-300 py-1"
+                >
+                  {day}
+                </div>
+              ))}
+            </div>
+            <div className="grid grid-cols-7 gap-2">
+              {monthCalendarDays.map((day) => {
+                const dayAppointments = getAppointmentsForDate(day);
+                const isSelected = isSameDay(day, selectedDate);
+                const isCurrentDay = isToday(day);
+                const isCurrentMonth =
+                  day.getMonth() === selectedDate.getMonth() &&
+                  day.getFullYear() === selectedDate.getFullYear();
+                const dayHolidayStatus = scheduleViewHoliday.resolveHolidayStatus(day);
+                const holidayLabel =
+                  dayHolidayStatus?.source === "holiday" ? dayHolidayStatus.label : "";
+
+                return (
+                  <button
+                    key={day.toString()}
+                    type="button"
+                    title={holidayLabel || undefined}
+                    onClick={() => handleScheduleDayClick(day)}
+                    className={cn(
+                      "min-h-[58px] p-1 border rounded-md transition-colors flex flex-col text-left",
+                      !isSelected && "border-gray-200 dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-800",
+                      isSelected && "border-blue-600 bg-blue-600 text-white hover:bg-blue-700",
+                      !isSelected &&
+                        monthDayHolidayCellClass(dayHolidayStatus?.holidayType, isSelected),
+                      !isSelected &&
+                        isCurrentDay &&
+                        !dayHolidayStatus &&
+                        "bg-blue-100 dark:bg-blue-900/30 border-blue-300 dark:border-blue-500",
+                    )}
+                  >
+                    <div
+                      className={cn(
+                        "flex flex-col items-center justify-center leading-tight w-full",
+                        !isCurrentMonth && !isSelected && "text-gray-300 dark:text-gray-600",
+                        isCurrentMonth && !isSelected && "text-gray-900 dark:text-gray-100",
+                        isSelected && "text-white",
+                      )}
+                    >
+                      <span className={cn("text-sm font-medium", isSelected && "font-bold")}>
+                        {format(day, "d")}
+                      </span>
+                      {holidayLabel && !isSelected && dayHolidayStatus && (
+                        <span
+                          className={cn(
+                            "text-[9px] font-normal truncate max-w-full px-0.5 opacity-90 mt-0.5",
+                            monthDayHolidayLabelClass(dayHolidayStatus.holidayType),
+                          )}
+                        >
+                          {holidayLabel.length > 8 ? `${holidayLabel.slice(0, 7)}…` : holidayLabel}
+                        </span>
+                      )}
+                      {isSelected && (
+                        <span className="mt-0.5 h-1.5 w-1.5 rounded-full bg-cyan-300 shrink-0" />
+                      )}
+                    </div>
+                    <div className="flex flex-wrap gap-0.5 mt-0.5 flex-1 justify-center items-start">
+                      {dayAppointments.slice(0, 3).map((appointment: any) => (
+                        <span
+                          key={appointment.id}
+                          className="w-2 h-2 rounded-full shrink-0 border border-white/80"
+                          style={{
+                            backgroundColor:
+                              statusColors[appointment.status as keyof typeof statusColors] ??
+                              statusColors.scheduled,
+                          }}
+                        />
+                      ))}
+                      {dayAppointments.length > 3 && (
+                        <span
+                          className={cn(
+                            "text-[9px] font-medium",
+                            isSelected ? "text-white/90" : "text-gray-600 dark:text-gray-400",
+                          )}
+                        >
+                          +{dayAppointments.length - 3}
+                        </span>
+                      )}
+                    </div>
+                  </button>
+                );
+              })}
+            </div>
+            <div className="flex flex-wrap gap-4 mt-4 pt-3 border-t border-gray-100 dark:border-gray-700 text-xs text-gray-600 dark:text-gray-400">
+              <span className="inline-flex items-center gap-1.5">
+                <span className="w-3 h-3 rounded bg-amber-200 dark:bg-amber-700 border border-amber-300" />
+                National
+              </span>
+              <span className="inline-flex items-center gap-1.5">
+                <span className="w-3 h-3 rounded bg-orange-200 dark:bg-orange-700 border border-orange-300" />
+                Regional
+              </span>
+              <span className="inline-flex items-center gap-1.5">
+                <span className="w-3 h-3 rounded bg-purple-200 dark:bg-purple-700 border border-purple-300" />
+                Company
+              </span>
+              <span className="inline-flex items-center gap-1.5">
+                <span className="w-3 h-3 rounded bg-slate-200 dark:bg-slate-600 border border-slate-300" />
+                Weekend
+              </span>
+              <span className="inline-flex items-center gap-1.5">
+                <span className="w-3 h-3 rounded bg-blue-600" />
+                Selected
+              </span>
+            </div>
+          </CardContent>
+        </Card>
+      )}
+
       {/* Day View */}
       {viewMode === "day" && (
         <Card>
@@ -1749,6 +2055,30 @@ export default function DoctorAppointments({ onNewAppointment }: { onNewAppointm
             </CardTitle>
           </CardHeader>
           <CardContent>
+            {selectedDayHolidayStatus && (
+              <div
+                className={cn(
+                  "flex items-start gap-2 rounded-md border p-3 text-sm mb-4",
+                  selectedDayHolidayStatus.allowShifts
+                    ? "border-amber-300 bg-amber-50 text-amber-950 dark:bg-amber-900/20 dark:text-amber-100"
+                    : "border-red-300 bg-red-50 text-red-900 dark:bg-red-900/20 dark:text-red-100",
+                )}
+              >
+                <AlertTriangle className="h-4 w-4 shrink-0 mt-0.5" />
+                <div>
+                  <p className="font-medium">
+                    {HOLIDAY_TYPE_LABELS[selectedDayHolidayStatus.holidayType] ?? "Holiday"}:{" "}
+                    {selectedDayHolidayStatus.label}
+                  </p>
+                  <p className="text-xs mt-1 opacity-90">
+                    {selectedDayHolidayStatus.allowShifts
+                      ? "Appointments are allowed with a confirmation warning."
+                      : "This day is configured as a non-working holiday."}
+                    {selectedDayHolidayStatus.isWorkingDay ? " · Marked as a working holiday." : ""}
+                  </p>
+                </div>
+              </div>
+            )}
             <div className="space-y-3">
               {(() => {
                 const sorted = sortAppointmentsByCardTimeKind(
@@ -3122,6 +3452,7 @@ export default function DoctorAppointments({ onNewAppointment }: { onNewAppointm
                   size="sm"
                   onClick={() => {
                     setEditingAppointment(null);
+                    editBookingHoliday.resetHolidayState();
                     setEditAppointmentType("");
                     setEditAppointmentSelectedTreatment(null);
                     setEditAppointmentSelectedConsultation(null);
@@ -3441,127 +3772,16 @@ export default function DoctorAppointments({ onNewAppointment }: { onNewAppointm
                     <Label className="text-sm font-medium text-gray-700 dark:text-gray-300">
                       Select Date *
                     </Label>
-                    <div className="mt-1 h-[280px] overflow-y-auto border border-gray-300 dark:border-gray-600 rounded-md p-4 bg-white dark:bg-gray-700">
-                      <div className="flex items-center justify-between mb-2">
-                        <Button
-                          type="button"
-                          variant="ghost"
-                          size="sm"
-                          onClick={() => {
-                            const currentDate = new Date(
-                              editingAppointment.scheduledAt,
-                            );
-                            currentDate.setMonth(currentDate.getMonth() - 1);
-                            setEditingAppointment({
-                              ...editingAppointment,
-                              scheduledAt: currentDate,
-                            });
-                          }}
-                          className="p-1"
-                        >
-                          <ChevronLeft className="h-4 w-4" />
-                        </Button>
-                        <span className="font-medium">
-                          {format(
-                            new Date(editingAppointment.scheduledAt),
-                            "MMMM yyyy",
-                          )}
-                        </span>
-                        <Button
-                          type="button"
-                          variant="ghost"
-                          size="sm"
-                          onClick={() => {
-                            const currentDate = new Date(
-                              editingAppointment.scheduledAt,
-                            );
-                            currentDate.setMonth(currentDate.getMonth() + 1);
-                            setEditingAppointment({
-                              ...editingAppointment,
-                              scheduledAt: currentDate,
-                            });
-                          }}
-                          className="p-1"
-                        >
-                          <ChevronRight className="h-4 w-4" />
-                        </Button>
-                      </div>
-                      <div className="grid grid-cols-7 gap-1 text-xs mb-2">
-                        {["Su", "Mo", "Tu", "We", "Th", "Fr", "Sa"].map(
-                          (day) => (
-                            <div
-                              key={day}
-                              className="p-2 text-center font-medium text-gray-500 dark:text-gray-400"
-                            >
-                              {day}
-                            </div>
-                          ),
-                        )}
-                      </div>
-                      <div className="grid grid-cols-7 gap-1">
-                        {Array.from({ length: 42 }, (_, i) => {
-                          const currentMonth = new Date(
-                            editingAppointment.scheduledAt,
-                          ).getMonth();
-                          const currentYear = new Date(
-                            editingAppointment.scheduledAt,
-                          ).getFullYear();
-                          const firstDayOfMonth = new Date(
-                            currentYear,
-                            currentMonth,
-                            1,
-                          );
-                          const startDate = new Date(firstDayOfMonth);
-                          startDate.setDate(
-                            startDate.getDate() - firstDayOfMonth.getDay(),
-                          );
-                          const cellDate = new Date(startDate);
-                          cellDate.setDate(cellDate.getDate() + i);
-                          const isCurrentMonth =
-                            cellDate.getMonth() === currentMonth;
-                          const isSelected =
-                            format(cellDate, "yyyy-MM-dd") ===
-                            format(
-                              parseScheduledAtAsLocal(editingAppointment.scheduledAt),
-                              "yyyy-MM-dd",
-                            );
-
-                          return (
-                            <Button
-                              key={i}
-                              type="button"
-                              variant="ghost"
-                              size="sm"
-                              onClick={() => {
-                                const current = parseScheduledAtAsLocal(editingAppointment.scheduledAt);
-                                const newDate = new Date(
-                                  cellDate.getFullYear(),
-                                  cellDate.getMonth(),
-                                  cellDate.getDate(),
-                                  current.getHours(),
-                                  current.getMinutes(),
-                                  current.getSeconds(),
-                                  0,
-                                );
-                                setEditingAppointment({
-                                  ...editingAppointment,
-                                  scheduledAt: newDate,
-                                });
-                                fetchAppointmentsForDate(cellDate);
-                              }}
-                              className={`p-2 text-sm rounded ${
-                                isSelected
-                                  ? "bg-blue-500 text-white hover:bg-blue-600"
-                                  : isCurrentMonth
-                                    ? "text-gray-900 dark:text-gray-100 hover:bg-blue-50 dark:hover:bg-gray-700"
-                                    : "text-gray-400 dark:text-gray-600"
-                              }`}
-                            >
-                              {cellDate.getDate()}
-                            </Button>
-                          );
-                        })}
-                      </div>
+                    <div className="mt-1 overflow-y-auto border border-gray-300 dark:border-gray-600 rounded-md p-2 bg-white dark:bg-gray-700">
+                      <CalendarComponent
+                        mode="single"
+                        selected={editPickerDate}
+                        onSelect={editBookingHoliday.handleDateSelect}
+                        disabled={(date) => editBookingHoliday.isDateHolidayBlocked(date)}
+                        className="w-full"
+                        {...editBookingHoliday.calendarProps}
+                      />
+                      {editBookingHoliday.legend}
                     </div>
                   </div>
 
@@ -3571,6 +3791,11 @@ export default function DoctorAppointments({ onNewAppointment }: { onNewAppointm
                       Select Time Slot *
                     </Label>
                     <div className="mt-1 h-[280px] overflow-y-auto border border-gray-300 dark:border-gray-600 rounded-md p-3 bg-white dark:bg-gray-700">
+                      <BookingHolidayTimeSlotPanel
+                        selectedDate={editPickerDate}
+                        bookingHoliday={editBookingHoliday}
+                        emptyMessage="No time slots available for this date."
+                      >
                       <div className="grid grid-cols-2 gap-2">
                         {(() => {
                           const providerId = editingAppointment?.providerId || editingAppointment?.provider_id;
@@ -3702,6 +3927,7 @@ export default function DoctorAppointments({ onNewAppointment }: { onNewAppointm
                           );
                         })}
                       </div>
+                      </BookingHolidayTimeSlotPanel>
                     </div>
                   </div>
                 </div>
@@ -3713,6 +3939,7 @@ export default function DoctorAppointments({ onNewAppointment }: { onNewAppointm
                   variant="outline"
                   onClick={() => {
                     setEditingAppointment(null);
+                    editBookingHoliday.resetHolidayState();
                     setEditAppointmentType("");
                     setEditAppointmentSelectedTreatment(null);
                     setEditAppointmentSelectedConsultation(null);
@@ -3984,6 +4211,77 @@ export default function DoctorAppointments({ onNewAppointment }: { onNewAppointm
               OK
             </Button>
           </div>
+        </DialogContent>
+      </Dialog>
+
+      {/* Week view holiday notice */}
+      <Dialog
+        open={!!weekHolidayNotice}
+        onOpenChange={(open) => {
+          if (!open) setWeekHolidayNotice(null);
+        }}
+      >
+        <DialogContent className="max-w-md">
+          <DialogHeader>
+            <DialogTitle className="text-lg font-semibold">
+              {weekHolidayNotice
+                ? format(weekHolidayNotice.day, "EEEE, MMMM d, yyyy")
+                : "Holiday"}
+            </DialogTitle>
+            <DialogDescription className="sr-only">Holiday notice for selected day</DialogDescription>
+          </DialogHeader>
+          {weekHolidayNotice && (
+            <div className="space-y-4">
+              <div
+                className={cn(
+                  "flex items-start gap-2 rounded-md border p-3 text-sm",
+                  weekHolidayNotice.status.allowShifts
+                    ? "border-amber-300 bg-amber-50 text-amber-950 dark:bg-amber-900/20 dark:text-amber-100"
+                    : "border-red-300 bg-red-50 text-red-900 dark:bg-red-900/20 dark:text-red-100",
+                )}
+              >
+                <AlertTriangle className="h-4 w-4 shrink-0 mt-0.5" />
+                <div>
+                  <p className="font-medium">
+                    {HOLIDAY_TYPE_LABELS[weekHolidayNotice.status.holidayType] ?? "Holiday"}:{" "}
+                    {weekHolidayNotice.status.label}
+                  </p>
+                  <p className="text-xs mt-1 opacity-90">
+                    {weekHolidayNotice.status.allowShifts
+                      ? "Appointments are allowed with a confirmation warning."
+                      : "Appointments cannot be booked on this date."}
+                    {weekHolidayNotice.status.isWorkingDay ? " · Marked as a working holiday." : ""}
+                  </p>
+                </div>
+              </div>
+              {weekHolidayNotice.status.allowShifts &&
+                !scheduleViewHoliday.isDateHolidayBlocked(weekHolidayNotice.day) && (
+                  <>
+                    <p className="text-xs text-gray-600 dark:text-gray-400">
+                      This date is a configured holiday. Review the notice above, then continue to view this day.
+                    </p>
+                    <Button
+                      type="button"
+                      className="w-full bg-blue-600 hover:bg-blue-700 text-white"
+                      onClick={() => {
+                        setSelectedDate(weekHolidayNotice.day);
+                        setWeekHolidayNotice(null);
+                        if (viewMode === "month") {
+                          setViewMode("day");
+                        }
+                      }}
+                    >
+                      Continue viewing schedule
+                    </Button>
+                  </>
+                )}
+            </div>
+          )}
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setWeekHolidayNotice(null)}>
+              Close
+            </Button>
+          </DialogFooter>
         </DialogContent>
       </Dialog>
 

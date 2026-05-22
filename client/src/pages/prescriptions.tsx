@@ -4705,7 +4705,62 @@ export default function PrescriptionsPage() {
       return [];
     }
   }, [patients]);
-  
+
+  const patientRelationRank = (relation?: string | null) => {
+    if (!relation) return 50;
+    const r = String(relation).toLowerCase();
+    if (r === "self") return 0;
+    if (r === "spouse") return 10;
+    if (r === "father") return 20;
+    if (r === "mother") return 21;
+    if (r === "son") return 30;
+    if (r === "daughter") return 31;
+    if (r === "dependent child") return 32;
+    if (r === "other") return 40;
+    return 45;
+  };
+
+  /** Group patients by login userId — account holder first, family members indented (↳). */
+  const patientDropdownGroups = useMemo(() => {
+    if (!Array.isArray(patients) || patients.length === 0) return [];
+
+    const map = new Map<number | string, any[]>();
+    for (const p of patients) {
+      const key = p?.userId ?? `no-user-${p?.id ?? Math.random()}`;
+      const list = map.get(key) ?? [];
+      list.push(p);
+      map.set(key, list);
+    }
+
+    const groups = Array.from(map.values()).map((members) => {
+      const sorted = [...members].sort((a, b) => {
+        const rr = patientRelationRank(a?.relation) - patientRelationRank(b?.relation);
+        if (rr !== 0) return rr;
+        const na = `${a?.firstName ?? ""} ${a?.lastName ?? ""}`.trim().toLowerCase();
+        const nb = `${b?.firstName ?? ""} ${b?.lastName ?? ""}`.trim().toLowerCase();
+        return na.localeCompare(nb);
+      });
+
+      const main =
+        sorted.find((m) => String(m?.relation ?? "").trim().toLowerCase() === "self") ??
+        sorted[0];
+      const relatives = sorted.filter((m) => m !== main);
+      return { main, relatives };
+    });
+
+    groups.sort((a, b) => {
+      const na = `${a.main?.firstName ?? ""} ${a.main?.lastName ?? ""}`.trim().toLowerCase();
+      const nb = `${b.main?.firstName ?? ""} ${b.main?.lastName ?? ""}`.trim().toLowerCase();
+      return na.localeCompare(nb);
+    });
+
+    return groups;
+  }, [patients]);
+
+  const formatPatientDropdownLabel = (patient: any) =>
+    `${patient?.firstName ?? ""} ${patient?.lastName ?? ""}`.trim() +
+    (patient?.patientId ? ` (${patient.patientId})` : "");
+
   // Compute unique prescription IDs for doctors (filtered to this doctor's prescriptions only)
   const doctorPrescriptionIds = useMemo(() => {
     if (!Array.isArray(prescriptions) || user?.role !== 'doctor') return [];
@@ -7084,59 +7139,63 @@ export default function PrescriptionsPage() {
                                 >
                                   <span className="flex-1 min-w-0 break-words pr-2">
                                     {formData.patientId
-                                      ? patients.find(
-                                          (patient: any) => patient.id.toString() === formData.patientId
-                                        )
-                                        ? `${
-                                            patients.find(
-                                              (patient: any) => patient.id.toString() === formData.patientId
-                                            )?.firstName
-                                          } ${
-                                            patients.find(
-                                              (patient: any) => patient.id.toString() === formData.patientId
-                                            )?.lastName
-                                          } (${
-                                            patients.find(
-                                              (patient: any) => patient.id.toString() === formData.patientId
-                                            )?.patientId
-                                          })`
-                                        : "Select patient"
-                                      : "Select patient"}
+                                      ? (() => {
+                                          const selected = patients.find(
+                                            (patient: any) =>
+                                              patient.id.toString() === formData.patientId,
+                                          );
+                                          return selected
+                                            ? formatPatientDropdownLabel(selected)
+                                            : "Select a patient";
+                                        })()
+                                      : "Select a patient"}
                                   </span>
                                   <ChevronsUpDown className="ml-2 h-4 w-4 shrink-0 opacity-50 flex-shrink-0" />
                                 </Button>
                               </PopoverTrigger>
-                              <PopoverContent className="w-[300px] p-0" align="start">
+                              <PopoverContent className="w-[var(--radix-popover-trigger-width)] min-w-[280px] p-0" align="start">
                                 <Command>
-                                  <CommandInput placeholder="Search patients..." />
-                                  <CommandEmpty>No patient found.</CommandEmpty>
-                                  <CommandGroup className="max-h-64 overflow-auto">
-                                    {patients.map((patient: any) => (
-                                      <CommandItem
-                                        key={patient.id}
-                                        value={`${patient.firstName} ${patient.lastName} ${patient.patientId}`}
-                                        onSelect={() => {
-                                          setFormData((prev) => ({
-                                            ...prev,
-                                            patientId: patient.id.toString(),
-                                          }));
-                                          setPatientSearchOpen(false);
-                                        }}
-                                        className="whitespace-normal break-words py-2"
-                                      >
-                                        <Check
-                                          className={`mr-2 h-4 w-4 shrink-0 mt-0.5 ${
-                                            formData.patientId === patient.id.toString()
-                                              ? "opacity-100"
-                                              : "opacity-0"
-                                          }`}
-                                        />
-                                        <span className="break-words">
-                                          {patient.firstName} {patient.lastName} ({patient.patientId})
-                                        </span>
-                                      </CommandItem>
-                                    ))}
-                                  </CommandGroup>
+                                  <CommandInput placeholder="Search patient..." />
+                                  <CommandList>
+                                    <CommandEmpty>No patient found.</CommandEmpty>
+                                    <CommandGroup>
+                                      {patientDropdownGroups.flatMap(({ main, relatives }) => {
+                                        const rows = [
+                                          { patient: main, isChild: false },
+                                          ...relatives.map((p: any) => ({
+                                            patient: p,
+                                            isChild: true,
+                                          })),
+                                        ];
+                                        return rows.map(({ patient, isChild }) => (
+                                          <CommandItem
+                                            key={patient.id}
+                                            value={`${patient.firstName} ${patient.lastName} ${patient.patientId} ${patient.email ?? ""}`}
+                                            onSelect={() => {
+                                              setFormData((prev) => ({
+                                                ...prev,
+                                                patientId: patient.id.toString(),
+                                              }));
+                                              setPatientSearchOpen(false);
+                                            }}
+                                            className="whitespace-normal break-words py-2"
+                                          >
+                                            <Check
+                                              className={`mr-2 h-4 w-4 shrink-0 mt-0.5 ${
+                                                formData.patientId === patient.id.toString()
+                                                  ? "opacity-100"
+                                                  : "opacity-0"
+                                              }`}
+                                            />
+                                            <span className={`break-words ${isChild ? "pl-1" : ""}`}>
+                                              {isChild ? "↳ " : ""}
+                                              {formatPatientDropdownLabel(patient)}
+                                            </span>
+                                          </CommandItem>
+                                        ));
+                                      })}
+                                    </CommandGroup>
+                                  </CommandList>
                                 </Command>
                               </PopoverContent>
                             </Popover>

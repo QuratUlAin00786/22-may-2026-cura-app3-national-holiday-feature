@@ -683,6 +683,117 @@ const roleSchema = z.object({
 type UserFormData = z.infer<typeof userSchema>;
 type RoleFormData = z.infer<typeof roleSchema>;
 
+type PatientCreatedDetailRow = { label: string; value: string };
+
+function buildPatientCreatedDetails(
+  variables: UserFormData,
+  newUser: { email?: string; firstName?: string; lastName?: string },
+  patient?: { patientId?: string } | null,
+): PatientCreatedDetailRow[] {
+  const address = variables.address;
+  const addressStr = address
+    ? [address.street, address.city, address.state, address.postcode, address.country]
+        .filter((part) => part && String(part).trim())
+        .join(", ")
+    : "";
+  const ec = variables.emergencyContact;
+  const emergencyStr = ec?.name
+    ? [
+        ec.name,
+        ec.relationship ? `(${ec.relationship})` : "",
+        ec.phone || "",
+        ec.email || "",
+      ]
+        .filter(Boolean)
+        .join(" · ")
+    : "";
+  const ins = variables.insuranceInfo;
+  const insuranceStr = ins?.provider
+    ? [ins.provider, ins.policyNumber, ins.memberNumber, ins.planType, ins.effectiveDate]
+        .filter((part) => part && String(part).trim())
+        .join(" · ")
+    : "";
+
+  return [
+    { label: "Name", value: `${variables.firstName} ${variables.lastName}`.trim() },
+    { label: "Email", value: variables.email || newUser.email || "—" },
+    { label: "Patient ID", value: patient?.patientId || "—" },
+    { label: "Phone", value: variables.phone?.trim() || "—" },
+    { label: "Date of Birth", value: variables.dateOfBirth || "—" },
+    { label: "Gender at Birth", value: variables.genderAtBirth || "—" },
+    { label: "NHS Number", value: variables.nhsNumber?.trim() || "—" },
+    { label: "Address", value: addressStr || "—" },
+    { label: "Emergency Contact", value: emergencyStr || "—" },
+    { label: "Insurance", value: insuranceStr || "—" },
+    { label: "Role", value: "Patient" },
+  ];
+}
+
+function formatAddressForDisplay(address?: {
+  street?: string;
+  city?: string;
+  state?: string;
+  postcode?: string;
+  country?: string;
+  building?: string;
+} | null): string {
+  if (!address) return "";
+  return [
+    address.building,
+    address.street,
+    address.city,
+    address.state,
+    address.postcode,
+    address.country,
+  ]
+    .filter((part) => part && String(part).trim())
+    .join(", ");
+}
+
+function buildFamilyMemberCreatedDetails(
+  created: {
+    firstName?: string;
+    lastName?: string;
+    email?: string;
+    patientId?: string;
+    relation?: string;
+    dateOfBirth?: string;
+    genderAtBirth?: string;
+    phone?: string;
+    address?: {
+      street?: string;
+      city?: string;
+      state?: string;
+      postcode?: string;
+      country?: string;
+      building?: string;
+    };
+  },
+  formData: { fullName?: string; dateOfBirth?: string | null; genderAtBirth?: string | null },
+): PatientCreatedDetailRow[] {
+  const name =
+    `${created.firstName ?? ""} ${created.lastName ?? ""}`.trim() ||
+    String(formData.fullName ?? "").trim() ||
+    "—";
+
+  return [
+    { label: "Name", value: name },
+    { label: "Email", value: created.email?.trim() || "—" },
+    { label: "Patient ID", value: created.patientId || "—" },
+    { label: "Relation", value: created.relation || "Dependent Child" },
+    {
+      label: "Date of Birth",
+      value: created.dateOfBirth || formData.dateOfBirth || "—",
+    },
+    {
+      label: "Gender",
+      value: created.genderAtBirth || formData.genderAtBirth || "—",
+    },
+    { label: "Phone", value: created.phone?.trim() || "—" },
+    { label: "Address", value: formatAddressForDisplay(created.address) || "—" },
+  ];
+}
+
 // Permission templates for complete module and field initialization
 type ModulePermission = {
   view: boolean;
@@ -1265,6 +1376,7 @@ export default function UserManagement() {
   const [showSuccessModal, setShowSuccessModal] = useState(false);
   const [successMessage, setSuccessMessage] = useState("");
   const [successTitle, setSuccessTitle] = useState("");
+  const [createdPatientDetails, setCreatedPatientDetails] = useState<PatientCreatedDetailRow[] | null>(null);
   const [isUserProfileImagePreviewOpen, setIsUserProfileImagePreviewOpen] = useState(false);
   const [userProfileImagePreviewUrl, setUserProfileImagePreviewUrl] = useState<string | null>(null);
   const getInitialPermissions = () => ({
@@ -2335,8 +2447,15 @@ export default function UserManagement() {
         const nb = `${b?.firstName ?? ""} ${b?.lastName ?? ""}`.trim().toLowerCase();
         return na.localeCompare(nb);
       });
-      const main =
-        sorted.find((p: any) => String(p?.relation ?? "").trim().toLowerCase() === "self") ?? sorted[0] ?? null;
+      const selfProfile = sorted.find(
+        (p: any) => String(p?.relation ?? "").trim().toLowerCase() === "self",
+      );
+      const accountHolderProfile = sorted.find((p: any) => {
+        if (Number(p?.userId) !== Number(u?.id)) return false;
+        const rel = String(p?.relation ?? "").trim().toLowerCase();
+        return !rel || rel === "self";
+      });
+      const main = selfProfile ?? accountHolderProfile ?? sorted[0] ?? null;
       const children = sorted.filter((p: any) => p !== main);
       return { main, children };
     },
@@ -2348,10 +2467,37 @@ export default function UserManagement() {
     (u: any): boolean => {
       if (!u || String(u.role || "").toLowerCase() !== "patient") return false;
       const h = patientProfileHierarchyForUser(u);
-      const rel = String(h.main?.relation ?? "").trim().toLowerCase();
-      return rel === "self";
+      const profiles = [...(h.main ? [h.main] : []), ...(h.children || [])];
+      // No linked clinical row in cache yet — still the login account holder
+      if (profiles.length === 0) return true;
+
+      const mainRel = String(h.main?.relation ?? "").trim().toLowerCase();
+      if (mainRel === "self") return true;
+
+      if (
+        Number(h.main?.userId) === Number(u.id) &&
+        (!mainRel || mainRel === "")
+      ) {
+        return true;
+      }
+
+      return profiles.some(
+        (p: any) => String(p?.relation ?? "").trim().toLowerCase() === "self",
+      );
     },
     [patientProfileHierarchyForUser],
+  );
+
+  const relationLabelForPatientProfile = useCallback(
+    (profile: any, loginUserId?: number) => {
+      const rel = String(profile?.relation ?? "").trim();
+      if (rel) return rel;
+      if (loginUserId != null && Number(profile?.userId) === Number(loginUserId)) {
+        return "Self";
+      }
+      return "Other";
+    },
+    [],
   );
 
   const displayNameForUserRow = useCallback(
@@ -2628,13 +2774,39 @@ export default function UserManagement() {
       return result;
     },
     onSuccess: async (newUser, variables) => {
-      setSuccessTitle("User Created Successfully");
+      let patientDetails: PatientCreatedDetailRow[] | null = null;
+
+      if (variables.role === "patient") {
+        setSuccessTitle("Patient Added Successfully");
+        try {
+          const patientsResponse = await apiRequest("GET", "/api/patients");
+          const patients = await patientsResponse.json();
+          const patient = patients.find(
+            (p: { userId?: number; email?: string }) =>
+              p.userId === newUser.id ||
+              (p.email &&
+                variables.email &&
+                p.email.toLowerCase() === variables.email.toLowerCase()),
+          );
+          patientDetails = buildPatientCreatedDetails(variables, newUser, patient);
+        } catch {
+          patientDetails = buildPatientCreatedDetails(variables, newUser, null);
+        }
+      } else {
+        setSuccessTitle("User Created Successfully");
+      }
+
+      setCreatedPatientDetails(patientDetails);
       setSuccessMessage("");
       setShowSuccessModal(true);
       // Immediately add user to list for instant display
       setUsers(prevUsers => [...prevUsers, newUser]);
       // Also fetch fresh data
       refetch();
+      if (variables.role === "patient") {
+        await queryClient.invalidateQueries({ queryKey: ["/api/patients", "user-management"] });
+        await queryClient.invalidateQueries({ queryKey: ["/api/patients"] });
+      }
       setIsCreateModalOpen(false);
       form.reset();
       
@@ -2909,8 +3081,10 @@ export default function UserManagement() {
       });
       return response.json();
     },
-    onSuccess: async () => {
+    onSuccess: async (created, variables) => {
       await refetchFamily();
+      await queryClient.invalidateQueries({ queryKey: ["/api/patients", "user-management"] });
+      await queryClient.invalidateQueries({ queryKey: ["/api/patients"] });
       setEditingFamilyMemberId(null);
       familyMemberForm.reset({
         fullName: "",
@@ -2918,7 +3092,10 @@ export default function UserManagement() {
         genderAtBirth: "",
         relation: "Dependent Child",
       });
-      toast({ title: "Family member added" });
+      setSuccessTitle("Family Member Added Successfully");
+      setSuccessMessage("");
+      setCreatedPatientDetails(buildFamilyMemberCreatedDetails(created, variables));
+      setShowSuccessModal(true);
     },
     onError: (error: any) => {
       toast({
@@ -5954,7 +6131,7 @@ export default function UserManagement() {
                                         {main ? (
                                           <div className="flex items-center gap-2">
                                             <Badge variant="secondary" className="text-[10px] px-2 py-0.5">
-                                              {String(main.relation || "Self")}
+                                              {relationLabelForPatientProfile(main, user.id)}
                                             </Badge>
                                             <span className="text-xs text-gray-700 dark:text-gray-200 font-medium">
                                               {`${main.firstName || ""} ${main.lastName || ""}`.trim() || "—"}
@@ -6190,7 +6367,7 @@ export default function UserManagement() {
                                           className="text-[10px] px-2 py-0.5"
                                           title={`${main.firstName || ""} ${main.lastName || ""}`.trim()}
                                         >
-                                          {String(main.relation || "Self")}
+                                          {relationLabelForPatientProfile(main, user.id)}
                                         </Badge>
                                         <span className="text-xs text-gray-600 dark:text-gray-300">
                                           {`${main.firstName || ""} ${main.lastName || ""}`.trim() || "—"}
@@ -7184,9 +7361,19 @@ export default function UserManagement() {
               <DialogTitle className="text-xl font-semibold text-gray-900 dark:text-gray-100">
                 {successTitle}
               </DialogTitle>
-              {successTitle === "User Created Successfully" && (
+              {successTitle === "User Created Successfully" && !createdPatientDetails && (
                 <p className="text-sm text-gray-600 dark:text-gray-400 mt-2">
                   The user has been created successfully and saved.
+                </p>
+              )}
+              {createdPatientDetails && successTitle === "Patient Added Successfully" && (
+                <p className="text-sm text-gray-600 dark:text-gray-400 mt-2">
+                  User and patient records were created. Sensitive data is stored encrypted.
+                </p>
+              )}
+              {createdPatientDetails && successTitle === "Family Member Added Successfully" && (
+                <p className="text-sm text-gray-600 dark:text-gray-400 mt-2">
+                  Family member profile was saved with the same email and address as the linked account.
                 </p>
               )}
               {successTitle === "User Updated Successfully" && successMessage && (
@@ -7214,6 +7401,24 @@ export default function UserManagement() {
               )}
             </DialogHeader>
             
+            {createdPatientDetails && createdPatientDetails.length > 0 && (
+              <div className="bg-gray-50 dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-4 mb-6 max-h-80 overflow-y-auto">
+                <h4 className="text-sm font-semibold text-gray-800 dark:text-gray-200 mb-3">
+                  {successTitle === "Family Member Added Successfully"
+                    ? "Family member details"
+                    : "Patient details"}
+                </h4>
+                <dl className="space-y-2.5">
+                  {createdPatientDetails.map(({ label, value }) => (
+                    <div key={label} className="grid grid-cols-[minmax(0,38%)_1fr] gap-2 text-sm">
+                      <dt className="text-gray-500 dark:text-gray-400 font-medium">{label}</dt>
+                      <dd className="text-gray-900 dark:text-gray-100 break-words">{value}</dd>
+                    </div>
+                  ))}
+                </dl>
+              </div>
+            )}
+
             {/* Deletion Steps - Only show for deletions */}
             {successMessage && successTitle === "User Deleted Successfully" && (
               <div className="bg-gray-50 dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-4 mb-6">
@@ -7244,14 +7449,20 @@ export default function UserManagement() {
             <div className="flex justify-center">
               <Button
                 onClick={() => {
+                  const wasFamilyMemberSuccess =
+                    successTitle === "Family Member Added Successfully";
                   setShowSuccessModal(false);
                   setSuccessMessage("");
                   setSuccessTitle("");
+                  setCreatedPatientDetails(null);
+                  if (wasFamilyMemberSuccess) {
+                    closeFamilyModal();
+                  }
                 }}
                 className="w-full bg-[#4A7DFF] hover:bg-[#3A6DEF] text-white"
                 data-testid="button-success-ok"
               >
-                Close
+                {createdPatientDetails ? "OK" : "Close"}
               </Button>
             </div>
           </div>

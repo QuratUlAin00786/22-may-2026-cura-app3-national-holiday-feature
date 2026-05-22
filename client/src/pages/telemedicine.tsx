@@ -524,7 +524,8 @@ function PatientList({
         return;
       }
 
-      await warmUpCallerMediaDevices(true);
+      // Mic only while ringing — camera is opened after accept to avoid "Device in use".
+      await warmUpCallerMediaDevices(false);
 
       toast({
         title: "Video Call Starting",
@@ -753,6 +754,7 @@ function PatientList({
       const videoSession = currentVideoCallRef.current;
       if (videoSession && data.roomId === videoSession.roomName) {
         callAcceptedRef.current = true;
+        releaseCallerWarmStream();
         setOutgoingVideoAccepted(true);
         if (callTimeoutRef.current) {
           clearTimeout(callTimeoutRef.current);

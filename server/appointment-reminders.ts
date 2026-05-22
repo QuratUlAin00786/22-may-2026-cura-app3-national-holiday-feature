@@ -1,7 +1,8 @@
 import { db } from "./db";
-import { appointments, users, patients, notifications } from "@shared/schema";
+import { appointments, users, notifications } from "@shared/schema";
 import { and, eq, isNull, sql } from "drizzle-orm";
 import { createBulkNotifications } from "./notification-helper";
+import { storage } from "./storage";
 
 export async function sendUpcomingAppointmentReminders() {
   try {
@@ -60,13 +61,8 @@ export async function sendUpcomingAppointmentReminders() {
         continue;
       }
       
-      // Get patient and provider details
-      const patient = await db
-        .select()
-        .from(patients)
-        .where(eq(patients.id, appointment.patientId))
-        .limit(1)
-        .then(results => results[0]);
+      // Get patient and provider details (decrypt PHI from patients table)
+      const patient = await storage.getPatient(appointment.patientId, appointment.organizationId);
       
       const provider = await db
         .select()

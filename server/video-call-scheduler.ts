@@ -1,9 +1,10 @@
 import { db } from "./db";
-import { scheduledVideoCalls, users, patients, notifications } from "@shared/schema";
+import { scheduledVideoCalls, users, notifications } from "@shared/schema";
 import { and, eq, sql } from "drizzle-orm";
 import { createBulkNotifications } from "./notification-helper";
 import { resolveLiveKitServerUrl } from "./livekit-url";
 import { emailService } from "./services/email";
+import { storage } from "./storage";
 const MK1_BASE_URL = "https://mk1.averox.com/api";
 const MK1_API_KEY = "3a7520ec8dd5de7bf74e2f791b14167773cd747cf8f4f452f3f473251a1c803d";
 
@@ -151,12 +152,10 @@ export async function startScheduledVideoCalls() {
         
         let participant: any;
         if (scheduledCall.participantRole === 'patient') {
-          participant = await db
-            .select()
-            .from(patients)
-            .where(eq(patients.id, scheduledCall.participantId))
-            .limit(1)
-            .then(results => results[0]);
+          participant = await storage.getPatient(
+            scheduledCall.participantId,
+            scheduledCall.organizationId,
+          );
           
           // If patient has a userId, get the user record too
           if (participant?.userId) {

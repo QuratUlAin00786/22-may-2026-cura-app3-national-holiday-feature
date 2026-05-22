@@ -14,6 +14,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Calendar as CalendarComponent } from "@/components/ui/calendar";
 import { Calendar, Clock, MapPin, User, Users, Video, Stethoscope, FileText, Plus, Save, X, Mic, Square, Edit, Trash2, Receipt, ExternalLink, PoundSterling } from "lucide-react";
 import { format, startOfMonth, endOfMonth, eachDayOfInterval, isSameDay, isToday, startOfWeek, endOfWeek } from "date-fns";
+import { useDayRender, type DayProps } from "react-day-picker";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Switch } from "@/components/ui/switch";
@@ -414,6 +415,8 @@ export default function AppointmentCalendar({ onNewAppointment }: { onNewAppoint
   const [duplicateResolveStatus, setDuplicateResolveStatus] = useState<string>("completed");
   const [pendingDuplicateCreatePayload, setPendingDuplicateCreatePayload] = useState<any | null>(null);
   const [newAppointmentDate, setNewAppointmentDate] = useState<Date | undefined>(undefined);
+  const [newApptPickerMonth, setNewApptPickerMonth] = useState<Date>(() => new Date());
+  const [newApptHolidayAcknowledged, setNewApptHolidayAcknowledged] = useState(false);
   const [newSelectedTimeSlot, setNewSelectedTimeSlot] = useState<string>("");
   const [selectedRole, setSelectedRole] = useState<string>("");
   const [selectedProviderId, setSelectedProviderId] = useState<string>("");
@@ -3164,6 +3167,401 @@ Medical License: [License Number]
   const calendarEnd = endOfWeek(monthEnd, { weekStartsOn: 1 });
   const calendarDays = eachDayOfInterval({ start: calendarStart, end: calendarEnd });
 
+  const holidayCalendarRange = useMemo(
+    () => ({
+      from: format(calendarStart, "yyyy-MM-dd"),
+      to: format(calendarEnd, "yyyy-MM-dd"),
+    }),
+    [calendarStart, calendarEnd],
+  );
+
+  const { data: holidayCalendarData } = useQuery({
+    queryKey: ["/api/holiday-calendar", holidayCalendarRange.from, holidayCalendarRange.to],
+    queryFn: async () => {
+      const response = await apiRequest(
+        "GET",
+        `/api/holiday-calendar?from=${holidayCalendarRange.from}&to=${holidayCalendarRange.to}`,
+      );
+      if (!response.ok) throw new Error("Failed to load holidays");
+      return response.json() as Promise<{
+        settings?: {
+          weekendDays?: string[];
+          weekendsNonWorking?: boolean;
+        };
+        holidays?: Array<{
+          holidayDate: string;
+          name: string;
+          holidayType: string;
+          allowShifts?: boolean;
+          isWorkingDay?: boolean;
+        }>;
+      }>;
+    },
+    staleTime: 60_000,
+  });
+
+  const holidayCalendarSettings = holidayCalendarData?.settings;
+
+  type CalendarDayHolidayStatus = {
+    label: string;
+    holidayType: "national" | "regional" | "company" | "weekend";
+    source: "holiday" | "weekend";
+  };
+
+  const calendarHolidayByDate = useMemo(() => {
+    const map = new Map<string, CalendarDayHolidayStatus>();
+    for (const h of holidayCalendarData?.holidays ?? []) {
+      const key = String(h.holidayDate).split("T")[0];
+      const type = (h.holidayType === "regional" || h.holidayType === "company"
+        ? h.holidayType
+        : "national") as CalendarDayHolidayStatus["holidayType"];
+      map.set(key, { label: h.name, holidayType: type, source: "holiday" });
+    }
+    return map;
+  }, [holidayCalendarData?.holidays]);
+
+  const isConfiguredWeekend = useCallback(
+    (date: Date) => {
+      if (!holidayCalendarSettings?.weekendsNonWorking) return false;
+      const dayNames = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+      const dayName = dayNames[date.getDay()];
+      return (holidayCalendarSettings.weekendDays ?? ["Saturday", "Sunday"]).includes(dayName);
+    },
+    [holidayCalendarSettings],
+  );
+
+  const resolveCalendarDayStatus = useCallback(
+    (date: Date): CalendarDayHolidayStatus | null => {
+      const key = format(date, "yyyy-MM-dd");
+      const explicit = calendarHolidayByDate.get(key);
+      if (explicit) return explicit;
+      if (isConfiguredWeekend(date)) {
+        return { label: "", holidayType: "weekend", source: "weekend" };
+      }
+      return null;
+    },
+    [calendarHolidayByDate, isConfiguredWeekend],
+  );
+
+  const calendarDayHolidayCellClass = (
+    holidayType: CalendarDayHolidayStatus["holidayType"] | undefined,
+    isSelected: boolean,
+  ) => {
+    if (isSelected || !holidayType) return "";
+    if (holidayType === "national") {
+      return "bg-amber-100 dark:bg-amber-900/40 border-amber-300 dark:border-amber-500";
+    }
+    if (holidayType === "regional") {
+      return "bg-orange-100 dark:bg-orange-900/40 border-orange-300 dark:border-orange-500";
+    }
+    if (holidayType === "company") {
+      return "bg-purple-100 dark:bg-purple-900/40 border-purple-300 dark:border-purple-500";
+    }
+    return "bg-slate-100 dark:bg-slate-700/60 border-slate-200 dark:border-slate-600";
+  };
+
+  const calendarDayHolidayLabelClass = (holidayType: CalendarDayHolidayStatus["holidayType"]) => {
+    if (holidayType === "national") return "text-amber-900 dark:text-amber-100";
+    if (holidayType === "regional") return "text-orange-900 dark:text-orange-100";
+    if (holidayType === "company") return "text-purple-900 dark:text-purple-100";
+    return "";
+  };
+
+  useEffect(() => {
+    if (showNewAppointment) {
+      setNewApptPickerMonth(newAppointmentDate ?? new Date());
+    }
+  }, [showNewAppointment, newAppointmentDate]);
+
+  const newApptHolidayRange = useMemo(() => {
+    const monthStart = startOfMonth(newApptPickerMonth);
+    const monthEnd = endOfMonth(newApptPickerMonth);
+    const start = startOfWeek(monthStart);
+    const end = endOfWeek(monthEnd);
+    return {
+      from: format(start, "yyyy-MM-dd"),
+      to: format(end, "yyyy-MM-dd"),
+    };
+  }, [newApptPickerMonth]);
+
+  const { data: newApptHolidayData } = useQuery({
+    queryKey: ["/api/holiday-calendar", "new-appointment", newApptHolidayRange.from, newApptHolidayRange.to],
+    queryFn: async () => {
+      const response = await apiRequest(
+        "GET",
+        `/api/holiday-calendar?from=${newApptHolidayRange.from}&to=${newApptHolidayRange.to}`,
+      );
+      if (!response.ok) throw new Error("Failed to load holidays");
+      return response.json() as Promise<{
+        settings?: {
+          weekendDays?: string[];
+          weekendsNonWorking?: boolean;
+        };
+        holidays?: Array<{
+          holidayDate: string;
+          name: string;
+          holidayType: string;
+          allowShifts: boolean;
+          isWorkingDay: boolean;
+        }>;
+      }>;
+    },
+    enabled: showNewAppointment,
+    staleTime: 60_000,
+  });
+
+  type NewApptHolidayStatus = {
+    label: string;
+    holidayType: string;
+    allowShifts: boolean;
+    isWorkingDay: boolean;
+    isNonWorking: boolean;
+    source: "holiday" | "weekend";
+  };
+
+  const NEW_APPT_HOLIDAY_TYPE_LABELS: Record<string, string> = {
+    national: "National",
+    regional: "Regional",
+    company: "Company",
+    weekend: "Weekend",
+  };
+
+  const newApptHolidayByDate = useMemo(() => {
+    const map = new Map<string, NewApptHolidayStatus>();
+    const defaultAllow = newApptHolidayData?.settings?.defaultAllowShiftsOnHolidays ?? false;
+    for (const h of newApptHolidayData?.holidays ?? []) {
+      const key = String(h.holidayDate).split("T")[0];
+      const allowShifts = h.allowShifts ?? defaultAllow;
+      map.set(key, {
+        label: h.name,
+        holidayType: h.holidayType,
+        allowShifts,
+        isWorkingDay: h.isWorkingDay,
+        isNonWorking: !h.isWorkingDay,
+        source: "holiday",
+      });
+    }
+    return map;
+  }, [newApptHolidayData?.holidays, newApptHolidayData?.settings?.defaultAllowShiftsOnHolidays]);
+
+  const resolveNewApptHolidayStatus = useCallback(
+    (date: Date): NewApptHolidayStatus | null => {
+      const dateKey = format(date, "yyyy-MM-dd");
+      const explicit = newApptHolidayByDate.get(dateKey);
+      if (explicit) return explicit;
+
+      const settings = newApptHolidayData?.settings;
+      if (!settings?.weekendsNonWorking) return null;
+      const dayNames = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+      const dayName = dayNames[date.getDay()];
+      if (!(settings.weekendDays ?? ["Saturday", "Sunday"]).includes(dayName)) return null;
+
+      const allowShifts = settings.defaultAllowShiftsOnHolidays ?? false;
+      return {
+        label: `${dayName} (weekend)`,
+        holidayType: "weekend",
+        allowShifts,
+        isWorkingDay: false,
+        isNonWorking: true,
+        source: "weekend",
+      };
+    },
+    [newApptHolidayByDate, newApptHolidayData?.settings],
+  );
+
+  const isNewApptDateHolidayBlocked = useCallback(
+    (date: Date) => {
+      const status = resolveNewApptHolidayStatus(date);
+      if (!status) return false;
+      if (status.source === "holiday") return !status.allowShifts;
+      return status.isNonWorking && !status.allowShifts;
+    },
+    [resolveNewApptHolidayStatus],
+  );
+
+  const newApptSelectedHolidayStatus = useMemo(
+    () => (newAppointmentDate ? resolveNewApptHolidayStatus(newAppointmentDate) : null),
+    [newAppointmentDate, resolveNewApptHolidayStatus],
+  );
+
+  useEffect(() => {
+    setNewApptHolidayAcknowledged(false);
+  }, [newAppointmentDate]);
+
+  useEffect(() => {
+    if (!showNewAppointment) {
+      setNewApptHolidayAcknowledged(false);
+    }
+  }, [showNewAppointment]);
+
+  const isNewApptConfiguredWeekend = useCallback(
+    (date: Date) => {
+      const settings = newApptHolidayData?.settings;
+      if (!settings?.weekendsNonWorking) return false;
+      const dayNames = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+      const dayName = dayNames[date.getDay()];
+      return (settings.weekendDays ?? ["Saturday", "Sunday"]).includes(dayName);
+    },
+    [newApptHolidayData?.settings],
+  );
+
+  const NewAppointmentPickerDay = useCallback(
+    function NewAppointmentPickerDay(props: DayProps) {
+      const buttonRef = useRef<HTMLButtonElement>(null);
+      const dayRender = useDayRender(props.date, props.displayMonth, buttonRef);
+      const dateKey = format(props.date, "yyyy-MM-dd");
+      const holidayStatus = newApptHolidayByDate.get(dateKey);
+      const holidayLabel = holidayStatus?.label;
+      const holidayType = holidayStatus?.holidayType;
+      const isSelected = !!dayRender.activeModifiers?.selected;
+      const showHolidayLabel =
+        !!holidayLabel && holidayStatus?.source === "holiday" && !isSelected;
+
+      const dayContent = (
+        <>
+          <span className="text-sm leading-none">{props.date.getDate()}</span>
+          {showHolidayLabel && holidayType && (
+            <span
+              className={cn(
+                "text-[8px] leading-none truncate max-w-[2.25rem] mt-0.5 font-normal",
+                calendarDayHolidayLabelClass(holidayType),
+              )}
+            >
+              {holidayLabel.length > 7 ? `${holidayLabel.slice(0, 6)}…` : holidayLabel}
+            </span>
+          )}
+        </>
+      );
+
+      if (dayRender.isHidden) {
+        return <></>;
+      }
+
+      if (!dayRender.isButton) {
+        return <div {...dayRender.divProps}>{dayContent}</div>;
+      }
+
+      return (
+        <td {...dayRender.cellProps}>
+          <button
+            ref={buttonRef}
+            {...dayRender.buttonProps}
+            title={holidayLabel}
+            className={cn(
+              dayRender.buttonProps.className,
+              "flex flex-col items-center justify-center h-auto min-h-9 w-9 py-0.5 font-normal",
+              dayRender.activeModifiers?.nationalHoliday &&
+                !isSelected &&
+                "bg-amber-100 text-amber-900 hover:bg-amber-200 dark:bg-amber-900/40 dark:text-amber-100 rounded-md",
+              dayRender.activeModifiers?.regionalHoliday &&
+                !isSelected &&
+                "bg-orange-100 text-orange-900 dark:bg-orange-900/40 rounded-md",
+              dayRender.activeModifiers?.companyHoliday &&
+                !isSelected &&
+                "bg-purple-100 text-purple-900 dark:bg-purple-900/40 rounded-md",
+              dayRender.activeModifiers?.configWeekend &&
+                !isSelected &&
+                !dayRender.activeModifiers?.nationalHoliday &&
+                !dayRender.activeModifiers?.regionalHoliday &&
+                !dayRender.activeModifiers?.companyHoliday &&
+                "bg-slate-100 text-slate-700 dark:bg-slate-700/60 rounded-md",
+            )}
+          >
+            {dayContent}
+          </button>
+        </td>
+      );
+    },
+    [newApptHolidayByDate],
+  );
+
+  const newApptHolidayCalendarProps = useMemo(
+    () => ({
+      month: newApptPickerMonth,
+      onMonthChange: setNewApptPickerMonth,
+      modifiers: {
+        nationalHoliday: (date: Date) =>
+          newApptHolidayByDate.get(format(date, "yyyy-MM-dd"))?.holidayType === "national",
+        regionalHoliday: (date: Date) =>
+          newApptHolidayByDate.get(format(date, "yyyy-MM-dd"))?.holidayType === "regional",
+        companyHoliday: (date: Date) =>
+          newApptHolidayByDate.get(format(date, "yyyy-MM-dd"))?.holidayType === "company",
+        configWeekend: (date: Date) => {
+          const key = format(date, "yyyy-MM-dd");
+          if (newApptHolidayByDate.has(key)) return false;
+          return isNewApptConfiguredWeekend(date);
+        },
+      },
+      classNames: {
+        day_selected:
+          "bg-blue-600 text-white hover:bg-blue-700 focus:bg-blue-700 rounded-md",
+        day_today:
+          "bg-blue-100 text-blue-700 aria-selected:bg-blue-600 aria-selected:text-white rounded-md",
+      },
+      components: {
+        Day: NewAppointmentPickerDay,
+      },
+    }),
+    [newApptPickerMonth, newApptHolidayByDate, isNewApptConfiguredWeekend, NewAppointmentPickerDay],
+  );
+
+  const newApptHolidayLegend = (
+    <div className="flex flex-wrap gap-3 mt-2 pt-2 border-t border-gray-200 dark:border-gray-600 text-[10px] text-gray-500 dark:text-gray-400">
+      <span className="inline-flex items-center gap-1">
+        <span className="w-2.5 h-2.5 rounded bg-amber-200 border border-amber-300" />
+        National
+      </span>
+      <span className="inline-flex items-center gap-1">
+        <span className="w-2.5 h-2.5 rounded bg-orange-200 border border-orange-300" />
+        Regional
+      </span>
+      <span className="inline-flex items-center gap-1">
+        <span className="w-2.5 h-2.5 rounded bg-purple-200 border border-purple-300" />
+        Company
+      </span>
+      <span className="inline-flex items-center gap-1">
+        <span className="w-2.5 h-2.5 rounded bg-slate-200 border border-slate-300" />
+        Weekend
+      </span>
+    </div>
+  );
+
+  const newApptHolidayBanner = newApptSelectedHolidayStatus ? (
+    <div
+      className={cn(
+        "flex items-start gap-2 rounded-md border p-3 text-sm mb-3",
+        newApptSelectedHolidayStatus.allowShifts
+          ? "border-amber-300 bg-amber-50 text-amber-950 dark:bg-amber-900/20 dark:text-amber-100"
+          : "border-red-300 bg-red-50 text-red-900 dark:bg-red-900/20 dark:text-red-100",
+      )}
+    >
+      <AlertTriangle className="h-4 w-4 shrink-0 mt-0.5" />
+      <div>
+        <p className="font-medium">
+          {NEW_APPT_HOLIDAY_TYPE_LABELS[newApptSelectedHolidayStatus.holidayType] ?? "Holiday"}:{" "}
+          {newApptSelectedHolidayStatus.label}
+        </p>
+        <p className="text-xs mt-1 opacity-90">
+          {newApptSelectedHolidayStatus.allowShifts
+            ? "Appointments are allowed with a confirmation warning."
+            : "Appointments cannot be booked on this date."}
+          {newApptSelectedHolidayStatus.isWorkingDay ? " · Marked as a working holiday." : ""}
+        </p>
+      </div>
+    </div>
+  ) : null;
+
+  const isNewApptDateDisabled = useCallback(
+    (date: Date) => {
+      const today = new Date();
+      today.setHours(0, 0, 0, 0);
+      if (date < today) return true;
+      if (isNewApptDateHolidayBlocked(date)) return true;
+      return !hasShiftsOnDate(date);
+    },
+    [isNewApptDateHolidayBlocked, hasShiftsOnDate],
+  );
+
   const getAppointmentsForDate = (date: Date) => {
     return appointments.filter((apt: any) => {
       // Extract date without timezone conversion: "2025-11-17T22:45:00" -> "2025-11-17"
@@ -3489,23 +3887,51 @@ Medical License: [License Number]
               const dayAppointments = getAppointmentsForDate(day);
               const isSelected = isSameDay(day, selectedDate);
               const isCurrentDay = isToday(day);
+              const isCurrentMonth =
+                day.getMonth() === selectedDate.getMonth() &&
+                day.getFullYear() === selectedDate.getFullYear();
+              const dayHolidayStatus = resolveCalendarDayStatus(day);
+              const holidayLabel =
+                dayHolidayStatus?.source === "holiday" ? dayHolidayStatus.label : "";
               
               return (
                 <div
                   key={day.toString()}
-                  className={`
-                    h-[50px] p-1 border rounded cursor-pointer transition-colors flex flex-col
-                    ${isSelected 
-                      ? 'border-blue-500 bg-blue-50 dark:bg-blue-900/20 dark:border-blue-400' 
-                      : 'border-gray-200 dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-800'}
-                    ${isCurrentDay ? 'bg-yellow-50 dark:bg-yellow-900/20 border-yellow-300 dark:border-yellow-600' : ''}
-                  `}
+                  title={holidayLabel || undefined}
+                  className={cn(
+                    "min-h-[58px] p-1 border rounded-md cursor-pointer transition-colors flex flex-col",
+                    !isSelected && "border-gray-200 dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-800",
+                    isSelected && "border-blue-600 bg-blue-600 text-white hover:bg-blue-700",
+                    !isSelected &&
+                      calendarDayHolidayCellClass(dayHolidayStatus?.holidayType, isSelected),
+                    !isSelected &&
+                      isCurrentDay &&
+                      !dayHolidayStatus &&
+                      "bg-blue-100 dark:bg-blue-900/30 border-blue-300 dark:border-blue-500",
+                  )}
                   onClick={() => setSelectedDate(day)}
                 >
-                  <div className={`text-sm font-medium ${isCurrentDay ? 'text-yellow-800 dark:text-yellow-200' : 'text-gray-900 dark:text-gray-100'}`}>
-                    {format(day, "d")}
+                  <div
+                    className={cn(
+                      "flex flex-col items-center justify-center leading-tight",
+                      !isCurrentMonth && !isSelected && "text-gray-300 dark:text-gray-600",
+                      isCurrentMonth && !isSelected && "text-gray-900 dark:text-gray-100",
+                      isSelected && "text-white",
+                    )}
+                  >
+                    <span className="text-sm font-medium">{format(day, "d")}</span>
+                    {holidayLabel && !isSelected && dayHolidayStatus && (
+                      <span
+                        className={cn(
+                          "text-[9px] font-normal truncate max-w-full px-0.5 opacity-90 mt-0.5",
+                          calendarDayHolidayLabelClass(dayHolidayStatus.holidayType),
+                        )}
+                      >
+                        {holidayLabel.length > 8 ? `${holidayLabel.slice(0, 7)}…` : holidayLabel}
+                      </span>
+                    )}
                   </div>
-                  <div className="flex flex-wrap gap-0.5 mt-0.5 flex-1">
+                  <div className="flex flex-wrap gap-0.5 mt-0.5 flex-1 justify-center">
                     {dayAppointments.slice(0, 3).map((appointment: any) => (
                       <div
                         key={appointment.id}
@@ -3534,6 +3960,28 @@ Medical License: [License Number]
                 </div>
               );
             })}
+          </div>
+          <div className="flex flex-wrap gap-4 mt-4 pt-3 border-t border-gray-100 dark:border-gray-700 text-xs text-gray-600 dark:text-gray-400">
+            <span className="inline-flex items-center gap-1.5">
+              <span className="w-3 h-3 rounded bg-amber-200 dark:bg-amber-700 border border-amber-300" />
+              National
+            </span>
+            <span className="inline-flex items-center gap-1.5">
+              <span className="w-3 h-3 rounded bg-orange-200 dark:bg-orange-700 border border-orange-300" />
+              Regional
+            </span>
+            <span className="inline-flex items-center gap-1.5">
+              <span className="w-3 h-3 rounded bg-purple-200 dark:bg-purple-700 border border-purple-300" />
+              Company
+            </span>
+            <span className="inline-flex items-center gap-1.5">
+              <span className="w-3 h-3 rounded bg-slate-200 dark:bg-slate-600 border border-slate-300" />
+              Weekend
+            </span>
+            <span className="inline-flex items-center gap-1.5">
+              <span className="w-3 h-3 rounded bg-blue-600" />
+              Selected
+            </span>
           </div>
         </CardContent>
       </Card>
@@ -5124,18 +5572,18 @@ Medical License: [License Number]
                         mode="single"
                         selected={newAppointmentDate}
                         onSelect={(date) => {
+                          if (!date) {
+                            setNewAppointmentDate(undefined);
+                            return;
+                          }
+                          if (isNewApptDateHolidayBlocked(date)) return;
                           setNewAppointmentDate(date);
                         }}
-                        disabled={(date: Date) => {
-                          const today = new Date();
-                          today.setHours(0, 0, 0, 0);
-                          
-                          if (date < today) return true;
-                          
-                          return !hasShiftsOnDate(date);
-                        }}
+                        disabled={isNewApptDateDisabled}
                         className="rounded-md"
+                        {...newApptHolidayCalendarProps}
                       />
+                      {newApptHolidayLegend}
                     </div>
                   </div>
 
@@ -5147,6 +5595,20 @@ Medical License: [License Number]
                         <div className="flex items-center justify-center h-full">
                           <p className="text-gray-400 text-sm">Time slots will appear here</p>
                         </div>
+                      ) : newApptSelectedHolidayStatus && !newApptHolidayAcknowledged ? (
+                        <div className="flex flex-col justify-center h-full px-1">
+                          {newApptHolidayBanner}
+                          <p className="text-xs text-gray-600 dark:text-gray-400 mb-3">
+                            This date is a configured holiday. Review the notice above, then continue to choose a time slot.
+                          </p>
+                          <Button
+                            type="button"
+                            className="w-full"
+                            onClick={() => setNewApptHolidayAcknowledged(true)}
+                          >
+                            Continue to time slots
+                          </Button>
+                        </div>
                       ) : timeSlots.length === 0 ? (
                         <div className="flex items-center justify-center h-full">
                           <div className="text-center">
@@ -5155,7 +5617,9 @@ Medical License: [License Number]
                           </div>
                         </div>
                       ) : (
-                        <div className="grid grid-cols-2 gap-2">
+                        <>
+                          {newApptHolidayBanner}
+                          <div className="grid grid-cols-2 gap-2">
                           {timeSlots.map((slot) => {
                             const providerForShift = selectedProviderId ? parseInt(selectedProviderId, 10) : null;
                             const inShift =
@@ -5207,6 +5671,7 @@ Medical License: [License Number]
                             );
                           })}
                         </div>
+                        </>
                       )}
                     </div>
                   </div>
@@ -5352,18 +5817,18 @@ Medical License: [License Number]
                         mode="single"
                         selected={newAppointmentDate}
                         onSelect={(date) => {
+                          if (!date) {
+                            setNewAppointmentDate(undefined);
+                            return;
+                          }
+                          if (isNewApptDateHolidayBlocked(date)) return;
                           setNewAppointmentDate(date);
                         }}
-                        disabled={(date: Date) => {
-                          const today = new Date();
-                          today.setHours(0, 0, 0, 0);
-                          
-                          if (date < today) return true;
-                          
-                          return !hasShiftsOnDate(date);
-                        }}
+                        disabled={isNewApptDateDisabled}
                         className="rounded-md"
+                        {...newApptHolidayCalendarProps}
                       />
+                      {newApptHolidayLegend}
                     </div>
                   </div>
 
@@ -5371,6 +5836,27 @@ Medical License: [License Number]
                   <div>
                     <Label className="text-sm font-medium text-gray-600 mb-2 block">Select Time Slot</Label>
                     <div className="border rounded-lg p-3 bg-gray-50 h-[320px] overflow-y-auto">
+                      {!newAppointmentDate ? (
+                        <div className="flex items-center justify-center h-full">
+                          <p className="text-gray-400 text-sm">Time slots will appear here</p>
+                        </div>
+                      ) : newApptSelectedHolidayStatus && !newApptHolidayAcknowledged ? (
+                        <div className="flex flex-col justify-center h-full px-1">
+                          {newApptHolidayBanner}
+                          <p className="text-xs text-gray-600 dark:text-gray-400 mb-3">
+                            This date is a configured holiday. Review the notice above, then continue to choose a time slot.
+                          </p>
+                          <Button
+                            type="button"
+                            className="w-full"
+                            onClick={() => setNewApptHolidayAcknowledged(true)}
+                          >
+                            Continue to time slots
+                          </Button>
+                        </div>
+                      ) : (
+                      <>
+                      {newApptHolidayBanner}
                       <div className="grid grid-cols-2 gap-2">
                           {timeSlots.map((slot) => {
                             const providerForShift = selectedProviderId ? parseInt(selectedProviderId, 10) : null;
@@ -5417,6 +5903,8 @@ Medical License: [License Number]
                           );
                         })}
                       </div>
+                      </>
+                      )}
                     </div>
                   </div>
                 </div>

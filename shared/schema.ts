@@ -386,6 +386,30 @@ export const staffShifts = pgTable("staff_shifts", {
   updatedAt: timestamp("updated_at").defaultNow().notNull(),
 });
 
+// Organization holiday calendar (global config for shift / scheduling workflows)
+export const organizationHolidaySettings = pgTable("organization_holiday_settings", {
+  organizationId: integer("organization_id").primaryKey().notNull(),
+  weekendDays: text("weekend_days").array().notNull().default(["Saturday", "Sunday"]),
+  weekendsNonWorking: boolean("weekends_non_working").notNull().default(true),
+  defaultAllowShiftsOnHolidays: boolean("default_allow_shifts_on_holidays").notNull().default(false),
+  updatedAt: timestamp("updated_at").defaultNow().notNull(),
+});
+
+export const organizationHolidays = pgTable("organization_holidays", {
+  id: serial("id").primaryKey(),
+  organizationId: integer("organization_id").notNull(),
+  holidayDate: date("holiday_date").notNull(),
+  name: text("name").notNull(),
+  holidayType: varchar("holiday_type", { length: 20 }).notNull().default("national"), // national, regional, company
+  region: text("region"),
+  allowShifts: boolean("allow_shifts").notNull().default(false),
+  isWorkingDay: boolean("is_working_day").notNull().default(false),
+  notes: text("notes"),
+  createdBy: integer("created_by").references(() => users.id),
+  createdAt: timestamp("created_at").defaultNow().notNull(),
+  updatedAt: timestamp("updated_at").defaultNow().notNull(),
+});
+
 // Default Shifts for Staff (Lifetime default working hours)
 export const doctorDefaultShifts = pgTable("doctor_default_shifts", {
   id: serial("id").primaryKey(),
@@ -406,9 +430,9 @@ export const patients = pgTable("patients", {
   patientId: text("patient_id").notNull(), // Custom patient ID per organization
   firstName: text("first_name").notNull(),
   lastName: text("last_name").notNull(),
-  relation: varchar("relation", { length: 20 }), // Self, Father, Mother, Son, Daughter, Spouse, Other
-  dateOfBirth: date("date_of_birth", { mode: 'string' }),
-  genderAtBirth: varchar("gender_at_birth", { length: 20 }),
+  relation: text("relation"), // Self, Father, Mother, Son, Daughter, Spouse, Other (or encrypted envelope)
+  dateOfBirth: text("date_of_birth"), // ISO date or encrypted envelope
+  genderAtBirth: text("gender_at_birth"), // plaintext or encrypted envelope
   email: text("email"),
   phone: text("phone"),
   nhsNumber: text("nhs_number"), // NHS number for UK patients
@@ -639,7 +663,7 @@ export const aiInsights = pgTable("ai_insights", {
   description: text("description").notNull(),
   severity: varchar("severity", { length: 10 }).notNull().default("medium"), // low, medium, high, critical
   actionRequired: boolean("action_required").notNull().default(false),
-  confidence: varchar("confidence", { length: 10 }), // 0.00 to 1.00
+  confidence: varchar("confidence", { length: 32 }), // 0.00–1.00 (widen for legacy DB varchar(10) migrations)
   metadata: jsonb("metadata").$type<{
     relatedConditions?: string[];
     suggestedActions?: string[];
@@ -2924,6 +2948,16 @@ export const insertDoctorDefaultShiftSchema = createInsertSchema(doctorDefaultSh
   updatedAt: true,
 });
 
+export const insertOrganizationHolidaySettingsSchema = createInsertSchema(organizationHolidaySettings).omit({
+  updatedAt: true,
+});
+
+export const insertOrganizationHolidaySchema = createInsertSchema(organizationHolidays).omit({
+  id: true,
+  createdAt: true,
+  updatedAt: true,
+});
+
 // GDPR Insert Schemas
 export const insertGdprConsentSchema = createInsertSchema(gdprConsents).omit({
   id: true,
@@ -3275,6 +3309,11 @@ export type InsertStaffShift = z.infer<typeof insertStaffShiftSchema>;
 
 export type DoctorDefaultShift = typeof doctorDefaultShifts.$inferSelect;
 export type InsertDoctorDefaultShift = z.infer<typeof insertDoctorDefaultShiftSchema>;
+
+export type OrganizationHolidaySettings = typeof organizationHolidaySettings.$inferSelect;
+export type InsertOrganizationHolidaySettings = z.infer<typeof insertOrganizationHolidaySettingsSchema>;
+export type OrganizationHoliday = typeof organizationHolidays.$inferSelect;
+export type InsertOrganizationHoliday = z.infer<typeof insertOrganizationHolidaySchema>;
 
 // GDPR Types
 export type GdprConsent = typeof gdprConsents.$inferSelect;

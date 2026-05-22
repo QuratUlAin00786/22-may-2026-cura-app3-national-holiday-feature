@@ -83,6 +83,30 @@ export default function Patients() {
   
   // State for view mode (true = List view, false = Grid view)
   const [isListView, setIsListView] = useState(true);
+
+  // List view pagination
+  const LIST_PAGE_SIZE = 10;
+  const [listPage, setListPage] = useState(1);
+  const [listTotalPages, setListTotalPages] = useState(1);
+  const [listTotalRows, setListTotalRows] = useState(0);
+
+  const handleListPaginationInfo = useCallback(
+    (info: { totalRows: number; totalPages: number }) => {
+      setListTotalRows(info.totalRows);
+      setListTotalPages(info.totalPages);
+    },
+    [],
+  );
+
+  useEffect(() => {
+    setListPage(1);
+  }, [genderFilter, isListView]);
+
+  useEffect(() => {
+    if (listPage > listTotalPages) {
+      setListPage(Math.max(1, listTotalPages));
+    }
+  }, [listPage, listTotalPages]);
   
   // Success modal state
   const [showSuccessModal, setShowSuccessModal] = useState(false);
@@ -731,7 +755,77 @@ export default function Patients() {
           viewMode={isListView ? "list" : "grid"}
           canEditPatient={canEdit('patients')}
           canDeletePatient={canDelete('patients')}
+          listPage={isListView ? listPage : undefined}
+          listPageSize={isListView ? LIST_PAGE_SIZE : undefined}
+          onListPageChange={isListView ? setListPage : undefined}
+          onListPaginationInfo={isListView ? handleListPaginationInfo : undefined}
         />
+
+        {isListView && listTotalPages > 1 && (
+          <div className="flex items-center justify-between pt-2">
+            <p className="text-sm text-neutral-600 dark:text-neutral-300">
+              Page {listPage} of {listTotalPages}
+              {" · "}
+              {listTotalRows} patient{listTotalRows !== 1 ? "s" : ""}
+            </p>
+            <div className="flex items-center gap-1">
+              <Button
+                size="sm"
+                variant="outline"
+                disabled={listPage <= 1}
+                onClick={() => setListPage(1)}
+                data-testid="button-list-page-first"
+              >
+                «
+              </Button>
+              <Button
+                size="sm"
+                variant="outline"
+                disabled={listPage <= 1}
+                onClick={() => setListPage((p) => Math.max(1, p - 1))}
+                data-testid="button-list-page-prev"
+              >
+                ‹ Prev
+              </Button>
+              {Array.from({ length: Math.min(5, listTotalPages) }, (_, i) => {
+                const half = 2;
+                const start = Math.max(1, Math.min(listPage - half, listTotalPages - 4));
+                const pageNum = start + i;
+                if (pageNum > listTotalPages) return null;
+                return (
+                  <Button
+                    key={pageNum}
+                    size="sm"
+                    variant={pageNum === listPage ? "default" : "outline"}
+                    onClick={() => setListPage(pageNum)}
+                    className="w-8 h-8 p-0"
+                    data-testid={`button-list-page-${pageNum}`}
+                  >
+                    {pageNum}
+                  </Button>
+                );
+              })}
+              <Button
+                size="sm"
+                variant="outline"
+                disabled={listPage >= listTotalPages}
+                onClick={() => setListPage((p) => Math.min(listTotalPages, p + 1))}
+                data-testid="button-list-page-next"
+              >
+                Next ›
+              </Button>
+              <Button
+                size="sm"
+                variant="outline"
+                disabled={listPage >= listTotalPages}
+                onClick={() => setListPage(listTotalPages)}
+                data-testid="button-list-page-last"
+              >
+                »
+              </Button>
+            </div>
+          </div>
+        )}
       </div>
 
       <PatientModal 

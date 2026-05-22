@@ -4,6 +4,7 @@
 import { db } from "./db.js";
 import { medicalRecords } from "@shared/schema.js";
 import { eq, and } from "drizzle-orm";
+import { storage } from "./storage.js";
 
 interface SeedOptions {
   orgSubdomain?: string;
@@ -42,7 +43,12 @@ export async function seedProductionMedicalRecords(options: SeedOptions = {}) {
     const results = [];
     
     // Process each patient (up to maxPatients)
-    for (const targetPatient of allPatients) {
+    for (const rawPatient of allPatients) {
+      const targetPatient = storage.normalizePatientFromRow(rawPatient);
+      if (!targetPatient) {
+        console.log(`⚠️  Skipping patient id=${rawPatient.id}: could not decrypt/normalize row`);
+        continue;
+      }
       console.log(`🎯 Processing patient: ID ${targetPatient.id}, Name: ${targetPatient.firstName} ${targetPatient.lastName}`);
       
       // Check if medical records already exist for this patient

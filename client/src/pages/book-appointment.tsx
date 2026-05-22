@@ -8,10 +8,14 @@ import { Button } from "@/components/ui/button";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { useToast } from "@/hooks/use-toast";
-import { format } from "date-fns";
+import { format, isBefore, startOfDay } from "date-fns";
 import { Textarea } from "@/components/ui/textarea";
 import { Calendar as CalendarComponent } from "@/components/ui/calendar";
 import { Loader2 } from "lucide-react";
+import {
+  useBookingHolidayCalendar,
+  BookingHolidayTimeSlotPanel,
+} from "@/hooks/use-booking-holiday-calendar";
 
 function getSubdomainFromPath(pathname: string): string | null {
   const parts = pathname.split("/").filter(Boolean);
@@ -153,6 +157,43 @@ export default function PublicBookAppointmentPage() {
     if ([y, mo, d].some((n) => Number.isNaN(n))) return undefined;
     return new Date(y, mo - 1, d, 0, 0, 0, 0);
   };
+
+  const selectedBookingDate = useMemo(
+    () => (date ? ymdToLocalDate(date) : undefined),
+    [date],
+  );
+
+  const setSelectedBookingDate = useCallback(
+    (d: Date | undefined) => {
+      if (!d) {
+        setDate("");
+        setTime("");
+        return;
+      }
+      setDate(dateToLocalYMD(d));
+      setTime("");
+    },
+    [],
+  );
+
+  const publicBookingHoliday = useBookingHolidayCalendar({
+    enabled: !!subdomain,
+    selectedDate: selectedBookingDate,
+    setSelectedDate: setSelectedBookingDate,
+    holidayCalendarUrl: subdomain
+      ? (from, to) =>
+          `/api/public/${encodeURIComponent(subdomain)}/holiday-calendar?from=${from}&to=${to}`
+      : undefined,
+  });
+
+  const isPublicBookingDateDisabled = useCallback(
+    (d: Date) => {
+      const today = startOfDay(new Date());
+      if (isBefore(startOfDay(d), today)) return true;
+      return publicBookingHoliday.isDateHolidayBlocked(d);
+    },
+    [publicBookingHoliday.isDateHolidayBlocked],
+  );
 
   // Duplicate check is performed only on "Book Appointment" click (handleSubmit),
   // so the popup always reflects the chosen service + time slot.
@@ -957,32 +998,29 @@ export default function PublicBookAppointmentPage() {
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
                   <div>
                     <label className="block text-sm font-medium mb-2">Select Date</label>
-                    <div className="border rounded-lg p-3 bg-gray-50 h-[360px] overflow-y-auto">
+                    <div className="border rounded-lg p-3 bg-gray-50 overflow-y-auto">
                       <CalendarComponent
                         mode="single"
-                        selected={date ? (ymdToLocalDate(date) || new Date(`${date}T00:00:00`)) : undefined}
+                        selected={selectedBookingDate}
                         onSelect={(d) => {
-                          if (!d) return;
-                          const dateStr = dateToLocalYMD(d);
-                          setDate(dateStr);
+                          publicBookingHoliday.handleDateSelect(d);
                           if (hasSubmitted) setTimeout(() => validate(), 0);
                         }}
-                        disabled={(d) => {
-                          const today = new Date();
-                          today.setHours(0, 0, 0, 0);
-                          return d < today;
-                        }}
+                        disabled={isPublicBookingDateDisabled}
                         className="rounded-md w-full"
+                        {...publicBookingHoliday.calendarProps}
                         classNames={{
+                          ...publicBookingHoliday.calendarProps.classNames,
                           month: "space-y-4 w-full",
                           table: "w-full table-fixed border-collapse",
                           head_cell: "text-muted-foreground rounded-md w-full font-normal text-[0.8rem]",
                           cell:
                             "h-10 w-full text-center text-sm p-0 relative [&:has([aria-selected].day-range-end)]:rounded-r-md [&:has([aria-selected].day-outside)]:bg-accent/50 [&:has([aria-selected])]:bg-accent first:[&:has([aria-selected])]:rounded-l-md last:[&:has([aria-selected])]:rounded-r-md focus-within:relative focus-within:z-20",
                           day:
-                            "h-10 w-full p-0 font-normal aria-selected:opacity-100 inline-flex items-center justify-center rounded-md hover:bg-accent hover:text-accent-foreground",
+                            "h-10 w-full p-0 font-normal aria-selected:opacity-100 inline-flex flex-col items-center justify-center rounded-md hover:bg-accent hover:text-accent-foreground",
                         }}
                       />
+                      {publicBookingHoliday.legend}
                     </div>
                     {hasSubmitted && errors.date && (
                       <p className="text-xs text-red-600 mt-2">{errors.date}</p>
@@ -996,6 +1034,11 @@ export default function PublicBookAppointmentPage() {
                       )}
                     </div>
                     <div className="border rounded-lg bg-gray-50 h-[360px] overflow-hidden flex flex-col">
+                      <BookingHolidayTimeSlotPanel
+                        selectedDate={selectedBookingDate}
+                        bookingHoliday={publicBookingHoliday}
+                        emptyMessage="Time slots will appear here"
+                      >
                       <div className="p-3 border-b bg-muted/30">
                         <div className="text-xs font-medium mb-1">Legend</div>
                         <div className="flex items-center gap-4 text-xs">
@@ -1011,8 +1054,8 @@ export default function PublicBookAppointmentPage() {
                       </div>
                       <div className="p-3 overflow-y-auto flex-1">
                         {allSlots.length === 0 && !slotsLoading ? (
-                          <div className="flex items-center justify-center h-full">
-                            <p className="text-gray-400 text-sm">Time slots will appear here</p>
+                          <div className="flex items-center justify-center h-full min-h-[120px]">
+                            <p className="text-gray-400 text-sm">No available time slots for this date.</p>
                           </div>
                         ) : (
                           <div className="grid grid-cols-2 gap-2">
@@ -1053,6 +1096,7 @@ export default function PublicBookAppointmentPage() {
                           </div>
                         )}
                       </div>
+                      </BookingHolidayTimeSlotPanel>
                     </div>
                     {hasSubmitted && errors.time && (
                       <p className="text-xs text-red-600 mt-2">{errors.time}</p>

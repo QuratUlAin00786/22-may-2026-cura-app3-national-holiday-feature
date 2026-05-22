@@ -707,6 +707,67 @@ export default function ImagingPage() {
     return foundPatient;
   }, [user, patientsData]);
 
+  const patientRelationRank = (relation?: string | null) => {
+    if (!relation) return 50;
+    const r = String(relation).toLowerCase();
+    if (r === "self") return 0;
+    if (r === "spouse") return 10;
+    if (r === "father") return 20;
+    if (r === "mother") return 21;
+    if (r === "son") return 30;
+    if (r === "daughter") return 31;
+    if (r === "dependent child") return 32;
+    if (r === "other") return 40;
+    return 45;
+  };
+
+  const formatPatientDropdownLabel = (patient: any) =>
+    `${patient?.firstName ?? ""} ${patient?.lastName ?? ""}`.trim() +
+    (patient?.patientId ? ` (${patient.patientId})` : "");
+
+  /** Group by login userId — account holder first, family members with ↳ */
+  const patientDropdownGroups = useMemo(() => {
+    if (!Array.isArray(patients) || patients.length === 0) return [];
+
+    const map = new Map<number | string, any[]>();
+    for (const p of patients) {
+      const key = p?.userId ?? `no-user-${p?.id ?? Math.random()}`;
+      const list = map.get(key) ?? [];
+      list.push(p);
+      map.set(key, list);
+    }
+
+    const groups = Array.from(map.values()).map((members) => {
+      const sorted = [...members].sort((a, b) => {
+        const rr = patientRelationRank(a?.relation) - patientRelationRank(b?.relation);
+        if (rr !== 0) return rr;
+        const na = `${a?.firstName ?? ""} ${a?.lastName ?? ""}`.trim().toLowerCase();
+        const nb = `${b?.firstName ?? ""} ${b?.lastName ?? ""}`.trim().toLowerCase();
+        return na.localeCompare(nb);
+      });
+
+      const main =
+        sorted.find((m) => String(m?.relation ?? "").trim().toLowerCase() === "self") ??
+        sorted[0];
+      const relatives = sorted.filter((m) => m !== main);
+      return { main, relatives };
+    });
+
+    groups.sort((a, b) => {
+      const na = `${a.main?.firstName ?? ""} ${a.main?.lastName ?? ""}`.trim().toLowerCase();
+      const nb = `${b.main?.firstName ?? ""} ${b.main?.lastName ?? ""}`.trim().toLowerCase();
+      return na.localeCompare(nb);
+    });
+
+    return groups;
+  }, [patients]);
+
+  const findPatientById = useCallback(
+    (patientId: string) =>
+      patients.find((patient: any) => patient.id?.toString() === patientId),
+    [patients],
+  );
+
   // Fetch medical images using React Query
   const {
     data: medicalImagesRaw = [],
@@ -7212,59 +7273,64 @@ export default function ImagingPage() {
                         className="w-full justify-between"
                       >
                         {orderFormData.patientId
-                          ? patients.find(
-                            (patient: any) => patient.id.toString() === orderFormData.patientId
-                          )
-                            ? `${patients.find(
-                              (patient: any) => patient.id.toString() === orderFormData.patientId
-                            )?.firstName
-                            } ${patients.find(
-                              (patient: any) => patient.id.toString() === orderFormData.patientId
-                            )?.lastName
-                            } (${patients.find(
-                              (patient: any) => patient.id.toString() === orderFormData.patientId
-                            )?.patientId
-                            })`
-                            : "Select patient"
+                          ? (() => {
+                              const selected = findPatientById(orderFormData.patientId);
+                              return selected
+                                ? formatPatientDropdownLabel(selected)
+                                : "Select a patient";
+                            })()
                           : patientsLoading
                             ? "Loading patients..."
-                            : "Select patient"}
+                            : "Select a patient"}
                         <ChevronsUpDown className="ml-2 h-4 w-4 shrink-0 opacity-50" />
                       </Button>
                     </PopoverTrigger>
-                    <PopoverContent className="w-[400px] p-0" align="start">
+                    <PopoverContent className="w-[var(--radix-popover-trigger-width)] min-w-[280px] p-0" align="start">
                       <Command>
-                        <CommandInput placeholder="Search patients..." />
-                        <CommandEmpty>No patient found.</CommandEmpty>
-                        <CommandGroup className="max-h-64 overflow-auto">
-                          {patientsLoading ? (
-                            <CommandItem disabled>Loading patients...</CommandItem>
-                          ) : patients.length > 0 ? (
-                            patients.map((patient: any) => (
-                              <CommandItem
-                                key={patient.id}
-                                value={`${patient.firstName} ${patient.lastName} ${patient.patientId}`}
-                                onSelect={() => {
-                                  setOrderFormData((prev) => ({
-                                    ...prev,
-                                    patientId: patient.id.toString(),
-                                  }));
-                                  setPatientSearchOpen(false);
-                                }}
-                              >
-                                <Check
-                                  className={`mr-2 h-4 w-4 ${orderFormData.patientId === patient.id.toString()
-                                    ? "opacity-100"
-                                    : "opacity-0"
-                                    }`}
-                                />
-                                {patient.firstName} {patient.lastName} ({patient.patientId})
-                              </CommandItem>
-                            ))
-                          ) : (
-                            <CommandItem disabled>No patients found</CommandItem>
-                          )}
-                        </CommandGroup>
+                        <CommandInput placeholder="Search patient..." />
+                        <CommandList>
+                          <CommandEmpty>No patient found.</CommandEmpty>
+                          <CommandGroup>
+                            {patientsLoading ? (
+                              <CommandItem disabled>Loading patients...</CommandItem>
+                            ) : patientDropdownGroups.length > 0 ? (
+                              patientDropdownGroups.flatMap(({ main, relatives }) => {
+                                const rows = [
+                                  { patient: main, isChild: false },
+                                  ...relatives.map((p: any) => ({ patient: p, isChild: true })),
+                                ];
+                                return rows.map(({ patient, isChild }) => (
+                                  <CommandItem
+                                    key={patient.id}
+                                    value={`${patient.firstName} ${patient.lastName} ${patient.patientId} ${patient.email ?? ""}`}
+                                    onSelect={() => {
+                                      setOrderFormData((prev) => ({
+                                        ...prev,
+                                        patientId: patient.id.toString(),
+                                      }));
+                                      setPatientSearchOpen(false);
+                                    }}
+                                    className="whitespace-normal break-words py-2"
+                                  >
+                                    <Check
+                                      className={`mr-2 h-4 w-4 shrink-0 ${
+                                        orderFormData.patientId === patient.id.toString()
+                                          ? "opacity-100"
+                                          : "opacity-0"
+                                      }`}
+                                    />
+                                    <span className={`break-words ${isChild ? "pl-1" : ""}`}>
+                                      {isChild ? "↳ " : ""}
+                                      {formatPatientDropdownLabel(patient)}
+                                    </span>
+                                  </CommandItem>
+                                ));
+                              })
+                            ) : (
+                              <CommandItem disabled>No patients found</CommandItem>
+                            )}
+                          </CommandGroup>
+                        </CommandList>
                       </Command>
                     </PopoverContent>
                   </Popover>
@@ -7792,59 +7858,64 @@ export default function ImagingPage() {
                         className="w-full justify-between"
                       >
                         {uploadFormData.patientId
-                          ? patients.find(
-                            (patient: any) => patient.id.toString() === uploadFormData.patientId
-                          )
-                            ? `${patients.find(
-                              (patient: any) => patient.id.toString() === uploadFormData.patientId
-                            )?.firstName
-                            } ${patients.find(
-                              (patient: any) => patient.id.toString() === uploadFormData.patientId
-                            )?.lastName
-                            } (${patients.find(
-                              (patient: any) => patient.id.toString() === uploadFormData.patientId
-                            )?.patientId
-                            })`
-                            : "Select patient"
+                          ? (() => {
+                              const selected = findPatientById(uploadFormData.patientId);
+                              return selected
+                                ? formatPatientDropdownLabel(selected)
+                                : "Select a patient";
+                            })()
                           : patientsLoading
                             ? "Loading patients..."
-                            : "Select patient"}
+                            : "Select a patient"}
                         <ChevronsUpDown className="ml-2 h-4 w-4 shrink-0 opacity-50" />
                       </Button>
                     </PopoverTrigger>
-                    <PopoverContent className="w-[400px] p-0" align="start">
+                    <PopoverContent className="w-[var(--radix-popover-trigger-width)] min-w-[280px] p-0" align="start">
                       <Command>
-                        <CommandInput placeholder="Search patients..." />
-                        <CommandEmpty>No patient found.</CommandEmpty>
-                        <CommandGroup className="max-h-64 overflow-auto">
-                          {patientsLoading ? (
-                            <CommandItem disabled>Loading patients...</CommandItem>
-                          ) : patients.length > 0 ? (
-                            patients.map((patient: any) => (
-                              <CommandItem
-                                key={patient.id}
-                                value={`${patient.firstName} ${patient.lastName} ${patient.patientId}`}
-                                onSelect={() => {
-                                  setUploadFormData((prev) => ({
-                                    ...prev,
-                                    patientId: patient.id.toString(),
-                                  }));
-                                  setUploadPatientSearchOpen(false);
-                                }}
-                              >
-                                <Check
-                                  className={`mr-2 h-4 w-4 ${uploadFormData.patientId === patient.id.toString()
-                                    ? "opacity-100"
-                                    : "opacity-0"
-                                    }`}
-                                />
-                                {patient.firstName} {patient.lastName} ({patient.patientId})
-                              </CommandItem>
-                            ))
-                          ) : (
-                            <CommandItem disabled>No patients found</CommandItem>
-                          )}
-                        </CommandGroup>
+                        <CommandInput placeholder="Search patient..." />
+                        <CommandList>
+                          <CommandEmpty>No patient found.</CommandEmpty>
+                          <CommandGroup>
+                            {patientsLoading ? (
+                              <CommandItem disabled>Loading patients...</CommandItem>
+                            ) : patientDropdownGroups.length > 0 ? (
+                              patientDropdownGroups.flatMap(({ main, relatives }) => {
+                                const rows = [
+                                  { patient: main, isChild: false },
+                                  ...relatives.map((p: any) => ({ patient: p, isChild: true })),
+                                ];
+                                return rows.map(({ patient, isChild }) => (
+                                  <CommandItem
+                                    key={patient.id}
+                                    value={`${patient.firstName} ${patient.lastName} ${patient.patientId} ${patient.email ?? ""}`}
+                                    onSelect={() => {
+                                      setUploadFormData((prev) => ({
+                                        ...prev,
+                                        patientId: patient.id.toString(),
+                                      }));
+                                      setUploadPatientSearchOpen(false);
+                                    }}
+                                    className="whitespace-normal break-words py-2"
+                                  >
+                                    <Check
+                                      className={`mr-2 h-4 w-4 shrink-0 ${
+                                        uploadFormData.patientId === patient.id.toString()
+                                          ? "opacity-100"
+                                          : "opacity-0"
+                                      }`}
+                                    />
+                                    <span className={`break-words ${isChild ? "pl-1" : ""}`}>
+                                      {isChild ? "↳ " : ""}
+                                      {formatPatientDropdownLabel(patient)}
+                                    </span>
+                                  </CommandItem>
+                                ));
+                              })
+                            ) : (
+                              <CommandItem disabled>No patients found</CommandItem>
+                            )}
+                          </CommandGroup>
+                        </CommandList>
                       </Command>
                     </PopoverContent>
                   </Popover>

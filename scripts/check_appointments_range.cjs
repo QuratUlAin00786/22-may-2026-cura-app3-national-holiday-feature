@@ -1,9 +1,9 @@
 const pg = require("pg");
 const { Pool } = pg;
+const { getDatabaseConnectionString } = require("./load-db-config.cjs");
 
 const pool = new Pool({
-  connectionString:
-    "postgresql://curauser24nov25:cura_123@185.185.126.58:5432/cura24nov2025",
+  connectionString: getDatabaseConnectionString(),
 });
 
 async function main() {

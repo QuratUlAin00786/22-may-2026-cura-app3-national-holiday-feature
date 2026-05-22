@@ -18,6 +18,11 @@ import { initializeMultiTenantPackage, getMultiTenantPackage } from "./packages/
 import { messagingService } from "./messaging-service";
 import { isDoctorLike } from './utils/role-utils.js';
 import {
+  isPatientEncryptionConfigured,
+  normalizePatientAddressForStorage,
+  preparePatientForStorage,
+} from "./utils/encryption-sdk.js";
+import {
   filterActiveWallClockConflicts,
   formatAppointmentScheduledAtForApi,
   mapAppointmentConflictForApi,
@@ -27,8 +32,9 @@ import {
 import { gdprComplianceService } from "./services/gdpr-compliance";
 import { insertGdprConsentSchema, insertGdprDataRequestSchema, updateMedicalImageReportFieldSchema, medicationsDatabase, patientDrugInteractions, insuranceVerifications, type Appointment, organizations, subscriptions, users, User, patients, symptomChecks, quickbooksConnections, insertClinicHeaderSchema, insertClinicFooterSchema, doctorsFee, invoices, labResults, insertMessageTemplateSchema, passwordResetTokens, saasSubscriptions, saasPackages, saasPayments, organizationIntegrations, insertTreatmentSchema, insertTreatmentsInfoSchema, InsertSaaSSubscription, imagingPricing, scheduledVideoCalls, insertScheduledVideoCallSchema, messages, analyticsSubjects, analyticsSubjectTreatments } from "../shared/schema";
 import * as schema from "../shared/schema";
-import { db, pool } from "./db";
-import { and, eq, sql, desc, asc, isNull, isNotNull, or, gte, lte, ne } from "drizzle-orm";
+import { db, pool, activeDbSchema } from "./db";
+import { fixFormForeignKeysForActiveSchema, repointFormSharePatientForeignKeys } from "./ensure-db-schema";
+import { and, eq, sql, desc, asc, isNull, isNotNull, or, gte, lte, ne, inArray } from "drizzle-orm";
 import { processAppointmentBookingChat, generateAppointmentSummary } from "./anthropic";
 import { inventoryService } from "./services/inventory";
 import { clinicalDecisionSupport } from "./services/clinical-decision-support";
@@ -5408,6 +5414,30 @@ This treatment plan should be reviewed and adjusted based on individual patient 
       }
 
       const patients = await storage.getPatientsByOrganization(req.tenant!.id, limit, isActive);
+      const orgId = req.tenant!.id;
+      const userIds = [
+        ...new Set(
+          patients
+            .map((p) => p.userId)
+            .filter((id): id is number => typeof id === "number" && id > 0),
+        ),
+      ];
+      if (userIds.length > 0) {
+        const userRows = await db
+          .select({ id: users.id, email: users.email })
+          .from(users)
+          .where(and(eq(users.organizationId, orgId), inArray(users.id, userIds)));
+        const emailByUserId = new Map<number, string>();
+        for (const u of userRows) {
+          const em = u.email?.trim();
+          if (em) emailByUserId.set(u.id, em);
+        }
+        for (const p of patients as Array<{ userId?: number | null; linkedUserEmail?: string | null }>) {
+          if (typeof p.userId === "number" && emailByUserId.has(p.userId)) {
+            p.linkedUserEmail = emailByUserId.get(p.userId) ?? null;
+          }
+        }
+      }
       res.json(patients);
     } catch (error) {
       console.error("Patients fetch error:", error);
@@ -5449,12 +5479,27 @@ This treatment plan should be reviewed and adjusted based on individual patient 
       const patientCount = await storage.getPatientsByOrganization(orgId, 999999);
       const patientId = `P${(patientCount.length + 1).toString().padStart(6, '0')}`;
 
-      // Store the same email as the linked user account, so all patient profiles under this userId share it.
-      const userRow = await pool.query(
-        `SELECT email FROM users WHERE id = $1 AND organization_id = $2 LIMIT 1`,
-        [body.userId, orgId],
-      );
-      const linkedUserEmail = String(userRow.rows[0]?.email ?? "").trim() || null;
+      const linkedUser = await storage.getUser(body.userId, orgId);
+      if (!linkedUser?.email?.trim()) {
+        return res.status(400).json({ error: "Linked user email is required to create a family member" });
+      }
+
+      const existingProfiles = await storage.getPatientsByUserId(orgId, body.userId);
+      const accountHolder =
+        existingProfiles.find(
+          (p) => String(p.relation ?? "").trim().toLowerCase() === "self",
+        ) ??
+        existingProfiles.find((p) => Number(p.userId) === body.userId) ??
+        null;
+
+      const sharedEmail = linkedUser.email.trim();
+      const sharedAddress = accountHolder?.address
+        ? JSON.parse(JSON.stringify(accountHolder.address))
+        : {};
+      const sharedPhone = accountHolder?.phone ? String(accountHolder.phone).trim() : "";
+      const sharedEmergencyContact = accountHolder?.emergencyContact
+        ? JSON.parse(JSON.stringify(accountHolder.emergencyContact))
+        : {};
 
       const created = await storage.createPatient({
         organizationId: orgId,
@@ -5462,20 +5507,22 @@ This treatment plan should be reviewed and adjusted based on individual patient 
         patientId,
         firstName: body.firstName,
         lastName: body.lastName,
-        relation: body.relation ?? "Other",
+        relation: body.relation ?? "Dependent Child",
         dateOfBirth: body.dateOfBirth ? (body.dateOfBirth as any) : null,
         genderAtBirth: body.genderAtBirth ?? null,
-        email: linkedUserEmail,
-        phone: null,
-        nhsNumber: null,
-        address: {},
-        insuranceInfo: {},
-        emergencyContact: {},
+        email: sharedEmail,
+        phone: sharedPhone || undefined,
+        nhsNumber: accountHolder?.nhsNumber ? String(accountHolder.nhsNumber) : undefined,
+        address: normalizePatientAddressForStorage(sharedAddress),
+        insuranceInfo: accountHolder?.insuranceInfo
+          ? JSON.parse(JSON.stringify(accountHolder.insuranceInfo))
+          : {},
+        emergencyContact: sharedEmergencyContact,
         medicalHistory: {},
         flags: [],
         communicationPreferences: {},
         isActive: true,
-        isInsured: false,
+        isInsured: accountHolder?.isInsured === true,
         createdBy: req.user!.id,
         riskLevel: "low",
       } as any);
@@ -5670,12 +5717,8 @@ This treatment plan should be reviewed and adjusted based on individual patient 
       const historyWithPatients = await Promise.all(
         history.map(async (check) => {
           if (check.patientId) {
-            const [patient] = await db
-              .select()
-              .from(patients)
-              .where(eq(patients.id, check.patientId))
-              .limit(1);
-            return { ...check, patient };
+            const patient = await storage.getPatient(check.patientId, orgId);
+            return { ...check, patient: patient ?? null };
           }
           return check;
         })
@@ -5759,16 +5802,11 @@ This treatment plan should be reviewed and adjusted based on individual patient 
         return res.status(400).json({ error: "Organization ID is required" });
       }
 
-      const { rows } = await pool.query(
-        `SELECT email FROM patients WHERE organization_id = $1 AND patient_id = $2 LIMIT 1`,
-        [organizationId, patientId]
-      );
-
-      const email = rows?.[0]?.email ?? null;
-      if (!email) {
+      const patient = await storage.getPatientByPatientId(patientId, organizationId);
+      if (!patient?.email) {
         return res.status(404).json({ error: "Patient email not found" });
       }
-      return res.json({ email });
+      return res.json({ email: patient.email });
     } catch (error: any) {
       console.error("[PATIENT-EMAIL-BY-PATIENT-ID] Error:", error);
       res.status(500).json({ error: "Failed to fetch patient email", details: error?.message || String(error) });
@@ -6330,7 +6368,7 @@ This treatment plan should be reviewed and adjusted based on individual patient 
       const patientId = `P${(patientCount.length + 1).toString().padStart(6, '0')}`;
 
       // Use database transaction to ensure atomicity
-      const patient = await db.transaction(async (tx) => {
+      const createdPatientRow = await db.transaction(async (tx) => {
         // Step 1: Create user record in users table with hashed password
         console.log("🔵 [PATIENT_CREATION] Starting transaction...");
         const hashedPassword = await bcrypt.hash("cura123", 10);
@@ -6387,18 +6425,22 @@ This treatment plan should be reviewed and adjusted based on individual patient 
           ...patientData.medicalHistory
         };
 
-        const patientInsertData = {
+        const patientInsertData = preparePatientForStorage({
           ...patientData,
           organizationId: req.tenant!.id,
-          userId: newUser.id, // Foreign key to users table
+          userId: newUser.id,
           patientId,
           address: patientData.address || {},
           emergencyContact: patientData.emergencyContact || {},
           insuranceInfo: patientData.insuranceInfo || {},
-          medicalHistory: medicalHistoryData
-        };
+          medicalHistory: medicalHistoryData,
+          riskLevel: patientData.riskLevel || "low",
+          isActive: patientData.isActive !== false,
+          isInsured: patientData.isInsured === true,
+          createdBy: req.user?.id,
+        });
 
-        console.log("🔍 [PATIENT_CREATION] Data being inserted into database - insuranceInfo:", JSON.stringify(patientInsertData.insuranceInfo, null, 2));
+        console.log("🔍 [PATIENT_CREATION] Inserting encrypted patient row for patientId:", patientId);
 
         const [patientRecord] = await tx.insert(patients).values(enforceCreatedBy(req, patientInsertData as any)).returning();
 
@@ -6447,6 +6489,11 @@ This treatment plan should be reviewed and adjusted based on individual patient 
 
         return patientRecord;
       });
+
+      const patient = await storage.getPatient(createdPatientRow.id, req.tenant!.id);
+      if (!patient) {
+        return res.status(500).json({ error: "Patient created but could not be loaded" });
+      }
 
       // Generate AI insights for new patient
       if (req.tenant!.settings?.features?.aiEnabled) {
@@ -11855,6 +11902,13 @@ ${clinicName}`;
       }
       // If no subscription found, allow creation (don't block)
 
+      if (userData.role === "patient" && !isPatientEncryptionConfigured()) {
+        return res.status(503).json({
+          error:
+            "Patient encryption is not configured. Set ENCRYPTION_KEY in the server .env file and restart the application.",
+        });
+      }
+
       // Hash password
       const hashedPassword = await authService.hashPassword(userData.password);
 
@@ -11871,27 +11925,35 @@ ${clinicName}`;
 
       console.log(`Created user with role: ${userData.role} and permissions:`, defaultPermissions);
 
-      // If user role is patient, automatically create patient record
-      if (userData.role === 'patient') {
+      // If user role is patient, automatically create encrypted patient record
+      if (userData.role === "patient") {
+        console.log("Creating encrypted patient record for user with role 'patient'");
+
         try {
-          console.log("Creating patient record for user with role 'patient'");
-
-          // Generate patient ID
           const patientCount = await storage.getPatientsByOrganization(req.tenant!.id, 999999);
-          const patientId = `P${(patientCount.length + 1).toString().padStart(6, '0')}`;
+          const patientId = `P${(patientCount.length + 1).toString().padStart(6, "0")}`;
 
-          const patientData = {
+          const patientAddress = normalizePatientAddressForStorage(userData.address);
+          const patientPhone = String(userData.phone ?? "").trim();
+          const patientEmail = String(userData.email).trim();
+          const patientNhs = String(userData.nhsNumber ?? "").trim();
+          const patientGender = String(userData.genderAtBirth ?? "").trim();
+
+          const patientRecord = await storage.createPatient({
+            organizationId: req.tenant!.id,
             userId: user.id,
+            patientId,
             firstName: userData.firstName,
             lastName: userData.lastName,
-            dateOfBirth: userData.dateOfBirth ? new Date(userData.dateOfBirth) : new Date('1990-01-01'),
-            email: userData.email, // Use same email as user
-            phone: userData.phone || '',
-            nhsNumber: userData.nhsNumber || '',
-            organizationId: req.tenant!.id,
-            patientId,
-            address: userData.address || {},
+            relation: "Self",
+            email: patientEmail,
+            phone: patientPhone,
+            nhsNumber: patientNhs || undefined,
+            dateOfBirth: userData.dateOfBirth || "1990-01-01",
+            genderAtBirth: patientGender || undefined,
+            address: patientAddress,
             emergencyContact: userData.emergencyContact || {},
+            insuranceInfo: userData.insuranceInfo || {},
             medicalHistory: {
               allergies: [],
               chronicConditions: [],
@@ -11900,7 +11962,7 @@ ${clinicName}`;
                 father: [],
                 mother: [],
                 siblings: [],
-                grandparents: []
+                grandparents: [],
               },
               socialHistory: {
                 smoking: { status: "never" as const },
@@ -11909,21 +11971,53 @@ ${clinicName}`;
                 occupation: "",
                 maritalStatus: "single" as const,
                 education: "",
-                exercise: { frequency: "none" as const }
+                exercise: { frequency: "none" as const },
               },
-              immunizations: []
+              immunizations: [],
             },
-            insuranceInfo: userData.insuranceInfo || null
-          };
+            riskLevel: "low",
+            isActive: true,
+            isInsured: Boolean(userData.insuranceInfo?.provider),
+            createdBy: req.user?.id,
+          });
 
-          console.log("🔍 DEBUG patientData BEFORE storage.createPatient:", { userId: patientData.userId, patientId: patientData.patientId });
-          const patient = await storage.createPatient(patientData);
-          console.log(`Created patient record with ID: ${patient.id}, patientId: ${patient.patientId}, userId: ${patient.userId}`);
+          console.log(
+            `Created encrypted patient record with ID: ${patientRecord.id}, patientId: ${patientRecord.patientId}, userId: ${patientRecord.userId}`,
+          );
 
+          const insurance = userData.insuranceInfo;
+          if (
+            insurance &&
+            (insurance.provider?.trim() || insurance.policyNumber?.trim())
+          ) {
+            await storage.createInsuranceVerification({
+              organizationId: req.tenant!.id,
+              patientId: patientRecord.id,
+              patientName: `${userData.firstName} ${userData.lastName}`,
+              provider: insurance.provider || "",
+              policyNumber: insurance.policyNumber || "",
+              groupNumber: insurance.groupNumber || null,
+              memberNumber: insurance.memberNumber || null,
+              nhsNumber: userData.nhsNumber || null,
+              planType: insurance.planType || null,
+              coverageType: "primary",
+              status: "active",
+              eligibilityStatus: "pending",
+              effectiveDate: insurance.effectiveDate
+                ? new Date(insurance.effectiveDate)
+                : null,
+              expirationDate: null,
+              lastVerified: null,
+              benefits: {},
+            });
+            console.log(
+              `Created insurance_verifications row for patient id=${patientRecord.id}`,
+            );
+          }
         } catch (patientError) {
-          console.error("Error creating patient record:", patientError);
-          // Don't fail user creation if patient creation fails
-          // Log the error but continue with user creation response
+          console.error("Encrypted patient record creation failed; rolling back user:", patientError);
+          await storage.deleteUser(user.id, req.tenant!.id);
+          throw patientError;
         }
       }
 
@@ -11953,7 +12047,23 @@ ${clinicName}`;
         });
       }
 
-      res.status(500).json({ error: "Failed to create user" });
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      if (
+        error?.code === "MISSING_ENCRYPTION_KEY" ||
+        errorMessage.includes("ENCRYPTION_KEY")
+      ) {
+        return res.status(503).json({
+          error:
+            "Patient encryption is not configured. Set ENCRYPTION_KEY in the server .env file and restart the application.",
+        });
+      }
+
+      res.status(500).json({
+        error: "Failed to create user",
+        ...(process.env.NODE_ENV === "development" && errorMessage
+          ? { details: errorMessage }
+          : {}),
+      });
     }
   });
 
@@ -12102,17 +12212,19 @@ ${clinicName}`;
           // Create patient record with basic info from user
           patient = await storage.createPatient({
             organizationId: req.tenant!.id,
+            userId: user.id,
             patientId: generatedPatientId,
             firstName: user.firstName,
             lastName: user.lastName,
+            relation: "Self",
             email: user.email,
-            dateOfBirth: null as any,
-            genderAtBirth: null as any,
-            phone: "",
-            nhsNumber: "",
-            address: {},
-            emergencyContact: {},
-            insuranceInfo: {},
+            dateOfBirth: (user as { dateOfBirth?: string }).dateOfBirth || patientUpdates.dateOfBirth || "1990-01-01",
+            genderAtBirth: (user as { genderAtBirth?: string }).genderAtBirth || patientUpdates.genderAtBirth || undefined,
+            phone: String(patientUpdates.phone ?? "").trim(),
+            nhsNumber: String(patientUpdates.nhsNumber ?? "").trim() || undefined,
+            address: normalizePatientAddressForStorage(patientUpdates.address),
+            emergencyContact: patientUpdates.emergencyContact || {},
+            insuranceInfo: patientUpdates.insuranceInfo || {},
             medicalHistory: {
               allergies: [],
               medications: [],
@@ -14429,27 +14541,41 @@ ${clinicName}`;
     try {
       // Create schema that excludes server-managed fields (organizationId)
       const createInsightSchema = z.object({
-        patientId: z.number().optional(),
+        patientId: z.coerce.number().int().positive().optional(),
         type: z.enum(["risk_alert", "drug_interaction", "treatment_suggestion", "preventive_care"]),
         title: z.string().min(1),
         description: z.string().min(1),
         severity: z.enum(["low", "medium", "high", "critical"]),
-        actionRequired: z.boolean(),
-        confidence: z.string().regex(/^(0(\.\d+)?|1(\.0+)?)$/, "Confidence must be between 0 and 1"),
+        actionRequired: z.coerce.boolean(),
+        confidence: z
+          .union([z.string(), z.number()])
+          .transform((v) => {
+            const n = typeof v === "number" ? v : parseFloat(String(v ?? "").trim());
+            if (!Number.isFinite(n)) return "0.00";
+            const c = Math.max(0, Math.min(1, n));
+            return c.toFixed(2);
+          }),
         symptoms: z.string().optional().nullable(),
         history: z.string().optional().nullable(),
-        status: z.string().default("active"),
-        aiStatus: z.string().default("pending"),
-        metadata: z.record(z.any()).optional().default({}),
-      }).passthrough();
+        status: z.string().max(20).default("active"),
+        aiStatus: z.string().max(20).default("pending"),
+        metadata: z.record(z.string(), z.any()).optional().default({}),
+      });
 
       const validatedData = createInsightSchema.parse(req.body);
 
       // Validate that patient belongs to the same organization if patientId is provided
       if (validatedData.patientId) {
-        const patient = await storage.getPatient(validatedData.patientId, req.tenant!.id);
-        if (!patient) {
-          return res.status(404).json({ error: "Patient not found" });
+        try {
+          const patient = await storage.getPatient(validatedData.patientId, req.tenant!.id);
+          if (!patient) {
+            return res.status(404).json({ error: "Patient not found" });
+          }
+        } catch (patientErr: unknown) {
+          console.error("[AI-INSIGHTS] patient lookup failed:", patientErr);
+          return res.status(400).json({
+            error: "Unable to load selected patient. Choose another patient or try again.",
+          });
         }
       }
 
@@ -14482,6 +14608,7 @@ ${clinicName}`;
               actions.push('Order appropriate diagnostic tests', 'Review results with specialist', 'Monitor symptoms progression', 'Document clinical findings');
               break;
             case 'preventive':
+            case 'preventive_care':
               actions.push('Implement preventive care plan', 'Patient lifestyle counseling', 'Schedule regular monitoring', 'Educate on risk reduction');
               break;
             default:
@@ -14530,6 +14657,7 @@ ${clinicName}`;
             conditions.push('Differential Diagnosis', 'Clinical Assessment', 'Diagnostic Testing');
             break;
           case 'preventive':
+          case 'preventive_care':
             conditions.push('Preventive Medicine', 'Health Maintenance', 'Risk Reduction', 'Screening Guidelines');
             break;
           default:
@@ -14557,12 +14685,19 @@ ${clinicName}`;
         metadata
       };
 
-      const { id: _, ...insertableInsight } = {
-        ...insightToCreate,
-        userId: req.user?.id,
-        createdAt: new Date(),
-      };
-      const newInsight = await storage.createAiInsight(insertableInsight as any);
+      const newInsight = await storage.createAiInsight({
+        organizationId: insightToCreate.organizationId,
+        patientId: insightToCreate.patientId,
+        type: insightToCreate.type,
+        title: insightToCreate.title,
+        description: insightToCreate.description,
+        severity: insightToCreate.severity,
+        actionRequired: insightToCreate.actionRequired,
+        confidence: insightToCreate.confidence,
+        metadata: insightToCreate.metadata,
+        status: insightToCreate.status,
+        aiStatus: insightToCreate.aiStatus,
+      });
 
       // Transform confidence back to number for frontend response
       const transformedInsight = {
@@ -18122,6 +18257,27 @@ ${clinicName}`;
     }
   });
 
+  // Public holiday calendar for booking links (read-only, org scoped by subdomain)
+  app.get("/api/public/:subdomain/holiday-calendar", async (req: TenantRequest, res) => {
+    try {
+      const sub = String(req.params.subdomain || "").trim();
+      const { from, to } = req.query as { from?: string; to?: string };
+      if (!sub) return res.status(400).json({ error: "Missing subdomain" });
+      const org = await storage.getOrganizationBySubdomain(sub);
+      if (!org) return res.status(404).json({ error: "Organization not found" });
+      const organizationId = (org as any).id;
+      res.setHeader("Cache-Control", "public, max-age=60");
+      const settings = await storage.getHolidayCalendarSettings(organizationId);
+      const rangeFrom = from || new Date().toISOString().slice(0, 10);
+      const rangeTo = to || rangeFrom;
+      const holidays = await storage.getOrganizationHolidaysInRange(organizationId, rangeFrom, rangeTo);
+      res.json({ settings, holidays });
+    } catch (error) {
+      console.error("[PUBLIC-HOLIDAY-CALENDAR] Error:", error);
+      res.status(500).json({ error: "Failed to fetch holiday calendar" });
+    }
+  });
+
   // Public availability for a doctor on a specific date (15-min slots, shift-aware, conflict-aware)
   app.get("/api/public/:subdomain/availability", async (req: TenantRequest, res) => {
     try {
@@ -19285,14 +19441,17 @@ ${clinicName}`;
       try {
         const clinicHeader = await storage.getActiveClinicHeader(organizationId);
         const clinicFooter = await storage.getActiveClinicFooter(organizationId);
-        await emailService.sendEmail({
+        const inviteMail = await emailService.sendEmailWithReport({
           to: normalizedEmail,
           subject: "Complete your patient registration",
           html: generateBookingLinkEmailHTML({ link, clinicHeader, clinicFooter }),
           text: `Hello,\n\nPlease use the link below to complete your patient registration:\n\n${link}\n\nThis link will expire in 72 hours.`,
         });
+        if (!inviteMail.success) {
+          console.error("[SELF-REGISTRATION-LINK] Invite email failed:", inviteMail.error);
+        }
       } catch (mailErr) {
-        console.warn("[SELF-REGISTRATION-LINK] Email failed:", mailErr);
+        console.error("[SELF-REGISTRATION-LINK] Email failed:", mailErr);
       }
 
       return res.json({
@@ -19474,6 +19633,7 @@ ${clinicName}`;
               state: z.string().optional(),
               postcode: z.string().optional(),
               country: z.string().optional(),
+              building: z.string().optional(),
             })
             .optional()
             .default({}),
@@ -19734,15 +19894,18 @@ ${clinicName}`;
           if (plainPassword) {
             try {
               const userName = `${body.firstName} ${body.lastName}`.trim();
-              await emailService.sendNewUserAccountEmail(
+              const credSent = await emailService.sendNewUserAccountEmail(
                 submittedEmail,
                 userName,
                 plainPassword,
                 String(orgRes.rows[0].name || "Clinic"),
                 "patient",
               );
+              if (!credSent) {
+                console.error("[PUBLIC-SELF-REG] Portal credentials email failed (check server logs)");
+              }
             } catch (mailErr) {
-              console.warn("[PUBLIC-SELF-REG] Welcome email failed:", mailErr);
+              console.error("[PUBLIC-SELF-REG] Welcome email failed:", mailErr);
             }
           }
         }
@@ -19828,12 +19991,63 @@ ${clinicName}`;
         [invite.id],
       );
 
+      const organizationName = String(orgRes.rows[0].name || "Clinic");
+      const patientDisplayName = `${body.firstName} ${body.lastName}`.trim();
+      let confirmationEmailSent = false;
+      let confirmationEmailError: string | undefined;
+      try {
+        const publicBase =
+          process.env.PUBLIC_APP_URL ||
+          process.env.APP_PUBLIC_URL ||
+          process.env.APP_BASE_URL ||
+          process.env.WEB_BASE_URL ||
+          process.env.VITE_API_URL ||
+          process.env.BASE_URL ||
+          process.env.APP_URL ||
+          "";
+        const hostFallback = (() => {
+          try {
+            const proto = (req as any).protocol || "http";
+            const host = req.get && req.get("host");
+            return host ? `${proto}://${host}` : "";
+          } catch {
+            return "";
+          }
+        })();
+        const baseUrl = (publicBase || hostFallback).replace(/\/$/, "");
+        const loginPath = `/${encodeURIComponent(subdomain)}/auth/login`;
+        const loginUrl = baseUrl ? `${baseUrl}${loginPath}` : "";
+        const mailReport = await emailService.sendPatientRegistrationSuccessEmail(
+          submittedEmail,
+          patientDisplayName,
+          organizationName,
+          patient.patientId,
+          { portalAccess: enablePortalAccess, loginUrl },
+        );
+        confirmationEmailSent = mailReport.success;
+        if (!mailReport.success) {
+          confirmationEmailError = mailReport.error;
+          console.error(
+            "[PUBLIC-SELF-REG] Registration confirmation email not sent:",
+            mailReport.error,
+          );
+        }
+      } catch (mailErr) {
+        confirmationEmailError =
+          mailErr instanceof Error ? mailErr.message : String(mailErr);
+        console.error("[PUBLIC-SELF-REG] Registration confirmation email failed:", mailErr);
+      }
+
       return res.json({
         success: true,
         portalAccess: enablePortalAccess,
         patient: { id: patient.id, patientId: patient.patientId },
         dependentPatient,
         user: userId ? { id: userId, email: submittedEmail } : null,
+        confirmationEmailSent,
+        ...(process.env.NODE_ENV !== "production" && confirmationEmailError
+          ? { confirmationEmailError }
+          : {}),
       });
     } catch (error) {
       console.error("[PUBLIC-SELF-REG] Error:", error);
@@ -19879,14 +20093,10 @@ ${clinicName}`;
         return res.status(404).json({ error: "Lab result not found" });
       }
 
-      const patientRow = await pool.query(
-        `SELECT first_name, last_name, email FROM patients WHERE id = $1 AND organization_id = $2 LIMIT 1`,
-        [labResult.patientId, organizationId]
-      );
-      if (patientRow.rows.length === 0) {
+      const patient = await storage.getPatient(labResult.patientId, organizationId);
+      if (!patient) {
         return res.status(404).json({ error: "Patient not found" });
       }
-      const patient = patientRow.rows[0];
 
       // Allow caller to override the recipient email (e.g. from the share dialog)
       const recipientEmail: string = (req.body?.recipientEmail || patient.email || "").trim();
@@ -19908,7 +20118,7 @@ ${clinicName}`;
       const fsModule = await import('fs');
       const fileBuffer = fsModule.readFileSync(filePath);
 
-      const patientName = `${patient.first_name} ${patient.last_name}`.trim();
+      const patientName = `${patient.firstName} ${patient.lastName}`.trim();
       const sharedBy = `${req.user.firstName ?? ""} ${req.user.lastName ?? ""}`.trim() || req.user.email || "Cura EMR";
       const customPart = customMessage ? `<p>${customMessage}</p>` : "";
       const customTextPart = customMessage ? `${customMessage}\n\n` : "";
@@ -21137,26 +21347,72 @@ ${clinicName}`;
         const organizationId = requireOrgId(req);
         const formId = Number(req.params.formId);
         const patientId = Number(req.body.patientId);
-        if (!patientId) {
-          return res.status(400).json({ error: "patientId is required" });
+        if (!Number.isFinite(formId) || formId <= 0) {
+          return res.status(400).json({ error: "Valid formId is required" });
+        }
+        if (!Number.isFinite(patientId) || patientId <= 0) {
+          return res.status(400).json({ error: "Valid patientId is required" });
         }
 
-        // Validate that the patient exists in the patients table
         const patient = await storage.getPatient(patientId, organizationId);
         if (!patient) {
-          return res.status(404).json({ error: `Patient with ID ${patientId} not found in this organization` });
+          return res.status(404).json({
+            error: `Patient with ID ${patientId} not found in this organization`,
+          });
         }
 
-        const result = await formService.shareForm({
+        const sharePayload = {
           formId,
           organizationId,
           patientId,
           sentById: req.user.id,
-        });
-        res.status(201).json(result);
+        };
+
+        const runShare = () => formService.shareForm(sharePayload);
+
+        const isForeignKeyViolation = (err: unknown): boolean => {
+          const e = err as { code?: string; message?: string };
+          if (e?.code === "23503") return true;
+          const m = e?.message ?? String(err);
+          return /foreign key constraint/i.test(m);
+        };
+
+        try {
+          const result = await runShare();
+          return res.status(201).json(result);
+        } catch (shareError: unknown) {
+          if (!isForeignKeyViolation(shareError)) {
+            throw shareError;
+          }
+
+          console.warn(
+            "[FORMS] FK violation on form share — repointing form foreign keys and retrying once",
+            shareError,
+          );
+          await fixFormForeignKeysForActiveSchema(pool, activeDbSchema);
+          await repointFormSharePatientForeignKeys(pool, activeDbSchema);
+          const result = await runShare();
+          return res.status(201).json(result);
+        }
       } catch (error) {
         console.error("Error sharing form:", error);
-        res.status(500).json({ error: (error as Error).message || "Failed to share form" });
+        const message = (error as Error).message || "Failed to share form";
+        const code = (error as { code?: string }).code;
+        if (
+          code === "23503" ||
+          (message.includes("foreign key constraint") &&
+            (message.includes("patient_id") || message.includes("form_shares") || message.includes("form_share_logs")))
+        ) {
+          return res.status(400).json({
+            error:
+              "Could not link this patient to the form share. The database may still reference patients/forms in the wrong schema. Restart the app server (runs a one-time FK repair), then try again. If it persists, contact support.",
+            detail:
+              process.env.NODE_ENV === "development"
+                ? message.slice(0, 500)
+                : undefined,
+          });
+        }
+        res.status(500).json({ error: message });
       }
     },
   );
@@ -31512,6 +31768,124 @@ ${clinicName}`;
     }
   });
 
+  // Organization holiday calendar (global config for shift management)
+  app.get("/api/holiday-calendar", authMiddleware, async (req: TenantRequest, res) => {
+    try {
+      const { from, to, date } = req.query as { from?: string; to?: string; date?: string };
+      const settings = await storage.getHolidayCalendarSettings(req.tenant!.id);
+
+      if (date) {
+        const status = await storage.resolveDateHolidayStatus(req.tenant!.id, date);
+        return res.json({ settings, dateStatus: status });
+      }
+
+      const rangeFrom = from || new Date().toISOString().slice(0, 10);
+      const rangeTo = to || rangeFrom;
+      const holidays = await storage.getOrganizationHolidaysInRange(req.tenant!.id, rangeFrom, rangeTo);
+      res.json({ settings, holidays });
+    } catch (error) {
+      console.error("Error fetching holiday calendar:", error);
+      res.status(500).json({ error: "Failed to fetch holiday calendar" });
+    }
+  });
+
+  app.put("/api/holiday-calendar/settings", authMiddleware, requireRole(["admin", "administrator"]), async (req: TenantRequest, res) => {
+    try {
+      const body = z.object({
+        weekendDays: z.array(z.string()).optional(),
+        weekendsNonWorking: z.boolean().optional(),
+        defaultAllowShiftsOnHolidays: z.boolean().optional(),
+      }).parse(req.body);
+
+      const settings = await storage.upsertHolidayCalendarSettings(req.tenant!.id, body);
+      res.json(settings);
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        return res.status(400).json({ error: "Validation failed", details: error.errors });
+      }
+      console.error("Error updating holiday settings:", error);
+      res.status(500).json({ error: "Failed to update holiday settings" });
+    }
+  });
+
+  app.post("/api/holiday-calendar/holidays", authMiddleware, requireRole(["admin", "administrator"]), async (req: TenantRequest, res) => {
+    try {
+      const body = z.object({
+        holidayDate: z.string(),
+        name: z.string().min(1),
+        holidayType: z.enum(["national", "regional", "company"]).default("national"),
+        region: z.string().optional(),
+        allowShifts: z.boolean().optional(),
+        isWorkingDay: z.boolean().optional(),
+        notes: z.string().optional(),
+      }).parse(req.body);
+
+      const settings = await storage.getHolidayCalendarSettings(req.tenant!.id);
+      const holiday = await storage.createOrganizationHoliday({
+        organizationId: req.tenant!.id,
+        holidayDate: body.holidayDate,
+        name: body.name,
+        holidayType: body.holidayType,
+        region: body.region ?? null,
+        allowShifts: body.allowShifts ?? settings.defaultAllowShiftsOnHolidays,
+        isWorkingDay: body.isWorkingDay ?? false,
+        notes: body.notes ?? null,
+        createdBy: req.user?.id ?? null,
+      });
+      res.status(201).json(holiday);
+    } catch (error: any) {
+      if (error?.code === "23505") {
+        return res.status(409).json({ error: "A holiday with this name already exists on that date" });
+      }
+      if (error instanceof z.ZodError) {
+        return res.status(400).json({ error: "Validation failed", details: error.errors });
+      }
+      console.error("Error creating holiday:", error);
+      res.status(500).json({ error: "Failed to create holiday" });
+    }
+  });
+
+  app.put("/api/holiday-calendar/holidays/:id", authMiddleware, requireRole(["admin", "administrator"]), async (req: TenantRequest, res) => {
+    try {
+      const id = parseInt(req.params.id);
+      const body = z.object({
+        holidayDate: z.string().optional(),
+        name: z.string().min(1).optional(),
+        holidayType: z.enum(["national", "regional", "company"]).optional(),
+        region: z.string().nullable().optional(),
+        allowShifts: z.boolean().optional(),
+        isWorkingDay: z.boolean().optional(),
+        notes: z.string().nullable().optional(),
+      }).parse(req.body);
+
+      const holiday = await storage.updateOrganizationHoliday(id, req.tenant!.id, body);
+      if (!holiday) {
+        return res.status(404).json({ error: "Holiday not found" });
+      }
+      res.json(holiday);
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        return res.status(400).json({ error: "Validation failed", details: error.errors });
+      }
+      console.error("Error updating holiday:", error);
+      res.status(500).json({ error: "Failed to update holiday" });
+    }
+  });
+
+  app.delete("/api/holiday-calendar/holidays/:id", authMiddleware, requireRole(["admin", "administrator"]), async (req: TenantRequest, res) => {
+    try {
+      const id = parseInt(req.params.id);
+      const deleted = await storage.deleteOrganizationHoliday(id, req.tenant!.id);
+      if (!deleted) {
+        return res.status(404).json({ error: "Holiday not found" });
+      }
+      res.json({ success: true });
+    } catch (error) {
+      console.error("Error deleting holiday:", error);
+      res.status(500).json({ error: "Failed to delete holiday" });
+    }
+  });
+
   // Shift Management API endpoints
   app.get("/api/shifts", authMiddleware, async (req: TenantRequest, res) => {
     try {
@@ -31561,8 +31935,25 @@ ${clinicName}`;
         endTime: z.string(),
         status: z.enum(["scheduled", "completed", "cancelled", "absent"]).default("scheduled"),
         notes: z.string().optional(),
-        isAvailable: z.boolean().default(true)
+        isAvailable: z.boolean().default(true),
+        confirmHolidayOverride: z.boolean().optional(),
       }).parse(req.body);
+
+      const dateOnly = shiftData.date.split("T")[0];
+      const holidayStatus = await storage.resolveDateHolidayStatus(req.tenant!.id, dateOnly);
+      if (
+        holidayStatus &&
+        holidayStatus.isNonWorking &&
+        !holidayStatus.allowShifts &&
+        shiftData.shiftType !== "absent" &&
+        !shiftData.confirmHolidayOverride
+      ) {
+        return res.status(409).json({
+          error: "HOLIDAY_BLOCKED",
+          message: `This date is marked as ${holidayStatus.label}. Shifts are not allowed on this day.`,
+          holidayStatus,
+        });
+      }
 
       const shift = await storage.createStaffShift(enforceCreatedBy(req, {
         ...shiftData,
@@ -35914,6 +36305,433 @@ ${clinicName}`;
     }
   });
 
+  const billingInvoiceLineItemSchema = z.object({
+    code: z.string().min(1),
+    description: z.string().min(1),
+    quantity: z.number().int().min(1),
+    unitPrice: z.number().gte(0),
+    total: z.number().gte(0),
+    serviceType: z.enum(["appointments", "labResults", "imaging", "other"]),
+    serviceId: z.union([z.string(), z.number()]).optional(),
+  });
+
+  const billingInvoiceBodySchema = z.object({
+    patientId: z.string().min(1, "Patient is required"),
+    serviceDate: z.string().min(1, "Service date is required"),
+    invoiceDate: z.string().min(1, "Invoice date is required"),
+    dueDate: z.string().min(1, "Due date is required"),
+    totalAmount: z.string().min(1, "Total amount is required").refine((val) => {
+      const num = parseFloat(val);
+      return !isNaN(num) && num >= 0;
+    }, "Total amount must be a valid number"),
+    lineItems: z.array(billingInvoiceLineItemSchema).min(1, "At least one service item must be provided"),
+    serviceType: z.string().min(1),
+    serviceIds: z.array(z.string()).optional(),
+    insuranceProvider: z.string().optional(),
+    nhsNumber: z.string().optional(),
+    notes: z.string().optional(),
+    paymentMethod: z.union([z.string(), z.null()]).optional(),
+    doctorId: z.number().int().positive().optional(),
+    status: z.enum(["unpaid", "sent", "paid", "overdue", "cancelled", "pending", "draft"]).optional(),
+  });
+
+  const normalizeBillingServiceType = (raw?: string | null): string => {
+    if (!raw) return "other";
+    const s = String(raw).toLowerCase().replace(/[\s-]+/g, "_");
+    if (s === "appointments" || s === "appointment") return "appointments";
+    if (s === "labresults" || s === "lab_result" || s === "lab_results") return "labResults";
+    if (s === "imaging" || s === "medical_image" || s === "medical_images" || s === "medical_imaging") {
+      return "imaging";
+    }
+    return "other";
+  };
+
+  const resolvePatientByPatientIdForBilling = async (
+    patientId: string,
+    organizationId: number,
+  ) => {
+    let patient = await storage.getPatientByPatientId(patientId, organizationId);
+    if (!patient && patientId.startsWith("P")) {
+      const numericPart = patientId.substring(1);
+      const numericValue = parseInt(numericPart, 10);
+      if (!isNaN(numericValue)) {
+        const variants = [
+          `P${numericValue.toString().padStart(6, "0")}`,
+          `P${numericValue.toString().padStart(3, "0")}`,
+          `P${numericValue}`,
+        ];
+        for (const variant of variants) {
+          if (variant === patientId) continue;
+          patient = await storage.getPatientByPatientId(variant, organizationId);
+          if (patient) break;
+        }
+      }
+    }
+    return patient;
+  };
+
+  const buildInvoiceServiceContext = async (
+    invoice: any,
+    organizationId: number,
+  ): Promise<{
+    serviceType: string;
+    serviceId: string | null;
+    resolvedSelectionId: string | null;
+    details: Record<string, unknown> | null;
+    items: any[];
+  }> => {
+    const rawItems = Array.isArray(invoice.items) ? invoice.items : [];
+    let serviceType = normalizeBillingServiceType(invoice.serviceType);
+    if (serviceType === "other" && rawItems[0]?.serviceType) {
+      serviceType = normalizeBillingServiceType(rawItems[0].serviceType);
+    }
+    const serviceId =
+      invoice.serviceId != null
+        ? String(invoice.serviceId)
+        : rawItems[0]?.serviceId != null
+          ? String(rawItems[0].serviceId)
+          : null;
+
+    const patient = await resolvePatientByPatientIdForBilling(invoice.patientId, organizationId);
+    let details: Record<string, unknown> | null = null;
+    let resolvedSelectionId: string | null = null;
+
+    if (patient && serviceId) {
+      if (serviceType === "appointments") {
+        const appointments = await storage.getAppointmentsByPatient(patient.id, organizationId);
+        const appointment = appointments.find(
+          (apt: any) =>
+            apt.appointmentId === serviceId || String(apt.id) === serviceId,
+        );
+        if (appointment) {
+          resolvedSelectionId = String(appointment.id);
+          let providerName: string | null = null;
+          if (appointment.providerId) {
+            const provider = await storage.getUser(appointment.providerId, organizationId);
+            if (provider) {
+              providerName = `${provider.firstName || ""} ${provider.lastName || ""}`.trim() || null;
+            }
+          }
+          details = {
+            type: "appointments",
+            id: appointment.id,
+            appointmentId: appointment.appointmentId,
+            title: appointment.title,
+            scheduledAt: appointment.scheduledAt,
+            duration: appointment.duration,
+            status: appointment.status,
+            location: appointment.location,
+            description: appointment.description,
+            providerId: appointment.providerId,
+            providerName,
+          };
+        }
+      } else if (serviceType === "labResults") {
+        const labResults = await storage.getLabResultsByPatient(patient.id, organizationId);
+        const labResult = labResults.find(
+          (lr: any) => lr.testId === serviceId || String(lr.id) === serviceId,
+        );
+        if (labResult) {
+          resolvedSelectionId = String(labResult.id);
+          details = {
+            type: "labResults",
+            id: labResult.id,
+            testId: labResult.testId,
+            testName: labResult.testName,
+            testType: labResult.testType,
+            status: labResult.status,
+            orderedAt: labResult.orderedAt,
+            doctorName: labResult.doctorName,
+            orderedBy: labResult.orderedBy,
+            priority: labResult.priority,
+          };
+        }
+      } else if (serviceType === "imaging") {
+        const images = await storage.getMedicalImagesByPatient(patient.id, organizationId);
+        const image = images.find(
+          (img: any) => img.imageId === serviceId || String(img.id) === serviceId,
+        );
+        if (image) {
+          resolvedSelectionId = String(image.id);
+          details = {
+            type: "imaging",
+            id: image.id,
+            imageId: image.imageId,
+            studyType: image.studyType,
+            studyDate: image.studyDate,
+            status: image.status,
+            selectedUserId: image.selectedUserId,
+          };
+        }
+      }
+    }
+
+    const totalAmount = Number(invoice.totalAmount) || 0;
+    let items = rawItems.map((item: any, index: number) => ({
+      code: item.code || `SVC-${index + 1}`,
+      description: item.description || "Service",
+      quantity: Number(item.quantity) || 1,
+      unitPrice: Number(item.unitPrice ?? item.amount ?? 0),
+      total: Number(item.total ?? item.amount ?? 0),
+      serviceType: normalizeBillingServiceType(item.serviceType) || serviceType,
+      serviceId: item.serviceId != null ? String(item.serviceId) : serviceId,
+    }));
+
+    if (items.length === 0 && details) {
+      if (details.type === "labResults") {
+        items = [
+          {
+            code: String(details.testId || "LAB"),
+            description: String(details.testName || details.testType || "Lab test"),
+            quantity: 1,
+            unitPrice: totalAmount,
+            total: totalAmount,
+            serviceType: "labResults",
+            serviceId: String(details.testId || details.id),
+          },
+        ];
+      } else if (details.type === "appointments") {
+        items = [
+          {
+            code: String(details.appointmentId || "APT"),
+            description: String(details.title || "Consultation"),
+            quantity: 1,
+            unitPrice: totalAmount,
+            total: totalAmount,
+            serviceType: "appointments",
+            serviceId: String(details.appointmentId || details.id),
+          },
+        ];
+      } else if (details.type === "imaging") {
+        items = [
+          {
+            code: String(details.imageId || "IMG"),
+            description: String(details.studyType || "Imaging study"),
+            quantity: 1,
+            unitPrice: totalAmount,
+            total: totalAmount,
+            serviceType: "imaging",
+            serviceId: String(details.imageId || details.id),
+          },
+        ];
+      }
+    }
+
+    return { serviceType, serviceId, resolvedSelectionId, details, items };
+  };
+
+  app.get("/api/billing/invoices/:id", requireRole(["admin", "doctor", "nurse", "receptionist", "patient"]), async (req: TenantRequest, res) => {
+    try {
+      const invoiceId = parseInt(req.params.id, 10);
+      if (isNaN(invoiceId)) {
+        return res.status(400).json({ error: "Invalid invoice ID" });
+      }
+
+      const invoice = await storage.getInvoice(invoiceId, req.tenant!.id);
+      if (!invoice) {
+        return res.status(404).json({ error: "Invoice not found" });
+      }
+
+      if (req.user?.role === "patient") {
+        const patients = await storage.getPatientsByOrganization(req.tenant!.id);
+        const userPatient = patients.find((p) => p.email?.toLowerCase() === req.user!.email.toLowerCase());
+        if (!userPatient || invoice.patientId !== userPatient.patientId) {
+          return res.status(403).json({ error: "Access denied" });
+        }
+      }
+
+      const serviceContext = await buildInvoiceServiceContext(invoice, req.tenant!.id);
+
+      res.json({
+        ...invoice,
+        items: serviceContext.items,
+        serviceType: serviceContext.serviceType,
+        serviceContext,
+      });
+    } catch (error) {
+      console.error("Invoice fetch error:", error);
+      res.status(500).json({ error: "Failed to fetch invoice" });
+    }
+  });
+
+  app.put("/api/billing/invoices/:id", requireRole(["admin", "doctor", "nurse", "receptionist"]), async (req: TenantRequest, res) => {
+    try {
+      const invoiceId = parseInt(req.params.id, 10);
+      if (isNaN(invoiceId)) {
+        return res.status(400).json({ error: "Invalid invoice ID" });
+      }
+
+      const existing = await storage.getInvoice(invoiceId, req.tenant!.id);
+      if (!existing) {
+        return res.status(404).json({ error: "Invoice not found" });
+      }
+
+      const parseResult = billingInvoiceBodySchema.safeParse(req.body);
+      if (!parseResult.success) {
+        const firstError = parseResult.error.errors[0];
+        return res.status(400).json({ error: firstError?.message || "Invalid invoice data", details: parseResult.error.errors });
+      }
+      const invoiceData = parseResult.data;
+
+      const patient = await storage.getPatientByPatientId(invoiceData.patientId, req.tenant!.id);
+      if (!patient) {
+        return res.status(400).json({ error: "Patient not found" });
+      }
+
+      const computedTotal = invoiceData.lineItems.reduce((acc, item) => acc + item.total, 0);
+      const requestedTotal = parseFloat(invoiceData.totalAmount);
+      if (Math.abs(computedTotal - requestedTotal) > 0.1) {
+        return res.status(400).json({ error: "Line item totals must match the invoice total" });
+      }
+
+      for (const item of invoiceData.lineItems) {
+        if (!item.serviceId) continue;
+        const serviceIdStr = String(item.serviceId);
+        const numericId = Number(serviceIdStr);
+        if (item.serviceType === "appointments") {
+          let appointment;
+          if (!Number.isNaN(numericId)) {
+            appointment = await storage.getAppointment(numericId, req.tenant!.id);
+          } else {
+            const appointments = await storage.getAppointmentsByPatient(patient.id, req.tenant!.id);
+            appointment = appointments.find(
+              (apt: any) => apt.appointmentId === serviceIdStr || String(apt.id) === serviceIdStr,
+            );
+          }
+          if (!appointment || appointment.patientId !== patient.id) {
+            return res.status(400).json({ error: "Selected appointment does not belong to the patient" });
+          }
+        } else if (item.serviceType === "labResults") {
+          let labResult;
+          if (!Number.isNaN(numericId)) {
+            labResult = await storage.getLabResult(numericId, req.tenant!.id);
+          } else {
+            const labResults = await storage.getLabResultsByPatient(patient.id, req.tenant!.id);
+            labResult = labResults.find(
+              (lr: any) => lr.testId === serviceIdStr || String(lr.id) === serviceIdStr,
+            );
+          }
+          if (!labResult || labResult.patientId !== patient.id) {
+            return res.status(400).json({ error: "Selected lab result does not belong to the patient" });
+          }
+        } else if (item.serviceType === "imaging") {
+          let imagingRecord;
+          if (!Number.isNaN(numericId)) {
+            imagingRecord = await storage.getMedicalImage(numericId, req.tenant!.id);
+          } else {
+            const images = await storage.getMedicalImagesByPatient(patient.id, req.tenant!.id);
+            imagingRecord = images.find(
+              (img: any) => img.imageId === serviceIdStr || String(img.id) === serviceIdStr,
+            );
+          }
+          if (!imagingRecord || imagingRecord.patientId !== patient.id) {
+            return res.status(400).json({ error: "Selected imaging study does not belong to the patient" });
+          }
+        }
+      }
+
+      const invoiceType =
+        invoiceData.insuranceProvider && invoiceData.insuranceProvider !== "" && invoiceData.insuranceProvider !== "none"
+          ? "insurance_claim"
+          : "payment";
+      const insuranceData =
+        invoiceType === "insurance_claim"
+          ? {
+              provider: invoiceData.insuranceProvider || "NHS",
+              claimNumber: (existing as any).insurance?.claimNumber || `CLM${Date.now().toString().slice(-6)}`,
+              status: (existing as any).insurance?.status || "approved",
+              paidAmount: (existing as any).insurance?.paidAmount ?? 0,
+            }
+          : null;
+
+      const serviceIds = invoiceData.serviceIds || invoiceData.lineItems.map((item) => item.serviceId).filter(Boolean).map(String);
+      let invoiceServiceId: string | null = serviceIds[0] || null;
+      if (invoiceData.serviceType === "appointments" && invoiceServiceId && /^\d+$/.test(invoiceServiceId)) {
+        const apt = await storage.getAppointment(parseInt(invoiceServiceId, 10), req.tenant!.id);
+        if (apt && (apt as any).appointmentId) {
+          invoiceServiceId = (apt as any).appointmentId;
+        }
+      }
+
+      const itemsWithServiceId = invoiceData.lineItems.map((item: any) => {
+        let sid = item.serviceId;
+        if (
+          item.serviceType === "appointments" &&
+          sid != null &&
+          /^\d+$/.test(String(sid)) &&
+          invoiceServiceId &&
+          !/^\d+$/.test(invoiceServiceId)
+        ) {
+          sid = invoiceServiceId;
+        }
+        return {
+          code: item.code,
+          description: item.description,
+          quantity: item.quantity,
+          unitPrice: item.unitPrice,
+          total: item.total,
+          serviceType: item.serviceType,
+          serviceId: sid,
+        };
+      });
+
+      const paymentMethod = invoiceData.paymentMethod || existing.paymentMethod || "Online Payment";
+      let status = invoiceData.status || existing.status || "unpaid";
+      let paidAmount = Number((existing as any).paidAmount) || 0;
+
+      if (paymentMethod === "Cash") {
+        status = "paid";
+        paidAmount = computedTotal;
+      } else if (paymentMethod === "Not Selected") {
+        status = invoiceData.status || "unpaid";
+        if (status !== "paid") {
+          paidAmount = 0;
+        }
+      } else if (status === "paid") {
+        paidAmount = computedTotal;
+      } else if (status === "unpaid" || status === "cancelled") {
+        paidAmount = 0;
+      }
+
+      const updatedInvoice = await storage.updateInvoice(invoiceId, req.tenant!.id, {
+        patientId: invoiceData.patientId,
+        patientName: `${patient.firstName} ${patient.lastName}`,
+        nhsNumber: invoiceData.nhsNumber
+          ? invoiceData.nhsNumber.replace(/\s+/g, "")
+          : patient.nhsNumber
+            ? patient.nhsNumber.replace(/\s+/g, "")
+            : null,
+        dateOfService: new Date(invoiceData.serviceDate),
+        invoiceDate: new Date(invoiceData.invoiceDate),
+        dueDate: new Date(invoiceData.dueDate),
+        status,
+        invoiceType,
+        paymentMethod,
+        subtotal: computedTotal,
+        tax: 0,
+        discount: 0,
+        totalAmount: computedTotal,
+        paidAmount,
+        items: itemsWithServiceId,
+        notes: invoiceData.notes || null,
+        insurance: insuranceData,
+        serviceId: invoiceServiceId,
+        serviceType: invoiceData.serviceType,
+        doctorId: invoiceData.doctorId ?? (existing as any).doctorId ?? null,
+        insuranceProvider: invoiceData.insuranceProvider || null,
+      });
+
+      if (!updatedInvoice) {
+        return res.status(404).json({ error: "Invoice not found" });
+      }
+
+      res.json({ invoice: updatedInvoice });
+    } catch (error) {
+      console.error("Invoice update error:", error);
+      res.status(500).json({ error: "Failed to update invoice" });
+    }
+  });
+
   // Create Stripe Checkout session for invoice payment
   app.post("/api/billing/create-checkout-session", tenantMiddleware, authMiddleware, requireRole(["admin", "doctor", "nurse", "receptionist", "patient"]), async (req: TenantRequest, res) => {
     try {
@@ -36489,6 +37307,12 @@ ${clinicName}`;
     try {
       const { id } = req.params;
       const { status, paymentMethod } = req.body;
+
+      if (Array.isArray(req.body?.lineItems)) {
+        return res.status(400).json({
+          error: "Use PUT /api/billing/invoices/:id for full invoice edits",
+        });
+      }
 
       if (!status) {
         return res.status(400).json({ error: "Status is required" });

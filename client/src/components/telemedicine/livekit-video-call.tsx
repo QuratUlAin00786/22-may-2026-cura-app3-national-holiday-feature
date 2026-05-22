@@ -146,37 +146,6 @@ export function LiveKitVideoCall({
     };
   }, [room, localParticipant, hasActiveLocalVideo]);
 
-  // Outgoing caller: turn camera on after accept if connect finished without a video track
-  useEffect(() => {
-    if (!videoEnabled || !connectWhenReady || !isConnected || !room || !localParticipant) {
-      return;
-    }
-    if (hasActiveLocalVideo) return;
-
-    let cancelled = false;
-    const tryEnable = async () => {
-      try {
-        await room.localParticipant.setCameraEnabled(true);
-        if (!cancelled) {
-          console.log('[LiveKitVideoCall] Camera enabled after connect');
-        }
-      } catch (e) {
-        console.warn('[LiveKitVideoCall] Deferred camera enable failed:', e);
-      }
-    };
-    void tryEnable();
-    return () => {
-      cancelled = true;
-    };
-  }, [
-    videoEnabled,
-    connectWhenReady,
-    isConnected,
-    room,
-    localParticipant,
-    hasActiveLocalVideo,
-  ]);
-
   // When the other participant leaves the room (they ended the call), close the call UI
   useEffect(() => {
     if (!room || !onDisconnect) return;

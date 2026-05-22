@@ -1,4 +1,4 @@
-import React, { useState } from "react";
+import React, { useState, useMemo, useCallback } from "react";
 import {
   Card,
   CardContent,
@@ -25,6 +25,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Label } from "@/components/ui/label";
+import { Calendar as CalendarComponent } from "@/components/ui/calendar";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Command, CommandEmpty, CommandGroup, CommandInput, CommandItem, CommandList } from "@/components/ui/command";
 import {
@@ -53,6 +54,10 @@ import { apiRequest } from "@/lib/queryClient";
 import { useAuth } from "@/hooks/use-auth";
 import { useToast } from "@/hooks/use-toast";
 import { cn } from "@/lib/utils";
+import {
+  useBookingHolidayCalendar,
+  BookingHolidayTimeSlotPanel,
+} from "@/hooks/use-booking-holiday-calendar";
 import {
   getAppointmentCardTimeKind,
   appointmentOngoingBadgePositionClassName,
@@ -923,6 +928,7 @@ export default function PatientAppointments({
       queryClient.invalidateQueries({ queryKey: ["/api/appointments"] });
       queryClient.refetchQueries({ queryKey: ["/api/appointments"] });
       setEditingAppointment(null);
+      editBookingHoliday.resetHolidayState();
       setEditAppointmentType("");
       setEditSelectedTreatment(null);
       setEditSelectedConsultation(null);
@@ -1724,6 +1730,40 @@ export default function PatientAppointments({
     });
     return result;
   };
+
+  const editPickerDate = useMemo(() => {
+    if (!editingAppointment?.scheduledAt) return undefined;
+    const d = parseScheduledAtAsLocal(editingAppointment.scheduledAt);
+    return new Date(d.getFullYear(), d.getMonth(), d.getDate());
+  }, [editingAppointment?.scheduledAt]);
+
+  const setEditPickerDate = useCallback(
+    (date: Date | undefined) => {
+      if (!editingAppointment || !date) return;
+      const current = parseScheduledAtAsLocal(editingAppointment.scheduledAt);
+      const merged = new Date(
+        date.getFullYear(),
+        date.getMonth(),
+        date.getDate(),
+        current.getHours(),
+        current.getMinutes(),
+        current.getSeconds(),
+        0,
+      );
+      setEditingAppointment({
+        ...editingAppointment,
+        scheduledAt: merged,
+      });
+      void fetchAppointmentsForDate(merged);
+    },
+    [editingAppointment],
+  );
+
+  const editBookingHoliday = useBookingHolidayCalendar({
+    enabled: !!editingAppointment,
+    selectedDate: editPickerDate,
+    setSelectedDate: setEditPickerDate,
+  });
 
   const formatTime = (timeString: string | Date) => {
     try {
@@ -2699,6 +2739,7 @@ export default function PatientAppointments({
                   size="sm"
                   onClick={() => {
                     setEditingAppointment(null);
+                    editBookingHoliday.resetHolidayState();
                     setEditAppointmentType("");
                     setEditSelectedTreatment(null);
                     setEditSelectedConsultation(null);
@@ -3024,126 +3065,16 @@ export default function PatientAppointments({
                     <Label className="text-sm font-medium text-gray-700 dark:text-gray-300">
                       Select Date *
                     </Label>
-                    <div className="mt-1 border border-gray-300 dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 overflow-hidden">
-                      <div className="p-3">
-                        <div className="flex items-center justify-between mb-2">
-                          <button
-                            type="button"
-                            onClick={() => {
-                              const currentDate = new Date(
-                                editingAppointment.scheduledAt,
-                              );
-                              currentDate.setMonth(currentDate.getMonth() - 1);
-                              setEditingAppointment({
-                                ...editingAppointment,
-                                scheduledAt: currentDate,
-                              });
-                            }}
-                            className="p-1 hover:bg-gray-100 dark:hover:bg-gray-600 rounded text-gray-700 dark:text-gray-300"
-                          >
-                            <ChevronLeft className="h-4 w-4" />
-                          </button>
-                          <span className="text-sm font-medium text-gray-900 dark:text-gray-100">
-                            {format(
-                              parseScheduledAtAsLocal(editingAppointment.scheduledAt),
-                              "MMMM yyyy",
-                            )}
-                          </span>
-                          <button
-                            type="button"
-                            onClick={() => {
-                              const currentDate = new Date(
-                                editingAppointment.scheduledAt,
-                              );
-                              currentDate.setMonth(currentDate.getMonth() + 1);
-                              setEditingAppointment({
-                                ...editingAppointment,
-                                scheduledAt: currentDate,
-                              });
-                            }}
-                            className="p-1 hover:bg-gray-100 dark:hover:bg-gray-600 rounded text-gray-700 dark:text-gray-300"
-                          >
-                            <ChevronRight className="h-4 w-4" />
-                          </button>
-                        </div>
-                        <div className="grid grid-cols-7 gap-0.5 text-xs mb-1">
-                          {["Su", "Mo", "Tu", "We", "Th", "Fr", "Sa"].map(
-                            (day) => (
-                              <div
-                                key={day}
-                                className="p-1.5 text-center font-medium text-gray-500 dark:text-gray-400"
-                              >
-                                {day}
-                              </div>
-                            ),
-                          )}
-                        </div>
-                        <div className="grid grid-cols-7 gap-0.5">
-                        {Array.from({ length: 42 }, (_, i) => {
-                          const currentMonth = new Date(
-                            editingAppointment.scheduledAt,
-                          ).getMonth();
-                          const currentYear = new Date(
-                            editingAppointment.scheduledAt,
-                          ).getFullYear();
-                          const firstDayOfMonth = new Date(
-                            currentYear,
-                            currentMonth,
-                            1,
-                          );
-                          const startDate = new Date(firstDayOfMonth);
-                          startDate.setDate(
-                            startDate.getDate() - firstDayOfMonth.getDay(),
-                          );
-                          const cellDate = new Date(startDate);
-                          cellDate.setDate(cellDate.getDate() + i);
-                          const isCurrentMonth =
-                            cellDate.getMonth() === currentMonth;
-                          const isSelected =
-                            format(cellDate, "yyyy-MM-dd") ===
-                            format(
-                              parseScheduledAtAsLocal(editingAppointment.scheduledAt),
-                              "yyyy-MM-dd",
-                            );
-
-                          return (
-                            <button
-                              key={i}
-                              type="button"
-                              onClick={() => {
-                                // Preserve the current time when changing the date
-                                // Parse scheduledAt as local time to avoid timezone conversion
-                                const currentDate = parseScheduledAtAsLocal(editingAppointment.scheduledAt);
-                                const newDate = new Date(
-                                  cellDate.getFullYear(),
-                                  cellDate.getMonth(),
-                                  cellDate.getDate(),
-                                  currentDate.getHours(),
-                                  currentDate.getMinutes(),
-                                  currentDate.getSeconds(),
-                                  0
-                                );
-                                setEditingAppointment({
-                                  ...editingAppointment,
-                                  scheduledAt: newDate,
-                                });
-                                // Fetch appointments for the new date to update time slot availability
-                                fetchAppointmentsForDate(cellDate);
-                              }}
-                              className={`p-1.5 text-xs rounded hover:bg-blue-50 dark:hover:bg-blue-900 ${
-                                isSelected
-                                  ? "bg-blue-500 text-white"
-                                  : isCurrentMonth
-                                    ? "text-gray-900 dark:text-gray-100"
-                                    : "text-gray-400 dark:text-gray-600"
-                              }`}
-                            >
-                              {cellDate.getDate()}
-                            </button>
-                          );
-                        })}
-                        </div>
-                      </div>
+                    <div className="mt-1 overflow-y-auto border border-gray-300 dark:border-gray-600 rounded-md p-2 bg-white dark:bg-gray-700">
+                      <CalendarComponent
+                        mode="single"
+                        selected={editPickerDate}
+                        onSelect={editBookingHoliday.handleDateSelect}
+                        disabled={(date) => editBookingHoliday.isDateHolidayBlocked(date)}
+                        className="w-full"
+                        {...editBookingHoliday.calendarProps}
+                      />
+                      {editBookingHoliday.legend}
                     </div>
                   </div>
 
@@ -3153,6 +3084,11 @@ export default function PatientAppointments({
                       Select Time Slot *
                     </Label>
                     <div className="mt-1 h-[280px] overflow-y-auto border border-gray-300 dark:border-gray-600 rounded-md p-3 bg-white dark:bg-gray-700 relative z-0">
+                      <BookingHolidayTimeSlotPanel
+                        selectedDate={editPickerDate}
+                        bookingHoliday={editBookingHoliday}
+                        emptyMessage="No time slots available for this date."
+                      >
                       <div className="grid grid-cols-2 gap-2 relative z-0">
                         {(() => {
                           // Generate time slots based on shift boundaries (custom shifts first, then default shifts by role)
@@ -3306,6 +3242,7 @@ export default function PatientAppointments({
                           );
                         })}
                       </div>
+                      </BookingHolidayTimeSlotPanel>
                     </div>
                   </div>
                 </div>
@@ -3317,6 +3254,7 @@ export default function PatientAppointments({
                   variant="outline"
                   onClick={() => {
                     setEditingAppointment(null);
+                    editBookingHoliday.resetHolidayState();
                     setEditAppointmentType("");
                     setEditSelectedTreatment(null);
                     setEditSelectedConsultation(null);

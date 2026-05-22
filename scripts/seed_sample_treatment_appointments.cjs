@@ -3,10 +3,9 @@ const { Pool } = pg;
 
 // Use the same connection string as the running app (server/db.ts) to avoid
 // accidentally seeding a different DB via env vars.
-const connectionString =
-  "postgresql://curauser24nov25:cura_123@185.185.126.58:5432/cura24nov2025";
+const { getDatabaseConnectionString } = require("./load-db-config.cjs");
 
-const pool = new Pool({ connectionString });
+const pool = new Pool({ connectionString: getDatabaseConnectionString() });
 
 // Note: do not force search_path here; environments differ.
 // We rely on the DB user's default search_path so tables like `appointments` resolve correctly.

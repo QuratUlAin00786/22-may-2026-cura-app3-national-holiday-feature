@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef } from "react";
+import { useState, useEffect, useCallback, useRef, useMemo } from "react";
 import { useQuery, useMutation } from "@tanstack/react-query";
 import { queryClient, apiRequest } from "@/lib/queryClient";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -19,6 +19,14 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { Label } from "@/components/ui/label";
+import {
+  Command,
+  CommandEmpty,
+  CommandGroup,
+  CommandInput,
+  CommandItem,
+  CommandList,
+} from "@/components/ui/command";
 import {
   Send,
   Plus,
@@ -48,6 +56,7 @@ import {
   X,
   Calendar,
   ChevronDown,
+  ChevronsUpDown,
   Globe,
   LogOut
 } from "lucide-react";
@@ -495,6 +504,8 @@ export default function MessagingPage() {
   const [selectedMessagePatient, setSelectedMessagePatient] = useState<string>("");
   const [messagePatientSearch, setMessagePatientSearch] = useState<string>("");
   const [selectedRecipientRole, setSelectedRecipientRole] = useState<string>("");
+  const [composeRecipientNameOpen, setComposeRecipientNameOpen] = useState(false);
+  const [composeRecipientRoleOpen, setComposeRecipientRoleOpen] = useState(false);
   const [selectedRecipientUser, setSelectedRecipientUser] = useState<string>("");
   const [selectedVideoCallParticipant, setSelectedVideoCallParticipant] = useState<any>(null);
   const [validationErrors, setValidationErrors] = useState<{
@@ -615,6 +626,121 @@ export default function MessagingPage() {
     }
     return base.filter((u: any) => String(u.id) !== String(currentUserId));
   })();
+
+  const patientRelationRank = (relation?: string | null) => {
+    if (!relation) return 50;
+    const r = String(relation).toLowerCase();
+    if (r === "self") return 0;
+    if (r === "spouse") return 10;
+    if (r === "father") return 20;
+    if (r === "mother") return 21;
+    if (r === "son") return 30;
+    if (r === "daughter") return 31;
+    if (r === "dependent child") return 32;
+    if (r === "other") return 40;
+    return 45;
+  };
+
+  const formatPatientDropdownLabel = (patient: any) =>
+    `${patient?.firstName ?? ""} ${patient?.lastName ?? ""}`.trim() +
+    (patient?.patientId ? ` (${patient.patientId})` : "");
+
+  const getSelfEmailForUserId = (userId: number | string | null | undefined): string => {
+    if (!patientsData || !Array.isArray(patientsData) || userId == null) return "";
+    const self = patientsData.find(
+      (p: any) =>
+        String(p?.userId) === String(userId) &&
+        String(p?.relation ?? "").trim().toLowerCase() === "self",
+    );
+    return String(self?.email ?? "").trim();
+  };
+
+  const getDisplayEmailForPatient = (patient: any): string => {
+    if (!patient) return "";
+    const relation = String(patient?.relation ?? "").trim().toLowerCase();
+    const email = String(patient?.email ?? "").trim();
+    if (relation === "self") return email;
+    return getSelfEmailForUserId(patient?.userId) || email;
+  };
+
+  const selectedComposePatient = useMemo(() => {
+    if (selectedRecipientRole !== "patient" || !selectedRecipientUser) return null;
+    return (patientsData || []).find((p: any) => String(p.id) === selectedRecipientUser) ?? null;
+  }, [selectedRecipientRole, selectedRecipientUser, patientsData]);
+
+  const patientRecipientsForMessaging = useMemo(() => {
+    const base = patientsData || [];
+    if (currentUserId == null) return base;
+    return base.filter(
+      (p: any) =>
+        String(p.userId) !== String(currentUserId) && String(p.id) !== String(currentUserId),
+    );
+  }, [patientsData, currentUserId]);
+
+  const patientDropdownGroups = useMemo(() => {
+    if (!Array.isArray(patientRecipientsForMessaging) || patientRecipientsForMessaging.length === 0) {
+      return [];
+    }
+
+    const map = new Map<number | string, any[]>();
+    for (const p of patientRecipientsForMessaging) {
+      const key = p?.userId ?? `no-user-${p?.id ?? Math.random()}`;
+      const list = map.get(key) ?? [];
+      list.push(p);
+      map.set(key, list);
+    }
+
+    const groups = Array.from(map.values()).map((members) => {
+      const sorted = [...members].sort((a, b) => {
+        const rr = patientRelationRank(a?.relation) - patientRelationRank(b?.relation);
+        if (rr !== 0) return rr;
+        const na = `${a?.firstName ?? ""} ${a?.lastName ?? ""}`.trim().toLowerCase();
+        const nb = `${b?.firstName ?? ""} ${b?.lastName ?? ""}`.trim().toLowerCase();
+        return na.localeCompare(nb);
+      });
+
+      const main =
+        sorted.find((m) => String(m?.relation ?? "").trim().toLowerCase() === "self") ??
+        sorted[0];
+      const relatives = sorted.filter((m) => m !== main);
+      return { main, relatives };
+    });
+
+    groups.sort((a, b) => {
+      const na = `${a.main?.firstName ?? ""} ${a.main?.lastName ?? ""}`.trim().toLowerCase();
+      const nb = `${b.main?.firstName ?? ""} ${b.main?.lastName ?? ""}`.trim().toLowerCase();
+      return na.localeCompare(nb);
+    });
+
+    return groups;
+  }, [patientRecipientsForMessaging]);
+
+  const handleComposeRecipientSelect = (recipient: any) => {
+    const value = String(recipient.id);
+    setSelectedRecipientUser(value);
+    setNewMessage((prev) => ({
+      ...prev,
+      recipient: value,
+      phoneNumber: recipient.phone || recipient.phoneNumber || recipient.mobile || prev.phoneNumber || "",
+    }));
+    setValidationErrors((prev) => ({ ...prev, recipientName: undefined }));
+    setComposeRecipientNameOpen(false);
+  };
+
+  const getRoleDisplayLabel = (roleName: string) => {
+    if (!roleName) return "";
+    const match = (rolesData as any[]).find((r) => r.name === roleName);
+    return match?.displayName || formatRoleLabel(roleName);
+  };
+
+  const handleComposeRoleSelect = (roleName: string) => {
+    setSelectedRecipientRole(roleName);
+    setSelectedRecipientUser("");
+    setComposeRecipientNameOpen(false);
+    setComposeRecipientRoleOpen(false);
+    setNewMessage((prev) => ({ ...prev, recipient: "", phoneNumber: "" }));
+    setValidationErrors((prev) => ({ ...prev, recipientRole: undefined }));
+  };
 
   // Helper function to get the other participant (not the current user)
   const getOtherParticipant = (conversation: Conversation) => {
@@ -1537,6 +1663,8 @@ export default function MessagingPage() {
     setSelectedRecipientRole("");
     setSelectedRecipientUser("");
     setSelectedMessagePatient("");
+    setComposeRecipientRoleOpen(false);
+    setComposeRecipientNameOpen(false);
   };
 
 
@@ -4430,77 +4558,204 @@ export default function MessagingPage() {
                   <>
                     <div className="space-y-1">
                       <Label htmlFor="selectRole" className="text-xs font-medium leading-none">Select Role *</Label>
-                      <Select
-                        value={selectedRecipientRole}
-                        onValueChange={(value) => {
-                          setSelectedRecipientRole(value);
-                          setSelectedRecipientUser("");
-                          setNewMessage(prev => ({ ...prev, recipient: "", phoneNumber: "" }));
-                          setValidationErrors(prev => ({ ...prev, recipientRole: undefined }));
-                        }}
+                      <Popover
+                        open={composeRecipientRoleOpen}
+                        onOpenChange={setComposeRecipientRoleOpen}
                       >
-                        <SelectTrigger data-testid="select-recipient-role" className={`h-8 text-xs leading-none ${validationErrors.recipientRole ? "border-red-500" : ""}`}>
-                          <SelectValue placeholder="Select a role..." />
-                        </SelectTrigger>
-                        <SelectContent className="max-h-[150px] overflow-y-auto">
-                          {rolesData.map((role: any) => (
-                            <SelectItem key={role.id} value={role.name} className="text-xs leading-none">
-                              {role.displayName || role.name}
-                            </SelectItem>
-                          ))}
-                        </SelectContent>
-                      </Select>
+                        <PopoverTrigger asChild>
+                          <Button
+                            type="button"
+                            variant="outline"
+                            role="combobox"
+                            aria-expanded={composeRecipientRoleOpen}
+                            data-testid="select-recipient-role"
+                            className={`h-8 w-full justify-between text-xs font-normal min-w-0 ${validationErrors.recipientRole ? "border-red-500" : ""}`}
+                          >
+                            <span className="truncate text-left">
+                              {selectedRecipientRole
+                                ? getRoleDisplayLabel(selectedRecipientRole)
+                                : "Select a role..."}
+                            </span>
+                            <ChevronsUpDown className="ml-2 h-3.5 w-3.5 shrink-0 opacity-50" />
+                          </Button>
+                        </PopoverTrigger>
+                        <PopoverContent className="w-[var(--radix-popover-trigger-width)] min-w-[200px] p-0" align="start">
+                          <Command>
+                            <CommandInput placeholder="Search role..." className="text-xs h-8" />
+                            <CommandList className="max-h-[200px]">
+                              <CommandEmpty className="text-xs py-3">No role found.</CommandEmpty>
+                              <CommandGroup>
+                                {(rolesData as any[]).map((role: any) => (
+                                  <CommandItem
+                                    key={role.id}
+                                    value={`${role.displayName || role.name} ${role.name}`}
+                                    data-testid={`recipient-role-option-${role.name}`}
+                                    onSelect={() => handleComposeRoleSelect(role.name)}
+                                    className="text-xs py-2"
+                                  >
+                                    <Check
+                                      className={`mr-2 h-3.5 w-3.5 shrink-0 ${
+                                        selectedRecipientRole === role.name
+                                          ? "opacity-100"
+                                          : "opacity-0"
+                                      }`}
+                                    />
+                                    <span className="truncate">
+                                      {role.displayName || formatRoleLabel(role.name)}
+                                    </span>
+                                  </CommandItem>
+                                ))}
+                              </CommandGroup>
+                            </CommandList>
+                          </Command>
+                        </PopoverContent>
+                      </Popover>
                       {validationErrors.recipientRole && (
                         <p className="text-xs text-red-500 mt-0.5 leading-none">{validationErrors.recipientRole}</p>
                       )}
                     </div>
                     <div className="space-y-1">
                       <Label htmlFor="selectName" className="text-xs font-medium leading-none">Select Name *</Label>
-                      <Select
-                        value={selectedRecipientUser}
-                        onValueChange={(value) => {
-                          setSelectedRecipientUser(value);
-                          setNewMessage(prev => ({ ...prev, recipient: value }));
-                          setValidationErrors(prev => ({ ...prev, recipientName: undefined }));
+                      {selectedRecipientRole === "patient" ? (
+                        <>
+                        <Popover
+                          open={composeRecipientNameOpen}
+                          onOpenChange={setComposeRecipientNameOpen}
+                        >
+                          <PopoverTrigger asChild>
+                            <Button
+                              type="button"
+                              variant="outline"
+                              role="combobox"
+                              aria-expanded={composeRecipientNameOpen}
+                              disabled={!selectedRecipientRole}
+                              data-testid="select-recipient-name"
+                              className={`h-8 w-full justify-between text-xs font-normal min-w-0 ${validationErrors.recipientName ? "border-red-500" : ""}`}
+                            >
+                              <span className="truncate text-left">
+                                {selectedRecipientUser
+                                  ? (() => {
+                                      const patient = (patientsData || []).find(
+                                        (p: any) => String(p.id) === selectedRecipientUser,
+                                      );
+                                      return patient
+                                        ? formatPatientDropdownLabel(patient)
+                                        : "Select a patient";
+                                    })()
+                                  : selectedRecipientRole
+                                    ? "Select a patient"
+                                    : "Select role first..."}
+                              </span>
+                              <ChevronsUpDown className="ml-2 h-3.5 w-3.5 shrink-0 opacity-50" />
+                            </Button>
+                          </PopoverTrigger>
+                          <PopoverContent className="w-[var(--radix-popover-trigger-width)] min-w-[260px] p-0" align="start">
+                            <Command>
+                              <CommandInput placeholder="Search patient..." className="text-xs h-8" />
+                              <CommandList>
+                                <CommandEmpty className="text-xs py-3">No patient found.</CommandEmpty>
+                                <CommandGroup>
+                                  {patientsLoading ? (
+                                    <CommandItem disabled className="text-xs">
+                                      Loading patients...
+                                    </CommandItem>
+                                  ) : patientDropdownGroups.length > 0 ? (
+                                    patientDropdownGroups.flatMap(({ main, relatives }) => {
+                                      const rows = [
+                                        { patient: main, isChild: false },
+                                        ...relatives.map((p: any) => ({ patient: p, isChild: true })),
+                                      ];
+                                      return rows.map(({ patient, isChild }) => (
+                                        <CommandItem
+                                          key={patient.id}
+                                          value={`${patient.firstName} ${patient.lastName} ${patient.patientId} ${patient.email ?? ""}`}
+                                          data-testid={`recipient-option-${patient.id}`}
+                                          onSelect={() => handleComposeRecipientSelect(patient)}
+                                          className="text-xs py-2"
+                                        >
+                                          <Check
+                                            className={`mr-2 h-3.5 w-3.5 shrink-0 ${
+                                              selectedRecipientUser === String(patient.id)
+                                                ? "opacity-100"
+                                                : "opacity-0"
+                                            }`}
+                                          />
+                                          <span className={`truncate ${isChild ? "pl-1" : ""}`}>
+                                            {isChild ? "↳ " : ""}
+                                            {formatPatientDropdownLabel(patient)}
+                                          </span>
+                                        </CommandItem>
+                                      ));
+                                    })
+                                  ) : (
+                                    <CommandItem disabled className="text-xs">
+                                      No patients available
+                                    </CommandItem>
+                                  )}
+                                </CommandGroup>
+                              </CommandList>
+                            </Command>
+                          </PopoverContent>
+                        </Popover>
+                        {selectedComposePatient && (
+                          <div className="rounded-md border border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-slate-900/40 px-2.5 py-2">
+                            <Label className="text-[10px] font-medium text-gray-500 dark:text-gray-400 leading-none">
+                              Email
+                            </Label>
+                            <p
+                              className="text-xs text-gray-900 dark:text-gray-100 mt-1 break-all leading-snug"
+                              data-testid="compose-recipient-email"
+                            >
+                              {getDisplayEmailForPatient(selectedComposePatient) || "—"}
+                            </p>
+                          </div>
+                        )}
+                        </>
+                      ) : (
+                        <Select
+                          value={selectedRecipientUser}
+                          onValueChange={(value) => {
+                            setSelectedRecipientUser(value);
+                            setNewMessage((prev) => ({ ...prev, recipient: value }));
+                            setValidationErrors((prev) => ({ ...prev, recipientName: undefined }));
 
-                          // Auto-populate phone number for patient role (find by id for unique selection)
-                          if (selectedRecipientRole === 'patient') {
-                            const patient = (patientsData || []).find((p: any) => String(p.id) === value);
-                            if (patient && (patient.phone || patient.phoneNumber || patient.mobile)) {
-                              setNewMessage(prev => ({
-                                ...prev,
-                                recipient: value,
-                                phoneNumber: patient.phone || patient.phoneNumber || patient.mobile || ""
-                              }));
-                            }
-                          } else {
                             const recipient = filteredRecipients.find((r: any) => String(r.id) === value);
                             if (recipient && (recipient.phone || recipient.phoneNumber || recipient.mobile)) {
-                              setNewMessage(prev => ({
+                              setNewMessage((prev) => ({
                                 ...prev,
-                                phoneNumber: recipient.phone || recipient.phoneNumber || recipient.mobile || ""
+                                phoneNumber:
+                                  recipient.phone || recipient.phoneNumber || recipient.mobile || "",
                               }));
                             }
-                          }
-                        }}
-                        disabled={!selectedRecipientRole}
-                      >
-                        <SelectTrigger data-testid="select-recipient-name" className={`h-8 text-xs min-w-0 truncate leading-none ${validationErrors.recipientName ? "border-red-500" : ""}`}>
-                          <SelectValue placeholder={selectedRecipientRole ? "Select a name..." : "Select role first..."} />
-                        </SelectTrigger>
-                        <SelectContent>
-                          {filteredRecipients.map((recipient: any) => (
-                            <SelectItem
-                              key={recipient.id}
-                              value={String(recipient.id)}
-                              data-testid={`recipient-option-${recipient.id}`}
-                              className="text-xs leading-none"
-                            >
-                              <span className="truncate block leading-none">{recipient.firstName} {recipient.lastName} ({recipient.email})</span>
-                            </SelectItem>
-                          ))}
-                        </SelectContent>
-                      </Select>
+                          }}
+                          disabled={!selectedRecipientRole}
+                        >
+                          <SelectTrigger
+                            data-testid="select-recipient-name"
+                            className={`h-8 text-xs min-w-0 truncate leading-none ${validationErrors.recipientName ? "border-red-500" : ""}`}
+                          >
+                            <SelectValue
+                              placeholder={
+                                selectedRecipientRole ? "Select a name..." : "Select role first..."
+                              }
+                            />
+                          </SelectTrigger>
+                          <SelectContent>
+                            {filteredRecipients.map((recipient: any) => (
+                              <SelectItem
+                                key={recipient.id}
+                                value={String(recipient.id)}
+                                data-testid={`recipient-option-${recipient.id}`}
+                                className="text-xs leading-none"
+                              >
+                                <span className="truncate block leading-none">
+                                  {recipient.firstName} {recipient.lastName} ({recipient.email})
+                                </span>
+                              </SelectItem>
+                            ))}
+                          </SelectContent>
+                        </Select>
+                      )}
                       {validationErrors.recipientName && (
                         <p className="text-xs text-red-500 mt-0.5 leading-none">{validationErrors.recipientName}</p>
                       )}

@@ -20,19 +20,64 @@ function releaseCallerWarmStream() {
   }
 }
 
-/** Free the camera/mic device held by the start-call preview stream before LiveKit opens it. */
-function stopCallerWarmTracks(kinds: Array<'audio' | 'video'>) {
-  const stream = (window as Window & { __callerWarmStream?: MediaStream | null })
-    .__callerWarmStream;
-  if (!stream) return;
-  stream.getTracks().forEach((track) => {
-    if (kinds.includes(track.kind as 'audio' | 'video')) {
-      track.stop();
+function waitMs(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function unpublishLocalVideoTracks(participant: LocalParticipant) {
+  for (const publication of participant.videoTrackPublications.values()) {
+    if (!publication.track) continue;
+    try {
+      await participant.unpublishTrack(publication.track);
+      publication.track.stop();
+    } catch (e) {
+      console.warn('Could not unpublish local video track:', e);
     }
-  });
-  if (stream.getTracks().every((t) => t.readyState === 'ended')) {
-    (window as Window & { __callerWarmStream?: MediaStream | null }).__callerWarmStream =
-      null;
+  }
+  try {
+    await participant.setCameraEnabled(false);
+  } catch {
+    // ignore
+  }
+}
+
+function hasPublishedCameraTrack(participant: LocalParticipant): boolean {
+  return Array.from(participant.videoTrackPublications.values()).some(
+    (pub) => pub.kind === Track.Kind.Video && pub.track,
+  );
+}
+
+/** Enable camera once pre-call streams are released; retries after NotReadableError. */
+async function enableLocalCamera(participant: LocalParticipant): Promise<boolean> {
+  releaseCallerWarmStream();
+  await waitMs(250);
+
+  for (let attempt = 0; attempt < 3; attempt++) {
+    if (attempt > 0) {
+      await unpublishLocalVideoTracks(participant);
+      releaseCallerWarmStream();
+      await waitMs(350 * attempt);
+    }
+    try {
+      await participant.setCameraEnabled(true);
+      if (hasPublishedCameraTrack(participant)) {
+        return true;
+      }
+    } catch (err) {
+      console.warn(`Camera enable attempt ${attempt + 1} failed:`, err);
+    }
+  }
+
+  try {
+    await unpublishLocalVideoTracks(participant);
+    releaseCallerWarmStream();
+    await waitMs(500);
+    const videoTrack = await createLocalVideoTrack();
+    await participant.publishTrack(videoTrack, { source: Track.Source.Camera });
+    return hasPublishedCameraTrack(participant);
+  } catch (err) {
+    console.error('❌ Failed to enable camera:', err);
+    return false;
   }
 }
 
@@ -242,9 +287,12 @@ export function useLiveKitRoom(): UseLiveKitRoomReturn {
       // Connect to room
       await newRoom.connect(serverUrl, token);
 
+      // Release start-call preview stream before LiveKit opens devices.
+      releaseCallerWarmStream();
+      await waitMs(150);
+
       if (config.audioEnabled !== false) {
         try {
-          stopCallerWarmTracks(['audio']);
           await newRoom.localParticipant.setMicrophoneEnabled(true);
           setIsAudioEnabled(true);
           console.log('✅ Microphone enabled');
@@ -255,29 +303,10 @@ export function useLiveKitRoom(): UseLiveKitRoomReturn {
       }
 
       if (config.videoEnabled !== false) {
-        const enableCamera = async () => {
-          stopCallerWarmTracks(['video']);
-          await new Promise((resolve) => setTimeout(resolve, 100));
-          await newRoom.localParticipant.setCameraEnabled(true);
-          setIsVideoEnabled(true);
+        const cameraOk = await enableLocalCamera(newRoom.localParticipant);
+        setIsVideoEnabled(cameraOk);
+        if (cameraOk) {
           console.log('✅ Camera enabled');
-        };
-        try {
-          await enableCamera();
-        } catch (err: any) {
-          try {
-            stopCallerWarmTracks(['video']);
-            await new Promise((resolve) => setTimeout(resolve, 300));
-            const videoTrack = await createLocalVideoTrack();
-            await newRoom.localParticipant.publishTrack(videoTrack, {
-              source: Track.Source.Camera,
-            });
-            setIsVideoEnabled(true);
-            console.log('✅ Camera enabled via publishTrack');
-          } catch (retryErr: any) {
-            console.error('❌ Failed to enable camera:', retryErr);
-            setIsVideoEnabled(false);
-          }
         }
       }
 

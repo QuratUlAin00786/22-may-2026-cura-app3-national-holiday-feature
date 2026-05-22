@@ -27,25 +27,41 @@ interface SendEmailReport {
   error?: string;
 }
 
+function resolveEmailFromAddress(override?: string): string {
+  const raw =
+    override ||
+    process.env.EMAIL_FROM ||
+    process.env.DEFAULT_FROM_EMAIL ||
+    process.env.GMAIL_EMAIL_FROM ||
+    process.env.SMTP_FROM ||
+    "noreply@curaemr.ai";
+  return String(raw).replace(/^["']|["']$/g, "").trim();
+}
+
 class EmailService {
   private transporter: nodemailer.Transporter;
   private initialized: boolean = false;
   private sendGridConnectionSettings: any = null;
+  /** Ensures SMTP from .env is applied before any send (constructor init is async). */
+  private readonly initPromise: Promise<void>;
 
   constructor() {
-    // Initialize with fallback transporter
+    // Placeholder until initializeProductionEmailService completes
     this.transporter = nodemailer.createTransport({
-      host: 'smtp.ethereal.email',
+      host: "smtp.ethereal.email",
       port: 587,
       secure: false,
       auth: {
-        user: 'test@test.com',
-        pass: 'test'
-      }
+        user: "test@test.com",
+        pass: "test",
+      },
     });
 
-    // Initialize production email service
-    this.initializeProductionEmailService();
+    this.initPromise = this.initializeProductionEmailService();
+  }
+
+  private async ensureReady(): Promise<void> {
+    await this.initPromise;
   }
 
   private async getSendGridCredentials() {
@@ -89,14 +105,28 @@ class EmailService {
 
   private async initializeProductionEmailService() {
     try {
-      const smtpHost = process.env.SMTP_HOST;
-      const smtpPort = Number(process.env.SMTP_PORT ?? 587);
-      const smtpUser = process.env.SMTP_USER;
-      const smtpPass = process.env.SMTP_PASSWORD;
+      const smtpHost = process.env.SMTP_HOST || process.env.GMAIL_SMTP_HOST;
+      const smtpPort = Number(
+        process.env.SMTP_PORT ?? process.env.GMAIL_SMTP_PORT ?? 587,
+      );
+      const smtpUser = process.env.SMTP_USER || process.env.GMAIL_SMTP_USER;
+      const smtpPass =
+        process.env.SMTP_PASSWORD || process.env.GMAIL_SMTP_PASSWORD;
 
       if (smtpHost && smtpUser && smtpPass) {
-        console.log('[EMAIL] Initializing SMTP transport from .env');
-        const secure = process.env.SMTP_SECURE === 'true' || smtpPort === 465;
+        const secure =
+          smtpPort === 465
+            ? true
+            : process.env.SMTP_SECURE === "true" ||
+              process.env.GMAIL_SMTP_SECURE === "true";
+
+        console.log("[EMAIL] Initializing SMTP transport:", {
+          host: smtpHost,
+          port: smtpPort,
+          secure,
+          user: smtpUser,
+        });
+
         this.transporter = nodemailer.createTransport({
           host: smtpHost,
           port: smtpPort,
@@ -106,47 +136,33 @@ class EmailService {
             pass: smtpPass,
           },
           tls: {
-            rejectUnauthorized: process.env.SMTP_REJECT_UNAUTHORIZED !== 'false',
+            rejectUnauthorized: process.env.SMTP_REJECT_UNAUTHORIZED !== "false",
           },
           connectionTimeout: 60000,
           greetingTimeout: 30000,
           socketTimeout: 60000,
         });
+
+        try {
+          await this.transporter.verify();
+          console.log("[EMAIL] ✅ SMTP transport verified");
+        } catch (verifyErr: unknown) {
+          console.warn(
+            "[EMAIL] SMTP verify warning (sends may still work):",
+            verifyErr instanceof Error ? verifyErr.message : verifyErr,
+          );
+        }
+
         this.initialized = true;
-        console.log('[EMAIL] ✅ SMTP transport configured using environment variables');
         return;
       }
 
-      console.log('[EMAIL] SMTP env vars missing, falling back to Gmail SMTP');
-      const gmailUser = process.env.GMAIL_SMTP_USER || 'noreply@curaemr.ai';
-      const gmailPass = process.env.GMAIL_SMTP_PASSWORD;
-
-      if (!gmailPass) {
-        console.warn('[EMAIL] GMAIL_SMTP_PASSWORD not set in environment variables');
-      }
-
-      this.transporter = nodemailer.createTransport({
-        host: 'smtp.gmail.com',
-        port: 465,
-        secure: true,
-        auth: {
-          user: gmailUser,
-          pass: gmailPass || '',
-        },
-        debug: false,
-        logger: false,
-        tls: {
-          rejectUnauthorized: false,
-        },
-        connectionTimeout: 60000,
-        greetingTimeout: 30000,
-        socketTimeout: 60000,
-      });
-
+      console.warn(
+        "[EMAIL] SMTP credentials missing (SMTP_* or GMAIL_SMTP_*). Emails will fail until configured.",
+      );
       this.initialized = true;
-      console.log('[EMAIL] ✅ Gmail SMTP configured for production');
     } catch (error) {
-      console.error('[EMAIL] Failed to initialize email service:', error);
+      console.error("[EMAIL] Failed to initialize email service:", error);
       this.initialized = true;
     }
   }
@@ -217,13 +233,20 @@ class EmailService {
 
   async sendEmailWithReport(options: EmailOptions): Promise<SendEmailReport> {
     try {
-      const sendGridResult = await this.sendWithSendGrid(options);
+      await this.ensureReady();
+
+      const normalizedOptions: EmailOptions = {
+        ...options,
+        from: resolveEmailFromAddress(options.from),
+      };
+
+      const sendGridResult = await this.sendWithSendGrid(normalizedOptions);
       if (sendGridResult.success) {
         return { success: true };
       }
 
       console.log('[EMAIL] SendGrid unavailable, trying SMTP fallback...');
-      const smtpResult = await this.sendWithSMTP(options);
+      const smtpResult = await this.sendWithSMTP(normalizedOptions);
       if (smtpResult.success) {
         return { success: true };
       }
@@ -232,13 +255,13 @@ class EmailService {
         smtpResult.error ||
         sendGridResult.error ||
         "Unknown error while sending email via SendGrid/SMTP";
-      console.log('[EMAIL] 🚨 EMAIL DELIVERY FAILED:', errorMessage);
-      console.log('[EMAIL] TO:', options.to);
-      console.log('[EMAIL] SUBJECT:', options.subject);
-      console.log('[EMAIL] CONTENT:', options.text?.substring(0, 200));
+      console.error("[EMAIL] 🚨 EMAIL DELIVERY FAILED:", errorMessage);
+      console.error("[EMAIL] TO:", normalizedOptions.to);
+      console.error("[EMAIL] FROM:", normalizedOptions.from);
+      console.error("[EMAIL] SUBJECT:", normalizedOptions.subject);
       return { success: false, error: errorMessage };
     } catch (error: any) {
-      console.error('[EMAIL] Failed to send email:', error);
+      console.error("[EMAIL] Failed to send email:", error);
       return { success: false, error: error?.message || "Unknown error" };
     }
   }
@@ -248,7 +271,7 @@ class EmailService {
       // Use only the attachments provided in options, don't add logos automatically
       const attachments = [...(options.attachments || [])];
 
-      const fromAddress = options.from || process.env.EMAIL_FROM || process.env.SMTP_FROM || 'noreply@curaemr.ai';
+      const fromAddress = resolveEmailFromAddress(options.from);
 
       const mailOptions = {
         from: fromAddress,
@@ -1492,12 +1515,16 @@ Company Registration: 16556912
     role: string
   ): Promise<boolean> {
     const template = this.generateNewUserAccountEmail(userName, userEmail, password, organizationName, role);
-    return this.sendEmail({
+    const report = await this.sendEmailWithReport({
       to: userEmail,
       subject: template.subject,
       html: template.html,
-      text: template.text
+      text: template.text,
     });
+    if (!report.success) {
+      console.error("[EMAIL] New user account email failed:", report.error, "to=", userEmail);
+    }
+    return report.success;
   }
 
   generatePasswordResetEmail(userFirstName: string, resetToken: string): EmailTemplate {
@@ -1834,6 +1861,160 @@ Cura EMR Billing Team
       html: template.html,
       text: template.text
     });
+  }
+
+  generatePatientRegistrationSuccessEmail(
+    patientName: string,
+    patientEmail: string,
+    organizationName: string,
+    patientId: string,
+    options?: { portalAccess?: boolean; loginUrl?: string },
+  ): EmailTemplate {
+    const portalAccess = !!options?.portalAccess;
+    const loginUrl = options?.loginUrl?.trim() || "";
+    const subject = `Registration confirmed — ${organizationName}`;
+
+    const portalBlock = portalAccess
+      ? loginUrl
+        ? `
+              <p style="margin: 0 0 20px 0; color: #4a5568; font-size: 16px; line-height: 1.6;">
+                A patient portal account is linked to this registration. You can sign in with <strong>${patientEmail}</strong>.
+              </p>
+              <table role="presentation" style="width: 100%; border-collapse: collapse;">
+                <tr>
+                  <td align="center" style="padding: 10px 0 20px 0;">
+                    <a href="${loginUrl}"
+                       style="display: inline-block; padding: 14px 32px; background-color: #4A7DFF; color: #ffffff; text-decoration: none; border-radius: 6px; font-size: 16px; font-weight: 600;">
+                      Sign in to patient portal
+                    </a>
+                  </td>
+                </tr>
+              </table>
+              <p style="margin: 0 0 20px 0; color: #718096; font-size: 14px; line-height: 1.6; word-break: break-all;">
+                Or open: ${loginUrl}
+              </p>`
+        : `
+              <p style="margin: 0 0 20px 0; color: #4a5568; font-size: 16px; line-height: 1.6;">
+                A patient portal account is linked to this registration. Sign in with <strong>${patientEmail}</strong> using your clinic portal login page.
+              </p>`
+      : `
+              <p style="margin: 0 0 20px 0; color: #4a5568; font-size: 16px; line-height: 1.6;">
+                Your patient record is on file with the clinic. If you need portal access, contact the clinic reception team.
+              </p>`;
+
+    const html = `
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Registration confirmed</title>
+</head>
+<body style="margin: 0; padding: 0; font-family: Arial, sans-serif; background-color: #f4f7fa;">
+  <table role="presentation" style="width: 100%; border-collapse: collapse; background-color: #f4f7fa;">
+    <tr>
+      <td align="center" style="padding: 40px 0;">
+        <table role="presentation" style="width: 600px; border-collapse: collapse; background-color: #ffffff; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.1);">
+          <tr>
+            <td style="padding: 40px 40px 30px 40px; background: linear-gradient(135deg, #4A7DFF 0%, #7279FB 100%); border-radius: 8px 8px 0 0;">
+              <h1 style="margin: 0; color: #ffffff; font-size: 26px; font-weight: bold; text-align: center;">
+                ${organizationName}
+              </h1>
+              <p style="margin: 12px 0 0 0; color: #e8eeff; font-size: 15px; text-align: center;">Patient registration confirmed</p>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding: 40px;">
+              <h2 style="margin: 0 0 16px 0; color: #2d3748; font-size: 22px; font-weight: 600;">
+                Hello ${patientName},
+              </h2>
+              <p style="margin: 0 0 20px 0; color: #4a5568; font-size: 16px; line-height: 1.6;">
+                Thank you for completing your registration. You have been successfully registered with <strong>${organizationName}</strong>.
+              </p>
+              <div style="margin: 0 0 24px 0; padding: 16px 20px; background-color: #f0fdf4; border-left: 4px solid #22c55e; border-radius: 4px;">
+                <p style="margin: 0 0 8px 0; color: #166534; font-size: 14px;"><strong>Patient ID:</strong> ${patientId}</p>
+                <p style="margin: 0; color: #166534; font-size: 14px;"><strong>Registered email:</strong> ${patientEmail}</p>
+              </div>
+              ${portalBlock}
+              <p style="margin: 24px 0 0 0; color: #718096; font-size: 14px; line-height: 1.6;">
+                If you did not complete this registration, please contact ${organizationName} as soon as possible.
+              </p>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding: 30px 40px; background-color: #f7fafc; border-radius: 0 0 8px 8px; border-top: 1px solid #e2e8f0;">
+              <p style="margin: 0; color: #718096; font-size: 14px; text-align: center;">
+                Best regards,<br><strong style="color: #4a5568;">${organizationName}</strong>
+              </p>
+              <p style="margin: 16px 0 0 0; color: #a0aec0; font-size: 12px; text-align: center;">
+                This is an automated message. Please do not reply to this email.<br>
+                &copy; ${new Date().getFullYear()} Cura EMR
+              </p>
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>`;
+
+    const portalText = portalAccess
+      ? loginUrl
+        ? `A patient portal account is linked. Sign in at: ${loginUrl}\nUse email: ${patientEmail}\n`
+        : `A patient portal account is linked. Sign in with: ${patientEmail}\n`
+      : "Contact the clinic if you need patient portal access.\n";
+
+    const text = `Hello ${patientName},
+
+Thank you for completing your registration. You have been successfully registered with ${organizationName}.
+
+Patient ID: ${patientId}
+Registered email: ${patientEmail}
+
+${portalText}
+If you did not complete this registration, please contact ${organizationName}.
+
+Best regards,
+${organizationName}`;
+
+    return { subject, html, text };
+  }
+
+  async sendPatientRegistrationSuccessEmail(
+    patientEmail: string,
+    patientName: string,
+    organizationName: string,
+    patientId: string,
+    options?: { portalAccess?: boolean; loginUrl?: string },
+  ): Promise<SendEmailReport> {
+    const template = this.generatePatientRegistrationSuccessEmail(
+      patientName,
+      patientEmail,
+      organizationName,
+      patientId,
+      options,
+    );
+    const report = await this.sendEmailWithReport({
+      to: patientEmail,
+      subject: template.subject,
+      html: template.html,
+      text: template.text,
+    });
+    if (!report.success) {
+      console.error(
+        "[EMAIL] Patient registration confirmation failed:",
+        report.error,
+        "to=",
+        patientEmail,
+      );
+    } else {
+      console.log(
+        "[EMAIL] Patient registration confirmation sent to",
+        patientEmail,
+      );
+    }
+    return report;
   }
 }
 
