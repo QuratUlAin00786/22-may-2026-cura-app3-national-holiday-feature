@@ -19,10 +19,12 @@
     "SECURITY.md"
   ],
   "scripts": {
-    "build": "npm run build:cjs && npm run build:esm && npm run build:types",
+    "prepare": "npm run build",
+    "build": "npm run build:cjs && npm run build:esm && npm run build:types && npm run build:esm-package",
     "build:cjs": "tsc --module commonjs --outDir dist/cjs",
     "build:esm": "tsc --module esnext --outDir dist/esm",
     "build:types": "tsc --emitDeclarationOnly --outDir dist/types",
+    "build:esm-package": "node -e \"require('fs').mkdirSync('dist/esm',{recursive:true}); require('fs').writeFileSync('dist/esm/package.json', JSON.stringify({type:'module'}) + '\\\\n')\"",
     "test": "jest",
     "test:nist": "node test/nist-vectors.test.js",
     "test:security": "npm run test:nist && npm run test:audit",
