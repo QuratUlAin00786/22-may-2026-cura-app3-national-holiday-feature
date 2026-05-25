@@ -12,6 +12,7 @@
     "docs:lab-imaging-pdf": "node scripts/generate-lab-imaging-integration-guide-pdf.cjs"
   },
   "dependencies": {
+    "@averox/curaemrencryption-crypto-sdk": "file:encryption-sdk",
     "@anthropic-ai/sdk": "^0.37.0",
     "@floating-ui/core": "^1.7.3",
     "@floating-ui/dom": "^1.7.4",
