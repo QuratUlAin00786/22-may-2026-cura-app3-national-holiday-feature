@@ -359,6 +359,94 @@ export interface EnvelopeWithKMS extends AveroxEnvelope {
   kmsContext?: Record<string, string>; // Context for KEK operations
 }
 
+/** Plaintext DEK + Vault-wrapped DEK for reuse across multiple encrypt operations (one per record). */
+export interface ProvisionedDataKey {
+  dek: Buffer;
+  encryptedDEK: string;
+}
+
+/**
+ * Session for encrypting multiple fields under one DEK (one database row).
+ * Call beginRowEncryption(), encryptField() per column, then close().
+ */
+export class RowEncryptionSession {
+  private closed = false;
+
+  constructor(
+    private readonly crypto: AveroxCrypto,
+    private readonly dataKey: ProvisionedDataKey,
+  ) {}
+
+  /** Vault-wrapped DEK shared by every envelope in this row. */
+  get encryptedDEK(): string {
+    return this.dataKey.encryptedDEK;
+  }
+
+  /** Encrypt one column/value with this row's DEK (unique IV per call). */
+  async encryptField(
+    plaintext: Buffer | string,
+    aad: Buffer | string,
+    kid?: string,
+    kmsContext?: Record<string, string>,
+  ): Promise<EnvelopeWithKMS> {
+    this.assertOpen();
+    return this.crypto.encryptWithDataKey(plaintext, aad, this.dataKey, kid, kmsContext);
+  }
+
+  /** Zero the row DEK from memory when the batch is complete. */
+  close(): void {
+    if (!this.closed) {
+      this.crypto.releaseDataKey(this.dataKey.dek);
+      this.closed = true;
+    }
+  }
+
+  private assertOpen(): void {
+    if (this.closed) {
+      throw new AveroxCryptoError('SESSION_CLOSED', 'Row encryption session is already closed');
+    }
+  }
+}
+
+/**
+ * Session for decrypting multiple fields under one DEK (one database row).
+ * Call beginRowDecryption(), decryptField() per column, then close().
+ */
+export class RowDecryptionSession {
+  private closed = false;
+
+  constructor(
+    private readonly crypto: AveroxCrypto,
+    readonly encryptedDEK: string,
+    private readonly dek: Buffer,
+  ) {}
+
+  /** Decrypt one column/value that was encrypted with the same row encryptedDEK. */
+  async decryptField(envelope: EnvelopeWithKMS, aad: Buffer | string): Promise<Buffer> {
+    this.assertOpen();
+    if (!envelope.encryptedDEK) {
+      throw new BadInputError('Envelope is missing encryptedDEK');
+    }
+    if (envelope.encryptedDEK !== this.encryptedDEK) {
+      throw new BadInputError('Envelope encryptedDEK does not match this row decryption session');
+    }
+    return this.crypto.decryptWithDataKey(envelope, aad, this.dek);
+  }
+
+  close(): void {
+    if (!this.closed) {
+      this.crypto.releaseDataKey(this.dek);
+      this.closed = true;
+    }
+  }
+
+  private assertOpen(): void {
+    if (this.closed) {
+      throw new AveroxCryptoError('SESSION_CLOSED', 'Row decryption session is already closed');
+    }
+  }
+}
+
 /**
  * Map algorithm name/ID to Node.js crypto format
  * Supports: AES-256-GCM, AES-192-GCM, AES-128-GCM, ChaCha20-Poly1305
@@ -526,149 +614,52 @@ export class AveroxCrypto {
     this.isAead = cryptoAlg.isAead !== false; // Default to true for AEAD modes
     this.cipherMode = cryptoAlg.mode; // For non-AEAD modes (cbc, cfb, ctr)
   }
-  
-  // Encrypt with MANDATORY AAD (with Vault KMS envelope encryption)
-  async encrypt(plaintext: Buffer | string, aad: Buffer | string, kid?: string, kmsContext?: Record<string, string>): Promise<EnvelopeWithKMS> {
-    const startTime = performance.now();
-    
-    if (this.isZeroized) {
-      throw new AveroxCryptoError('ZEROIZED', 'Cannot encrypt: instance has been zeroized');
-    }
 
-      // Use selected algorithm name (normalized for envelope and telemetry)
-      // this.algorithm is in Node.js format (e.g., 'aes-256-gcm'), convert to display format
-      const algorithmDisplayName = this.algorithm.toUpperCase().replace(/_/g, '-');
-      
-      const attributes = {
-        alg: algorithmDisplayName,
-        kid: kid || 'unknown',
-        env: process.env.NODE_ENV || 'development',
-        useKMS: this.useEnvelopeEncryption ? 'true' : 'false'
-      };
-
-    try {
-      if (!aad || (typeof aad === 'string' && aad.length === 0) || (Buffer.isBuffer(aad) && aad.length === 0)) {
-        telemetry.increment(METRICS.FAIL_TOTAL, 1, { ...attributes, reason: 'missing_aad' });
-        throw new BadInputError('AAD (Additional Authenticated Data) is required and cannot be empty');
-      }
-      
-      const plaintextBuffer = typeof plaintext === 'string' ? Buffer.from(plaintext, 'utf8') : plaintext;
-      const aadBuffer = typeof aad === 'string' ? Buffer.from(aad, 'utf8') : aad;
-      
-      // ENVELOPE ENCRYPTION MODE: Obtain DEK from backend and encrypt data with it
-      if (!this.useEnvelopeEncryption || !this.backendClient) {
-        throw new AveroxCryptoError('ENVELOPE_REQUIRED', 'Envelope encryption is required. Please provide backend configuration.');
-      }
-      
-      // Step 1: Request DEK from backend
-      const { plaintext: dekB64, ciphertext: encryptedDEK } = await this.backendClient.getDataKey();
-      let dek = Buffer.from(dekB64, 'base64');
-      dek = Buffer.from(alignDekKeyLength(dek, this.keySize, this.algorithm));
-      
-      // Step 2: Encrypt data with backend-provisioned DEK using selected algorithm
-      const iv = crypto.randomBytes(this.ivSize);
-      
-      let ciphertext: Buffer;
-      let tag: Buffer;
-      
-      // Handle AEAD vs non-AEAD modes
-      if (this.isAead) {
-        // AEAD modes (GCM, ChaCha20-Poly1305) have built-in authentication
-        const cipher = crypto.createCipheriv(this.algorithm, dek, iv) as crypto.CipherGCM;
-        cipher.setAAD(aadBuffer, { 
-          plaintextLength: plaintextBuffer.length 
-        });
-        
-        ciphertext = cipher.update(plaintextBuffer);
-        ciphertext = Buffer.concat([ciphertext, cipher.final()]);
-        tag = cipher.getAuthTag();
-      } else {
-        // Non-AEAD modes (CBC, CFB, CTR) require HMAC for authentication
-        const cipher = crypto.createCipheriv(this.algorithm, dek, iv) as crypto.CipherGCM;
-        
-        ciphertext = cipher.update(plaintextBuffer);
-        ciphertext = Buffer.concat([ciphertext, cipher.final()]);
-        
-        // Compute HMAC-SHA256 tag for authentication (using DEK as HMAC key)
-        // In production, you might want to derive a separate HMAC key from DEK
-        const hmacKey = hkdf(
-          dek,
-          Buffer.alloc(32, 0),
-          Buffer.from('averox-hmac', 'utf8'),
-          32
-        );
-        const hmac = crypto.createHmac('sha256', hmacKey);
-        hmac.update(iv);
-        hmac.update(ciphertext);
-        hmac.update(aadBuffer);
-        tag = hmac.digest();
-        secureZero(hmacKey);
-      }
-      
-      // Step 3: Securely zero the DEK from memory
-      secureZero(dek);
-      
-      telemetry.increment(METRICS.ENCRYPT_TOTAL, 1, { ...attributes, mode: 'envelope' });
-      
-      const result = {
-        v: '2.0',
-        alg: algorithmDisplayName, // Use selected algorithm
-        kid,
-        iv: iv.toString('base64url'),
-        tag: tag.toString('base64url'),
-        ct: ciphertext.toString('base64url'),
-        aad: aadBuffer.toString('base64url'),
-        encryptedDEK: encryptedDEK, // DEK encrypted by Vault KEK (provided by backend)
-        kmsContext: kmsContext
-      };
-      
-      // Send telemetry (non-blocking)
-      const duration = Math.round(performance.now() - startTime);
-      telemetryClient.sendEvent({
-        operation: 'encrypt',
-        algorithm: result.alg || algorithmDisplayName, // Use algorithm from envelope
-        duration,
-        success: true,
-        inputSize: plaintextBuffer.length,
-        outputSize: ciphertext.length
-      });
-      
-      return result;
-      
-    } catch (error: unknown) {
-      telemetry.increment(METRICS.FAIL_TOTAL, 1, { ...attributes, reason: 'encryption_error' });
-      
-      // Send telemetry for failed operation (non-blocking)
-      const duration = Math.round(performance.now() - startTime);
-      const plaintextBuffer = typeof plaintext === 'string' ? Buffer.from(plaintext, 'utf8') : plaintext;
-      telemetryClient.sendEvent({
-        operation: 'encrypt',
-        algorithm: algorithmDisplayName, // Use selected algorithm
-        duration,
-        success: false,
-        inputSize: plaintextBuffer.length,
-        outputSize: 0
-      });
-      
-      if (error instanceof AveroxCryptoError) throw error;
-      const errorMessage = error instanceof Error ? error.message : 'Unknown encryption error';
-      throw new AveroxCryptoError('ENCRYPTION_FAILED', `Encryption failed: ${errorMessage}`);
+  /** Request one DEK from the backend for encrypting an entire logical record (e.g. one patient row). */
+  async provisionDataKey(): Promise<ProvisionedDataKey> {
+    if (!this.backendClient) {
+      throw new AveroxCryptoError('ENVELOPE_REQUIRED', 'Backend client is not configured.');
     }
+    const { plaintext, ciphertext } = await this.backendClient.getDataKey();
+    let dek = Buffer.from(plaintext, 'base64');
+    dek = Buffer.from(alignDekKeyLength(dek, this.keySize, this.algorithm));
+    return { dek, encryptedDEK: ciphertext };
   }
-  
-  // Decrypt with MANDATORY AAD (with optional Vault KMS envelope decryption)
-  async decrypt(envelope: EnvelopeWithKMS, aad: Buffer | string): Promise<Buffer> {
-    const startTime = performance.now();
-    
-    if (this.isZeroized) {
-      throw new AveroxCryptoError('ZEROIZED', 'Cannot decrypt: instance has been zeroized');
-    }
 
+  /** Unwrap a stored encrypted DEK via the backend (one call per record on decrypt). */
+  async unwrapDataKey(encryptedDEK: string): Promise<Buffer> {
+    if (!this.backendClient) {
+      throw new AveroxCryptoError('ENVELOPE_REQUIRED', 'Backend client is not configured.');
+    }
+    const dekPlaintext = await this.backendClient.decryptDEK(encryptedDEK);
+    let dek = Buffer.from(dekPlaintext, 'base64');
+    dek = Buffer.from(alignDekKeyLength(dek, this.keySize, this.algorithm));
+    return dek;
+  }
+
+  /** Securely zero a provisioned DEK after a batch encrypt/decrypt completes. */
+  releaseDataKey(dek: Buffer): void {
+    secureZero(dek);
+  }
+
+  /**
+   * Encrypt with a previously provisioned DEK (unique IV per call; same encryptedDEK on each envelope).
+   * Used for field-level ciphertext that shares one DEK per database row.
+   */
+  async encryptWithDataKey(
+    plaintext: Buffer | string,
+    aad: Buffer | string,
+    dataKey: ProvisionedDataKey,
+    kid?: string,
+    kmsContext?: Record<string, string>,
+  ): Promise<EnvelopeWithKMS> {
+    const startTime = performance.now();
+    const algorithmDisplayName = this.algorithm.toUpperCase().replace(/_/g, '-');
     const attributes = {
-      alg: envelope.alg,
-      kid: envelope.kid || 'unknown',
+      alg: algorithmDisplayName,
+      kid: kid || 'unknown',
       env: process.env.NODE_ENV || 'development',
-      useKMS: envelope.encryptedDEK ? 'true' : 'false'
+      useKMS: 'true',
     };
 
     try {
@@ -676,172 +667,269 @@ export class AveroxCrypto {
         telemetry.increment(METRICS.FAIL_TOTAL, 1, { ...attributes, reason: 'missing_aad' });
         throw new BadInputError('AAD (Additional Authenticated Data) is required and cannot be empty');
       }
-      
-      // Validate that the algorithm in the envelope matches the selected algorithm
+
+      const plaintextBuffer = typeof plaintext === 'string' ? Buffer.from(plaintext, 'utf8') : plaintext;
+      const aadBuffer = typeof aad === 'string' ? Buffer.from(aad, 'utf8') : aad;
+      const iv = crypto.randomBytes(this.ivSize);
+      let ciphertext: Buffer;
+      let tag: Buffer;
+
+      if (this.isAead) {
+        const cipher = crypto.createCipheriv(this.algorithm, dataKey.dek, iv) as crypto.CipherGCM;
+        cipher.setAAD(aadBuffer, { plaintextLength: plaintextBuffer.length });
+        ciphertext = cipher.update(plaintextBuffer);
+        ciphertext = Buffer.concat([ciphertext, cipher.final()]);
+        tag = cipher.getAuthTag();
+      } else {
+        const cipher = crypto.createCipheriv(this.algorithm, dataKey.dek, iv) as crypto.CipherGCM;
+        ciphertext = cipher.update(plaintextBuffer);
+        ciphertext = Buffer.concat([ciphertext, cipher.final()]);
+        const hmacKey = hkdf(dataKey.dek, Buffer.alloc(32, 0), Buffer.from('averox-hmac', 'utf8'), 32);
+        const hmac = crypto.createHmac('sha256', hmacKey);
+        hmac.update(iv);
+        hmac.update(ciphertext);
+        hmac.update(aadBuffer);
+        tag = hmac.digest();
+        secureZero(hmacKey);
+      }
+
+      telemetry.increment(METRICS.ENCRYPT_TOTAL, 1, { ...attributes, mode: 'envelope' });
+      const result: EnvelopeWithKMS = {
+        v: '2.0',
+        alg: algorithmDisplayName,
+        kid,
+        iv: iv.toString('base64url'),
+        tag: tag.toString('base64url'),
+        ct: ciphertext.toString('base64url'),
+        aad: aadBuffer.toString('base64url'),
+        encryptedDEK: dataKey.encryptedDEK,
+        kmsContext,
+      };
+
+      telemetryClient.sendEvent({
+        operation: 'encrypt',
+        algorithm: result.alg || algorithmDisplayName,
+        duration: Math.round(performance.now() - startTime),
+        success: true,
+        inputSize: plaintextBuffer.length,
+        outputSize: ciphertext.length,
+      });
+
+      return result;
+    } catch (error: unknown) {
+      telemetry.increment(METRICS.FAIL_TOTAL, 1, { ...attributes, reason: 'encryption_error' });
+      const plaintextBuffer = typeof plaintext === 'string' ? Buffer.from(plaintext, 'utf8') : plaintext;
+      telemetryClient.sendEvent({
+        operation: 'encrypt',
+        algorithm: algorithmDisplayName,
+        duration: Math.round(performance.now() - startTime),
+        success: false,
+        inputSize: plaintextBuffer.length,
+        outputSize: 0,
+      });
+      if (error instanceof AveroxCryptoError) throw error;
+      const errorMessage = error instanceof Error ? error.message : 'Unknown encryption error';
+      throw new AveroxCryptoError('ENCRYPTION_FAILED', `Encryption failed: ${errorMessage}`);
+    }
+  }
+
+  /** Decrypt with an already-unwrapped DEK (batch decrypt for one record). */
+  async decryptWithDataKey(
+    envelope: EnvelopeWithKMS,
+    aad: Buffer | string,
+    dek: Buffer,
+  ): Promise<Buffer> {
+    const startTime = performance.now();
+    const attributes = {
+      alg: envelope.alg,
+      kid: envelope.kid || 'unknown',
+      env: process.env.NODE_ENV || 'development',
+      useKMS: envelope.encryptedDEK ? 'true' : 'false',
+    };
+
+    try {
+      if (!aad || (typeof aad === 'string' && aad.length === 0) || (Buffer.isBuffer(aad) && aad.length === 0)) {
+        telemetry.increment(METRICS.FAIL_TOTAL, 1, { ...attributes, reason: 'missing_aad' });
+        throw new BadInputError('AAD (Additional Authenticated Data) is required and cannot be empty');
+      }
+
       const envelopeAlg = (envelope.alg || '').toString().toUpperCase().trim();
       const selectedAlgUpper = this.algorithm.toUpperCase().replace(/-/g, '-');
-      
-      // Normalize both for comparison
       const normalizeAlg = (alg: string) => alg.replace(/[-s_]/g, '').toUpperCase();
       const envelopeNormalized = normalizeAlg(envelopeAlg);
       const selectedNormalized = normalizeAlg(selectedAlgUpper);
-      
-      // Check if envelope algorithm matches selected algorithm (with fuzzy matching)
-      const isMatch = envelopeNormalized === selectedNormalized ||
-                     (envelopeNormalized.includes('AES') && selectedNormalized.includes('AES') && 
-                      envelopeNormalized.includes('GCM') && selectedNormalized.includes('GCM')) ||
-                     (envelopeNormalized.includes('CHACHA') && selectedNormalized.includes('CHACHA'));
-      
+      const isMatch =
+        envelopeNormalized === selectedNormalized ||
+        (envelopeNormalized.includes('AES') &&
+          selectedNormalized.includes('AES') &&
+          envelopeNormalized.includes('GCM') &&
+          selectedNormalized.includes('GCM')) ||
+        (envelopeNormalized.includes('CHACHA') && selectedNormalized.includes('CHACHA'));
+
       if (!isMatch) {
-        // Get supported algorithms for error message (with safety checks)
-        let algList = this.algorithm.toUpperCase(); // Use selected algorithm
-        try {
-          const supportedAlgorithms = this.getSupportedAlgorithms();
-          if (Array.isArray(supportedAlgorithms) && supportedAlgorithms.length > 0) {
-            algList = supportedAlgorithms.join(', ');
-          } else if (supportedAlgorithms) {
-            algList = String(supportedAlgorithms);
-          }
-        } catch (err) {
-          // If getting supported algorithms fails, use selected algorithm
-          algList = this.algorithm.toUpperCase();
-        }
-        
         telemetry.increment(METRICS.FAIL_TOTAL, 1, { ...attributes, reason: 'unsupported_algorithm' });
         throw new BadInputError(
-          `Unsupported algorithm: ${envelope.alg || 'undefined'}. Supported algorithms: ${algList}`
+          `Unsupported algorithm: ${envelope.alg || 'undefined'}. Supported algorithms: ${this.getSupportedAlgorithms().join(', ')}`,
         );
       }
-      
+
       const aadBuffer = typeof aad === 'string' ? Buffer.from(aad, 'utf8') : aad;
-      
-      // Decode envelope components
       const iv = Buffer.from(envelope.iv, 'base64url');
       const tag = Buffer.from(envelope.tag, 'base64url');
       const ciphertext = Buffer.from(envelope.ct, 'base64url');
-      
-      // Validate sizes
+
       if (iv.length !== this.ivSize) {
         throw new AveroxCryptoError('INVALID_IV', `IV must be exactly ${this.ivSize} bytes`);
       }
-      
       if (tag.length !== this.tagSize) {
         throw new AveroxCryptoError('INVALID_TAG', `Tag must be exactly ${this.tagSize} bytes`);
       }
-      
-      // ENVELOPE DECRYPTION MODE: Ask backend to unwrap DEK, then decrypt data with DEK
-      if (!envelope.encryptedDEK || !this.backendClient) {
-        throw new AveroxCryptoError('ENVELOPE_REQUIRED', 'Envelope decryption is required. Encrypted DEK not found or backend client not configured.');
-      }
-      
-      // Step 1: Request plaintext DEK from backend using stored encryptedDEK
-      const dekPlaintext = await this.backendClient.decryptDEK(
-        envelope.encryptedDEK
-      );
-      
-      let dek = Buffer.from(dekPlaintext, 'base64');
-      dek = Buffer.from(alignDekKeyLength(dek, this.keySize, this.algorithm));
-      
-      // Step 2: Decrypt data with DEK
+
       let plaintext: Buffer;
-      
-      // Handle AEAD vs non-AEAD modes
       if (this.isAead) {
-        // AEAD modes (GCM, ChaCha20-Poly1305) have built-in authentication
         const decipher = crypto.createDecipheriv(this.algorithm, dek, iv) as crypto.DecipherGCM;
         decipher.setAuthTag(tag);
-        decipher.setAAD(aadBuffer, { 
-          plaintextLength: ciphertext.length 
-        });
-        
+        decipher.setAAD(aadBuffer, { plaintextLength: ciphertext.length });
         plaintext = decipher.update(ciphertext);
         plaintext = Buffer.concat([plaintext, decipher.final()]);
       } else {
-        // Non-AEAD modes (CBC, CFB, CTR) require HMAC verification
-        // Verify HMAC tag first
-        const hmacKey = hkdf(
-          dek,
-          Buffer.alloc(32, 0),
-          Buffer.from('averox-hmac', 'utf8'),
-          32
-        );
+        const hmacKey = hkdf(dek, Buffer.alloc(32, 0), Buffer.from('averox-hmac', 'utf8'), 32);
         const hmac = crypto.createHmac('sha256', hmacKey);
         hmac.update(iv);
         hmac.update(ciphertext);
         hmac.update(aadBuffer);
         const computedTag = hmac.digest();
-        
-        // Constant-time tag comparison
         if (!crypto.timingSafeEqual(tag, computedTag)) {
-          secureZero(dek);
           secureZero(hmacKey);
           throw new InvalidTagError('Authentication tag verification failed');
         }
-        
-        // HMAC verified, now decrypt
         const decipher = crypto.createDecipheriv(this.algorithm, dek, iv) as crypto.DecipherGCM;
         plaintext = decipher.update(ciphertext);
         plaintext = Buffer.concat([plaintext, decipher.final()]);
         secureZero(hmacKey);
       }
-      
-      // Step 3: Securely zero the DEK from memory
-      secureZero(dek);
-      
+
       telemetry.increment(METRICS.DECRYPT_TOTAL, 1, { ...attributes, mode: 'envelope' });
-      
-      // Send telemetry (non-blocking)
-      const duration = Math.round(performance.now() - startTime);
-      // Use algorithm from envelope if available, otherwise use selected algorithm
-      // Convert Node.js format (aes-256-gcm) to display format (AES-256-GCM)
       const algorithmForTelemetry = envelope.alg || this.algorithm.toUpperCase().replace(/_/g, '-');
       telemetryClient.sendEvent({
         operation: 'decrypt',
-        algorithm: algorithmForTelemetry, // Use algorithm from envelope or selected
-        duration,
+        algorithm: algorithmForTelemetry,
+        duration: Math.round(performance.now() - startTime),
         success: true,
         inputSize: ciphertext.length,
-        outputSize: plaintext.length
+        outputSize: plaintext.length,
       });
-      
+
       return plaintext;
-      
     } catch (error: unknown) {
       telemetry.increment(METRICS.FAIL_TOTAL, 1, { ...attributes, reason: 'decryption_error' });
-      
-      // Send telemetry for failed operation (non-blocking)
-      const duration = Math.round(performance.now() - startTime);
       const ciphertext = Buffer.from(envelope.ct, 'base64url');
-      // Use algorithm from envelope if available, otherwise use selected algorithm
-      // Convert Node.js format (aes-256-gcm) to display format (AES-256-GCM)
       const algorithmForTelemetry = envelope.alg || this.algorithm.toUpperCase().replace(/_/g, '-');
       telemetryClient.sendEvent({
         operation: 'decrypt',
-        algorithm: algorithmForTelemetry, // Use algorithm from envelope or selected
-        duration,
+        algorithm: algorithmForTelemetry,
+        duration: Math.round(performance.now() - startTime),
         success: false,
         inputSize: ciphertext.length,
-        outputSize: 0
+        outputSize: 0,
       });
-      
-      // Detect authentication tag failures from Node.js crypto
-      // Handle both direct Error objects and ts-jest wrapped errors
+
       const errorMessage = error instanceof Error ? error.message : String(error);
-      if (errorMessage && (
-        errorMessage.includes('Unsupported state or unable to authenticate data') ||
-        errorMessage.includes('unable to authenticate') || 
-        errorMessage.includes('authentication') ||
-        errorMessage.includes('auth tag')
-      )) {
+      if (
+        errorMessage &&
+        (errorMessage.includes('Unsupported state or unable to authenticate data') ||
+          errorMessage.includes('unable to authenticate') ||
+          errorMessage.includes('authentication') ||
+          errorMessage.includes('auth tag'))
+      ) {
         throw new InvalidTagError('Authentication failed - data may have been tampered with');
       }
-      
       if (error instanceof AveroxCryptoError) throw error;
-      const finalErrorMessage = error instanceof Error ? error.message : 'Unknown decryption error';
-      throw new AveroxCryptoError('DECRYPTION_FAILED', `Decryption failed: ${finalErrorMessage}`);
+      throw new AveroxCryptoError('DECRYPTION_FAILED', `Decryption failed: ${errorMessage}`);
     }
   }
   
+  /**
+   * Encrypt a single field/column — provisions its own DEK (one backend call).
+   * Use beginRowEncryption() when multiple fields share one database row.
+   */
+  async encryptField(
+    plaintext: Buffer | string,
+    aad: Buffer | string,
+    kid?: string,
+    kmsContext?: Record<string, string>,
+  ): Promise<EnvelopeWithKMS> {
+    return this.encrypt(plaintext, aad, kid, kmsContext);
+  }
+
+  /**
+   * Decrypt a single field/column — unwraps the envelope's DEK (one backend call).
+   * Use beginRowDecryption() when multiple fields share one database row.
+   */
+  async decryptField(envelope: EnvelopeWithKMS, aad: Buffer | string): Promise<Buffer> {
+    return this.decrypt(envelope, aad);
+  }
+
+  /** Start a row encryption batch — one DEK for all encryptField() calls on the session. */
+  async beginRowEncryption(): Promise<RowEncryptionSession> {
+    if (this.isZeroized) {
+      throw new AveroxCryptoError('ZEROIZED', 'Cannot encrypt: instance has been zeroized');
+    }
+    const dataKey = await this.provisionDataKey();
+    return new RowEncryptionSession(this, dataKey);
+  }
+
+  /** Start a row decryption batch — one unwrap for all decryptField() calls on the session. */
+  async beginRowDecryption(encryptedDEK: string): Promise<RowDecryptionSession> {
+    if (this.isZeroized) {
+      throw new AveroxCryptoError('ZEROIZED', 'Cannot decrypt: instance has been zeroized');
+    }
+    const dek = await this.unwrapDataKey(encryptedDEK);
+    return new RowDecryptionSession(this, encryptedDEK, dek);
+  }
+
+  /** Start row decryption using any envelope from the row as the DEK reference. */
+  async beginRowDecryptionFromEnvelope(envelope: EnvelopeWithKMS): Promise<RowDecryptionSession> {
+    if (!envelope.encryptedDEK) {
+      throw new AveroxCryptoError('ENVELOPE_REQUIRED', 'Envelope is missing encryptedDEK');
+    }
+    return this.beginRowDecryption(envelope.encryptedDEK);
+  }
+
+  // Encrypt with MANDATORY AAD (provisions a new DEK — use beginRowEncryption for row-level reuse)
+  async encrypt(plaintext: Buffer | string, aad: Buffer | string, kid?: string, kmsContext?: Record<string, string>): Promise<EnvelopeWithKMS> {
+    if (this.isZeroized) {
+      throw new AveroxCryptoError('ZEROIZED', 'Cannot encrypt: instance has been zeroized');
+    }
+    if (!this.useEnvelopeEncryption || !this.backendClient) {
+      throw new AveroxCryptoError('ENVELOPE_REQUIRED', 'Envelope encryption is required. Please provide backend configuration.');
+    }
+
+    const dataKey = await this.provisionDataKey();
+    try {
+      return await this.encryptWithDataKey(plaintext, aad, dataKey, kid, kmsContext);
+    } finally {
+      this.releaseDataKey(dataKey.dek);
+    }
+  }
+
+  // Decrypt with MANDATORY AAD (unwraps DEK per call — use beginRowDecryption for row-level reuse)
+  async decrypt(envelope: EnvelopeWithKMS, aad: Buffer | string): Promise<Buffer> {
+    if (this.isZeroized) {
+      throw new AveroxCryptoError('ZEROIZED', 'Cannot decrypt: instance has been zeroized');
+    }
+    if (!envelope.encryptedDEK || !this.backendClient) {
+      throw new AveroxCryptoError('ENVELOPE_REQUIRED', 'Envelope decryption is required. Encrypted DEK not found or backend client not configured.');
+    }
+
+    const dek = await this.unwrapDataKey(envelope.encryptedDEK);
+    try {
+      return await this.decryptWithDataKey(envelope, aad, dek);
+    } finally {
+      this.releaseDataKey(dek);
+    }
+  }
+
   // Derive key using HKDF-SHA256
   deriveKey(salt: Buffer, info: Buffer): Buffer {
     try {
