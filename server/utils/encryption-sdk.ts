@@ -5,11 +5,14 @@ import {
   BadInputError,
   InvalidTagError,
   AveroxCryptoError,
+  RowEncryptionSession,
+  RowDecryptionSession,
   type EnvelopeWithKMS,
 } from "@averox/curaemrencryption-crypto-sdk";
 
 export { BadInputError, InvalidTagError, AveroxCryptoError };
 export { AveroxCryptoError as PatientCryptoError };
+export { RowEncryptionSession, RowDecryptionSession };
 
 /** Domain-separated AAD for whole-patient payload authentication */
 const PATIENT_RECORD_AAD = "cura-emr:patient-record:v1";
@@ -195,6 +198,16 @@ function isEmptyObject(value: unknown): boolean {
   );
 }
 
+async function beginPatientRowEncryption(): Promise<RowEncryptionSession> {
+  if (!isPatientEncryptionConfigured()) {
+    throw new AveroxCryptoError(
+      "SDK_NOT_CONFIGURED",
+      "Encryption SDK is not configured. Vault metadata is missing from the SDK package.",
+    );
+  }
+  return getAveroxCrypto().beginRowEncryption();
+}
+
 async function encryptEnvelope(plaintext: string, aad: string): Promise<EnvelopeWithKMS> {
   if (!isPatientEncryptionConfigured()) {
     throw new AveroxCryptoError(
@@ -202,11 +215,11 @@ async function encryptEnvelope(plaintext: string, aad: string): Promise<Envelope
       "Encryption SDK is not configured. Vault metadata is missing from the SDK package.",
     );
   }
-  return getAveroxCrypto().encrypt(plaintext, aad);
+  return getAveroxCrypto().encryptField(plaintext, aad);
 }
 
 async function decryptEnvelope(envelope: EnvelopeWithKMS, aad: string): Promise<Buffer> {
-  return getAveroxCrypto().decrypt(envelope, aad);
+  return getAveroxCrypto().decryptField(envelope, aad);
 }
 
 /** Encrypts a scalar patient column value (stored as envelope JSON string). */
@@ -217,6 +230,36 @@ export async function encryptPatientField(fieldName: string, plaintext: string):
   }
   const envelope = await encryptEnvelope(normalized, fieldAad(fieldName));
   return JSON.stringify(envelope);
+}
+
+async function encryptPatientFieldWithRowSession(
+  session: RowEncryptionSession,
+  fieldName: string,
+  plaintext: string,
+): Promise<string> {
+  const normalized = plaintext.trim();
+  if (!normalized) {
+    throw new BadInputError(`Field "${fieldName}" must be non-empty to encrypt`);
+  }
+  const envelope = await session.encryptField(normalized, fieldAad(fieldName));
+  return JSON.stringify(envelope);
+}
+
+async function decryptPatientFieldWithRowSession(
+  session: RowDecryptionSession,
+  fieldName: string,
+  encryptedValue: unknown,
+): Promise<string> {
+  const json =
+    typeof encryptedValue === "string" && isEncryptedScalarField(encryptedValue.trim())
+      ? encryptedValue.trim()
+      : patientEnvelopeJsonFromUnknown(encryptedValue);
+  if (!json) {
+    throw new BadInputError(`Field "${fieldName}" is not in encrypted envelope format`);
+  }
+  const envelope = parseEnvelope(json);
+  const plaintext = await session.decryptField(envelope, fieldAad(fieldName));
+  return plaintext.toString("utf8");
 }
 
 /** Decrypts a scalar patient column envelope. */
@@ -243,6 +286,42 @@ export async function encryptPatientEmail(email: string): Promise<string> {
 
 export async function decryptPatientEmail(encryptedEmail: string): Promise<string> {
   return decryptPatientField("email", encryptedEmail);
+}
+
+async function encryptPatientTextColumnWithRowSession(
+  session: RowEncryptionSession,
+  fieldName: PatientTextField,
+  value: unknown,
+  required = false,
+): Promise<string | null> {
+  if (value == null || String(value).trim() === "") {
+    if (required) {
+      throw new BadInputError(`Field "${fieldName}" is required`);
+    }
+    return null;
+  }
+  return encryptPatientFieldWithRowSession(session, fieldName, String(value));
+}
+
+async function encryptPatientJsonbColumnWithRowSession(
+  session: RowEncryptionSession,
+  fieldName: PatientJsonbField,
+  value: unknown,
+): Promise<Record<string, string>> {
+  if (value == null || isEmptyObject(value)) {
+    return {};
+  }
+  const serialized = JSON.stringify(value);
+  if (serialized === "{}" || serialized === "null") {
+    return {};
+  }
+  return {
+    [ENCRYPTED_JSONB_FIELD_KEY]: await encryptPatientFieldWithRowSession(
+      session,
+      fieldName,
+      serialized,
+    ),
+  };
 }
 
 async function encryptPatientTextColumn(
@@ -286,6 +365,46 @@ function getRawColumnValue(rawPatient: Record<string, unknown>, fieldName: strin
   return undefined;
 }
 
+async function decryptPatientTextColumnWithRowSession(
+  session: RowDecryptionSession,
+  fieldName: PatientTextField,
+  rawPatient: Record<string, unknown>,
+): Promise<unknown> {
+  const stored = getRawColumnValue(rawPatient, fieldName);
+  const envJson = patientEnvelopeJsonFromUnknown(stored);
+  if (!envJson) {
+    throw new BadInputError(`Field "${fieldName}" is not encrypted`);
+  }
+  return decryptPatientFieldWithRowSession(session, fieldName, envJson);
+}
+
+async function decryptPatientJsonbColumnWithRowSession(
+  session: RowDecryptionSession,
+  fieldName: PatientJsonbField,
+  rawPatient: Record<string, unknown>,
+): Promise<unknown> {
+  const stored = getRawColumnValue(rawPatient, fieldName);
+  if (stored == null || isEmptyObject(stored)) {
+    return {};
+  }
+  if (typeof stored !== "object" || Array.isArray(stored)) {
+    throw new BadInputError(`Field "${fieldName}" has invalid encrypted jsonb shape`);
+  }
+  const encrypted = (stored as Record<string, unknown>)[ENCRYPTED_JSONB_FIELD_KEY];
+  const encJson = patientEnvelopeJsonFromUnknown(encrypted);
+  if (!encJson) {
+    throw new BadInputError(`Field "${fieldName}" is not encrypted`);
+  }
+  try {
+    return JSON.parse(await decryptPatientFieldWithRowSession(session, fieldName, encJson));
+  } catch (error) {
+    if (error instanceof BadInputError) {
+      throw error;
+    }
+    throw new BadInputError(`Decrypted "${fieldName}" is not valid JSON`);
+  }
+}
+
 async function decryptPatientTextColumn(
   fieldName: PatientTextField,
   rawPatient: Record<string, unknown>,
@@ -325,21 +444,32 @@ async function decryptPatientJsonbColumn(
 }
 
 /** Encrypts a complete patient object as a single authenticated SDK envelope payload. */
-export async function encryptPatientData(patient: object): Promise<string> {
+export async function encryptPatientData(
+  patient: object,
+  rowSession?: RowEncryptionSession,
+): Promise<string> {
   if (patient === null || typeof patient !== "object") {
     throw new BadInputError("Patient data must be a non-null object");
   }
-  const envelope = await encryptEnvelope(JSON.stringify(patient), PATIENT_RECORD_AAD);
+  const serialized = JSON.stringify(patient);
+  const envelope = rowSession
+    ? await rowSession.encryptField(serialized, PATIENT_RECORD_AAD)
+    : await encryptEnvelope(serialized, PATIENT_RECORD_AAD);
   return JSON.stringify(envelope);
 }
 
 /** Decrypts a patient payload produced by encryptPatientData. */
-export async function decryptPatientData(encryptedData: string): Promise<object> {
+export async function decryptPatientData(
+  encryptedData: string,
+  rowSession?: RowDecryptionSession,
+): Promise<object> {
   if (!encryptedData || typeof encryptedData !== "string") {
     throw new BadInputError("Encrypted patient data must be a non-empty string");
   }
   const envelope = parseEnvelope(encryptedData);
-  const plaintext = await decryptEnvelope(envelope, PATIENT_RECORD_AAD);
+  const plaintext = rowSession
+    ? await rowSession.decryptField(envelope, PATIENT_RECORD_AAD)
+    : await decryptEnvelope(envelope, PATIENT_RECORD_AAD);
   try {
     return JSON.parse(plaintext.toString("utf8")) as object;
   } catch {
@@ -394,7 +524,7 @@ export async function normalizePatientFromDatabaseRow(
 }
 
 /**
- * Builds a DB row: each PHI column holds its own SDK envelope; full record also in medicalHistory.
+ * Builds a DB row: one DEK per patient; each PHI column gets a unique IV but the same encryptedDEK.
  */
 export async function preparePatientForStorage(
   patient: Record<string, unknown>,
@@ -408,62 +538,71 @@ export async function preparePatientForStorage(
     throw new BadInputError("Patient email is required for encrypted storage");
   }
 
-  const encryptedPayload = await encryptPatientData({ ...patient, email });
+  const rowSession = await beginPatientRowEncryption();
+  try {
+    const encryptedPayload = await encryptPatientData({ ...patient, email }, rowSession);
 
-  const [
-    firstName,
-    lastName,
-    relation,
-    dateOfBirth,
-    genderAtBirth,
-    encryptedEmail,
-    phone,
-    nhsNumber,
-    address,
-    insuranceInfo,
-    emergencyContact,
-    communicationPreferences,
-  ] = await Promise.all([
-    encryptPatientTextColumn("firstName", patient.firstName, true),
-    encryptPatientTextColumn("lastName", patient.lastName, true),
-    encryptPatientTextColumn("relation", patient.relation),
-    encryptPatientTextColumn("dateOfBirth", patient.dateOfBirth),
-    encryptPatientTextColumn("genderAtBirth", patient.genderAtBirth),
-    encryptPatientField("email", email),
-    encryptPatientTextColumn("phone", patient.phone),
-    encryptPatientTextColumn("nhsNumber", patient.nhsNumber),
-    encryptPatientJsonbColumn("address", patient.address),
-    encryptPatientJsonbColumn("insuranceInfo", patient.insuranceInfo),
-    encryptPatientJsonbColumn("emergencyContact", patient.emergencyContact),
-    encryptPatientJsonbColumn("communicationPreferences", patient.communicationPreferences),
-  ]);
+    const [
+      firstName,
+      lastName,
+      relation,
+      dateOfBirth,
+      genderAtBirth,
+      encryptedEmail,
+      phone,
+      nhsNumber,
+      address,
+      insuranceInfo,
+      emergencyContact,
+      communicationPreferences,
+    ] = await Promise.all([
+      encryptPatientTextColumnWithRowSession(rowSession, "firstName", patient.firstName, true),
+      encryptPatientTextColumnWithRowSession(rowSession, "lastName", patient.lastName, true),
+      encryptPatientTextColumnWithRowSession(rowSession, "relation", patient.relation),
+      encryptPatientTextColumnWithRowSession(rowSession, "dateOfBirth", patient.dateOfBirth),
+      encryptPatientTextColumnWithRowSession(rowSession, "genderAtBirth", patient.genderAtBirth),
+      encryptPatientFieldWithRowSession(rowSession, "email", email),
+      encryptPatientTextColumnWithRowSession(rowSession, "phone", patient.phone),
+      encryptPatientTextColumnWithRowSession(rowSession, "nhsNumber", patient.nhsNumber),
+      encryptPatientJsonbColumnWithRowSession(rowSession, "address", patient.address),
+      encryptPatientJsonbColumnWithRowSession(rowSession, "insuranceInfo", patient.insuranceInfo),
+      encryptPatientJsonbColumnWithRowSession(rowSession, "emergencyContact", patient.emergencyContact),
+      encryptPatientJsonbColumnWithRowSession(
+        rowSession,
+        "communicationPreferences",
+        patient.communicationPreferences,
+      ),
+    ]);
 
-  return {
-    organizationId: patient.organizationId,
-    userId: patient.userId ?? null,
-    patientId: patient.patientId,
-    firstName,
-    lastName,
-    relation,
-    dateOfBirth,
-    genderAtBirth,
-    email: encryptedEmail,
-    phone,
-    nhsNumber,
-    address,
-    insuranceInfo,
-    emergencyContact,
-    medicalHistory: { [ENCRYPTED_PATIENT_PAYLOAD_KEY]: encryptedPayload },
-    riskLevel: patient.riskLevel ?? "low",
-    flags: Array.isArray(patient.flags) ? (patient.flags as unknown[]) : [],
-    communicationPreferences,
-    isActive: patient.isActive !== false,
-    isInsured: patient.isInsured === true,
-    createdBy: patient.createdBy ?? null,
-  };
+    return {
+      organizationId: patient.organizationId,
+      userId: patient.userId ?? null,
+      patientId: patient.patientId,
+      firstName,
+      lastName,
+      relation,
+      dateOfBirth,
+      genderAtBirth,
+      email: encryptedEmail,
+      phone,
+      nhsNumber,
+      address,
+      insuranceInfo,
+      emergencyContact,
+      medicalHistory: { [ENCRYPTED_PATIENT_PAYLOAD_KEY]: encryptedPayload },
+      riskLevel: patient.riskLevel ?? "low",
+      flags: Array.isArray(patient.flags) ? (patient.flags as unknown[]) : [],
+      communicationPreferences,
+      isActive: patient.isActive !== false,
+      isInsured: patient.isInsured === true,
+      createdBy: patient.createdBy ?? null,
+    };
+  } finally {
+    rowSession.close();
+  }
 }
 
-/** Decrypts an encrypted storage row via the SDK. */
+/** Decrypts an encrypted storage row via the SDK (one DEK unwrap per row). */
 export async function decryptPatientFromStorageRow(
   rawPatient: Record<string, unknown>,
 ): Promise<Record<string, unknown>> {
@@ -471,34 +610,42 @@ export async function decryptPatientFromStorageRow(
     throw new BadInputError("Patient row is not encrypted");
   }
 
-  const decrypted = (await decryptPatientData(extractEncryptedPayload(rawPatient))) as Record<
-    string,
-    unknown
-  >;
+  const crypto = getAveroxCrypto();
+  const rowEnvelope = parseEnvelope(extractEncryptedPayload(rawPatient));
+  const rowSession = await crypto.beginRowDecryptionFromEnvelope(rowEnvelope);
 
-  const result: Record<string, unknown> = {
-    ...decrypted,
-    id: rawPatient.id ?? decrypted.id,
-    organizationId: rawPatient.organizationId ?? decrypted.organizationId,
-    userId: rawPatient.userId ?? decrypted.userId,
-    isActive:
-      rawPatient.isActive !== undefined ? rawPatient.isActive : decrypted.isActive,
-    isInsured:
-      rawPatient.isInsured !== undefined ? rawPatient.isInsured : decrypted.isInsured,
-    createdAt: rawPatient.createdAt ?? decrypted.createdAt,
-    updatedAt: rawPatient.updatedAt ?? decrypted.updatedAt,
-    createdBy: rawPatient.createdBy ?? decrypted.createdBy,
-  };
+  try {
+    const decrypted = (await decryptPatientData(extractEncryptedPayload(rawPatient), rowSession)) as Record<
+      string,
+      unknown
+    >;
 
-  for (const field of PATIENT_ENCRYPTED_TEXT_FIELDS) {
-    result[field] = await decryptPatientTextColumn(field, rawPatient);
+    const result: Record<string, unknown> = {
+      ...decrypted,
+      id: rawPatient.id ?? decrypted.id,
+      organizationId: rawPatient.organizationId ?? decrypted.organizationId,
+      userId: rawPatient.userId ?? decrypted.userId,
+      isActive:
+        rawPatient.isActive !== undefined ? rawPatient.isActive : decrypted.isActive,
+      isInsured:
+        rawPatient.isInsured !== undefined ? rawPatient.isInsured : decrypted.isInsured,
+      createdAt: rawPatient.createdAt ?? decrypted.createdAt,
+      updatedAt: rawPatient.updatedAt ?? decrypted.updatedAt,
+      createdBy: rawPatient.createdBy ?? decrypted.createdBy,
+    };
+
+    for (const field of PATIENT_ENCRYPTED_TEXT_FIELDS) {
+      result[field] = await decryptPatientTextColumnWithRowSession(rowSession, field, rawPatient);
+    }
+
+    for (const field of PATIENT_ENCRYPTED_JSONB_FIELDS) {
+      result[field] = await decryptPatientJsonbColumnWithRowSession(rowSession, field, rawPatient);
+    }
+
+    return result;
+  } finally {
+    rowSession.close();
   }
-
-  for (const field of PATIENT_ENCRYPTED_JSONB_FIELDS) {
-    result[field] = await decryptPatientJsonbColumn(field, rawPatient);
-  }
-
-  return result;
 }
 
 /** In-memory search for listings/dropdowns after decryption */
