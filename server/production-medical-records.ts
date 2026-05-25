@@ -44,7 +44,7 @@ export async function seedProductionMedicalRecords(options: SeedOptions = {}) {
     
     // Process each patient (up to maxPatients)
     for (const rawPatient of allPatients) {
-      const targetPatient = storage.normalizePatientFromRow(rawPatient);
+      const targetPatient = await storage.normalizePatientFromRow(rawPatient);
       if (!targetPatient) {
         console.log(`⚠️  Skipping patient id=${rawPatient.id}: could not decrypt/normalize row`);
         continue;

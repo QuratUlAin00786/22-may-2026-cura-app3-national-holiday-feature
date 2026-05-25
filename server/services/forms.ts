@@ -27,14 +27,14 @@ import { decryptPatientField, patientEnvelopeJsonFromUnknown } from "../utils/en
 import { fixFormForeignKeysForActiveSchema, repointFormSharePatientForeignKeys } from "../ensure-db-schema";
 
 /** Plaintext for email/PDF when `patient` may still carry per-column envelopes (decrypt here as a safety net). */
-function patientScalarForEmail(
+async function patientScalarForEmail(
   fieldName: "firstName" | "lastName",
   raw: unknown,
-): string {
+): Promise<string> {
   const envJson = patientEnvelopeJsonFromUnknown(raw);
   if (envJson) {
     try {
-      return decryptPatientField(fieldName, envJson).trim();
+      return (await decryptPatientField(fieldName, envJson)).trim();
     } catch {
       return "";
     }
@@ -45,8 +45,8 @@ function patientScalarForEmail(
   return "";
 }
 
-function patientFirstNameForEmail(patient: Patient): string {
-  return patientScalarForEmail("firstName", patient.firstName as unknown) || "Patient";
+async function patientFirstNameForEmail(patient: Patient): Promise<string> {
+  return (await patientScalarForEmail("firstName", patient.firstName as unknown)) || "Patient";
 }
 
 interface FormFieldInput {
@@ -684,7 +684,7 @@ export class FormService {
   ) {
     const patient = await storage.getPatient(share.patientId, share.organizationId);
     const patientName = patient
-      ? `${patientScalarForEmail("firstName", patient.firstName as unknown)} ${patientScalarForEmail("lastName", patient.lastName as unknown)}`.trim() ||
+      ? `${await patientScalarForEmail("firstName", patient.firstName as unknown)} ${await patientScalarForEmail("lastName", patient.lastName as unknown)}`.trim() ||
         `Patient ${share.patientId}`
       : `Patient ${share.patientId}`;
     const answersMap = this.buildAnswerMap(answers);
@@ -1116,7 +1116,7 @@ export class FormService {
     const filename = path.basename(pdfPath);
     const subject = `Your completed ${form.title}`;
     const html = `
-      <p>Hi ${patientFirstNameForEmail(patient)},</p>
+      <p>Hi ${await patientFirstNameForEmail(patient)},</p>
       <p>The form <strong>${form.title}</strong> you filled has been processed. You can find a PDF copy attached.</p>
       <p>Regards,<br/>The Cura EMR Team</p>
     `;
@@ -1142,10 +1142,10 @@ export class FormService {
     }
   }
 
-  private buildShareEmailContent(patient: Patient, link: string) {
+  private async buildShareEmailContent(patient: Patient, link: string) {
     const subject = "Your Cura Medical Form";
     const html = `
-      <p>Hi ${patientFirstNameForEmail(patient)},</p>
+      <p>Hi ${await patientFirstNameForEmail(patient)},</p>
       <p>Please complete the secure form using the link below. A PDF copy will be generated and stored once you submit.</p>
       <p><a href="${link}">Complete your form securely</a></p>
       <p>If you experience any issues, contact your care team.</p>
@@ -1163,7 +1163,7 @@ export class FormService {
     const emailEnv = patientEnvelopeJsonFromUnknown(patient.email as unknown);
     if (emailEnv) {
       try {
-        raw = decryptPatientField("email", emailEnv).trim();
+        raw = (await decryptPatientField("email", emailEnv)).trim();
       } catch {
         raw = "";
       }
@@ -1374,7 +1374,7 @@ export class FormService {
     }
 
     const link = this.buildShareLink(params.subdomain, params.token);
-    const { subject, html, text } = this.buildShareEmailContent(patient, link);
+    const { subject, html, text } = await this.buildShareEmailContent(patient, link);
     const toEmail = await this.resolveRecipientEmail(patient, params.organizationId);
     if (!toEmail) {
       return {
@@ -1487,7 +1487,7 @@ export class FormService {
     const previewToken = uuidv4();
     const subdomain = await this.getOrganizationSubdomain(input.organizationId);
     const link = this.buildShareLink(subdomain, previewToken);
-    const { subject, html, text } = this.buildShareEmailContent(patient, link);
+    const { subject, html, text } = await this.buildShareEmailContent(patient, link);
     return { subject, html, text, link };
   }
 }

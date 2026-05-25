@@ -391,11 +391,13 @@ export async function seedDatabase() {
         }
       ];
 
-      const encryptedSamplePatients = samplePatients.map((row) => {
-        const insertData = preparePatientForStorage(row as Record<string, unknown>);
-        assertEncryptedPatientInsertRow(insertData);
-        return insertData;
-      });
+      const encryptedSamplePatients = await Promise.all(
+        samplePatients.map(async (row) => {
+          const insertData = await preparePatientForStorage(row as Record<string, unknown>);
+          assertEncryptedPatientInsertRow(insertData);
+          return insertData;
+        }),
+      );
       createdPatients = await db.insert(patients).values(encryptedSamplePatients as any).returning();
       console.log(`Created ${createdPatients.length} encrypted patients linked to user accounts`);
     } else {
@@ -403,7 +405,7 @@ export async function seedDatabase() {
       
       // Link existing patients to user accounts if not already linked
       for (const rawExisting of existingPatients) {
-        const existingPatient = storage.normalizePatientFromRow(rawExisting);
+        const existingPatient = await storage.normalizePatientFromRow(rawExisting);
         if (!existingPatient) continue;
         if (!rawExisting.userId && existingPatient.email) {
           // Find or create a patient user for this patient

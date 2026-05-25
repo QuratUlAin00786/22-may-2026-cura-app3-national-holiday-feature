@@ -3,11 +3,8 @@ import {
   decryptPatientFromStorageRow,
   ENCRYPTED_PATIENT_PAYLOAD_KEY,
   isEncryptedPatientStorageRow,
-  mergePerColumnDecryptedPatientFields,
   patientMatchesSearchQuery,
   preparePatientForStorage,
-  needsPatientColumnBackfill,
-  rebuildPatientStorageRowFromBlob,
   assertEncryptedPatientInsertRow,
   isEncryptedScalarField,
 } from './utils/encryption-sdk.js';
@@ -230,7 +227,7 @@ export interface IStorage {
   getPatientsByOrganization(organizationId: number, limit?: number, isActive?: boolean): Promise<Patient[]>;
   getPatientsByUserId(organizationId: number, userId: number): Promise<Patient[]>;
   /** Decrypt/normalize a raw patients table row (for direct SQL/drizzle reads outside helpers). */
-  normalizePatientFromRow(rawPatient: unknown): Patient | undefined;
+  normalizePatientFromRow(rawPatient: unknown): Promise<Patient | undefined>;
   createPatient(patient: InsertPatient): Promise<Patient>;
   updatePatient(id: number, organizationId: number, updates: Partial<InsertPatient>): Promise<Patient | undefined>;
   deletePatient(id: number, organizationId: number): Promise<boolean>;
@@ -1250,61 +1247,22 @@ export class DatabaseStorage implements IStorage {
     return result.length > 0;
   }
 
-  /** Upgrade legacy blob-only rows so email, DOB, etc. have per-column envelopes in patients table. */
-  private async backfillPatientPhiColumnsIfNeeded(rawPatient: any): Promise<any> {
-    if (!rawPatient?.id || !needsPatientColumnBackfill(rawPatient as Record<string, unknown>)) {
-      return rawPatient;
-    }
-    try {
-      const rebuilt = rebuildPatientStorageRowFromBlob(rawPatient as Record<string, unknown>);
-      const [updated] = await db
-        .update(patients)
-        .set({ ...rebuilt, updatedAt: new Date() } as any)
-        .where(
-          and(
-            eq(patients.id, rawPatient.id),
-            eq(patients.organizationId, rawPatient.organizationId),
-          ),
-        )
-        .returning();
-      console.log(
-        `[PATIENT-ENCRYPT] Backfilled per-column PHI envelopes for patient id=${rawPatient.id}`,
-      );
-      return updated ?? rawPatient;
-    } catch (err: unknown) {
-      console.warn(
-        `[PATIENT-ENCRYPT] Column backfill skipped for patient id=${rawPatient.id}:`,
-        err instanceof Error ? err.message : err,
-      );
-      return rawPatient;
-    }
-  }
-
-  // Production compatibility layer - decrypt encrypted rows, then normalize legacy plaintext
-  private normalizePatientData(rawPatient: any): Patient | undefined {
+  private async normalizePatientData(rawPatient: any): Promise<Patient | undefined> {
     if (!rawPatient) return undefined;
 
     try {
-      const decrypted = decryptPatientFromStorageRow(rawPatient as Record<string, unknown>);
-      if (decrypted) {
-        return this.normalizeLegacyPatientData(decrypted);
-      }
+      const decrypted = await decryptPatientFromStorageRow(rawPatient as Record<string, unknown>);
+      return this.formatPatientRow(decrypted);
     } catch (err: unknown) {
       console.warn(
-        `[PATIENT-ENCRYPT] Full-row decrypt failed for patient id=${(rawPatient as { id?: number }).id}:`,
+        `[PATIENT-ENCRYPT] Decrypt failed for patient id=${(rawPatient as { id?: number }).id}:`,
         err instanceof Error ? err.message : err,
       );
+      return undefined;
     }
-
-    const perColumn = mergePerColumnDecryptedPatientFields(rawPatient as Record<string, unknown>);
-    if (perColumn) {
-      return this.normalizeLegacyPatientData(perColumn);
-    }
-
-    return this.normalizeLegacyPatientData(rawPatient);
   }
 
-  private normalizeLegacyPatientData(rawPatient: any): Patient | undefined {
+  private formatPatientRow(rawPatient: any): Patient | undefined {
     if (!rawPatient) return undefined;
     
     // Helper function to safely parse JSON or return default
@@ -1392,15 +1350,15 @@ export class DatabaseStorage implements IStorage {
   }
 
   // Patients — all public reads must return decrypted PHI via decryptPatientRow / normalizePatientData.
-  normalizePatientFromRow(rawPatient: unknown): Patient | undefined {
+  async normalizePatientFromRow(rawPatient: unknown): Promise<Patient | undefined> {
+    if (!rawPatient) return undefined;
     return this.normalizePatientData(rawPatient);
   }
 
-  /** Decrypt (+ optional legacy column backfill) before returning patient data to callers. */
+  /** Decrypt before returning patient data to callers. */
   private async decryptPatientRow(raw: unknown): Promise<Patient | undefined> {
     if (!raw) return undefined;
-    const row = await this.backfillPatientPhiColumnsIfNeeded(raw);
-    return this.normalizePatientData(row);
+    return this.normalizePatientData(raw);
   }
 
   private async decryptPatientRows(rows: unknown[]): Promise<Patient[]> {
@@ -1476,21 +1434,6 @@ export class DatabaseStorage implements IStorage {
     return this.decryptPatientRows(results);
   }
 
-  async backfillAllPatientPhiColumns(): Promise<{ updated: number; skipped: number }> {
-    const rows = await db.select().from(patients);
-    let updated = 0;
-    let skipped = 0;
-    for (const row of rows) {
-      if (!needsPatientColumnBackfill(row as Record<string, unknown>)) {
-        skipped++;
-        continue;
-      }
-      await this.backfillPatientPhiColumnsIfNeeded(row);
-      updated++;
-    }
-    return { updated, skipped };
-  }
-
   async createPatient(patient: InsertPatient): Promise<Patient> {
     console.log("🔍 [STORAGE] createPatient called with userId:", (patient as any).userId);
 
@@ -1512,26 +1455,20 @@ export class DatabaseStorage implements IStorage {
       flags: Array.isArray(patient.flags) ? patient.flags : [],
     } as Record<string, unknown>;
 
-    const insertData = preparePatientForStorage(patientPayload);
+    const insertData = await preparePatientForStorage(patientPayload);
     assertEncryptedPatientInsertRow(insertData);
 
     console.log("🔍 [STORAGE] insertData.userId before insert:", (insertData as any).userId);
     const [created] = await db.insert(patients).values([insertData as any]).returning();
     console.log("🔍 [STORAGE] created patient userId:", created.userId);
 
-    let row = await this.backfillPatientPhiColumnsIfNeeded(created);
-    if (needsPatientColumnBackfill(row as Record<string, unknown>)) {
+    if (!isEncryptedScalarField(created.email)) {
       throw new Error(
-        `Patient PHI columns were not stored correctly (patient id=${row?.id}). Check ENCRYPTION_KEY and server logs.`,
-      );
-    }
-    if (!isEncryptedScalarField(row.email)) {
-      throw new Error(
-        `Patient email column is missing after insert (patient id=${row?.id}).`,
+        `Patient email column is missing after insert (patient id=${created?.id}).`,
       );
     }
 
-    const normalized = await this.decryptPatientRow(row);
+    const normalized = await this.decryptPatientRow(created);
     if (!normalized) {
       throw new Error("Failed to normalize patient after create");
     }
@@ -1546,7 +1483,7 @@ export class DatabaseStorage implements IStorage {
       return undefined;
     }
 
-    const current = this.normalizePatientData(existing);
+    const current = await this.normalizePatientData(existing);
     if (!current) {
       return undefined;
     }
@@ -1590,7 +1527,7 @@ export class DatabaseStorage implements IStorage {
       throw new Error("Refusing to re-encrypt an already encrypted patient payload");
     }
 
-    const encryptedRow = preparePatientForStorage(mergedPatient);
+    const encryptedRow = await preparePatientForStorage(mergedPatient);
     const [updated] = await db.update(patients)
       .set({ ...encryptedRow, updatedAt: new Date() } as any)
       .where(and(eq(patients.id, id), eq(patients.organizationId, organizationId)))
@@ -2824,7 +2761,7 @@ export class DatabaseStorage implements IStorage {
     const rows = await db.select().from(patients);
     for (const row of rows) {
       // Global scan — decrypt without per-row DB backfill for performance
-      const patient = this.normalizePatientData(row);
+      const patient = await this.normalizePatientData(row);
       if (!patient?.phone) continue;
 
       const storedDigits = patient.phone.replace(/[^0-9]/g, "").slice(-10);

@@ -6425,7 +6425,7 @@ This treatment plan should be reviewed and adjusted based on individual patient 
           ...patientData.medicalHistory
         };
 
-        const patientInsertData = preparePatientForStorage({
+        const patientInsertData = await preparePatientForStorage({
           ...patientData,
           organizationId: req.tenant!.id,
           userId: newUser.id,
@@ -11905,7 +11905,7 @@ ${clinicName}`;
       if (userData.role === "patient" && !isPatientEncryptionConfigured()) {
         return res.status(503).json({
           error:
-            "Patient encryption is not configured. Set ENCRYPTION_KEY in the server .env file and restart the application.",
+            "Patient encryption is not configured. Ensure the encryption SDK is installed and vault metadata is present, then restart the application.",
         });
       }
 
@@ -12049,12 +12049,12 @@ ${clinicName}`;
 
       const errorMessage = error instanceof Error ? error.message : String(error);
       if (
-        error?.code === "MISSING_ENCRYPTION_KEY" ||
-        errorMessage.includes("ENCRYPTION_KEY")
+        error?.code === "SDK_NOT_CONFIGURED" ||
+        errorMessage.includes("Encryption SDK is not configured")
       ) {
         return res.status(503).json({
           error:
-            "Patient encryption is not configured. Set ENCRYPTION_KEY in the server .env file and restart the application.",
+            "Patient encryption is not configured. Ensure the encryption SDK is installed with vault metadata, then restart the application.",
         });
       }
 
@@ -21400,12 +21400,12 @@ ${clinicName}`;
         const code = (error as { code?: string }).code;
 
         if (
-          message.includes("MISSING_ENCRYPTION_KEY") ||
-          message.includes("ENCRYPTION_KEY environment variable")
+          message.includes("SDK_NOT_CONFIGURED") ||
+          message.includes("Encryption SDK is not configured")
         ) {
           return res.status(503).json({
             error:
-              "Patient encryption is not configured on this server. Set ENCRYPTION_KEY in production environment variables (same value as used when patients were encrypted), then restart the API.",
+              "Patient encryption is not configured on this server. Ensure the encryption SDK is installed with vault metadata, then restart the API.",
             detail: process.env.NODE_ENV === "development" ? message.slice(0, 500) : undefined,
           });
         }
@@ -21417,7 +21417,7 @@ ${clinicName}`;
         ) {
           return res.status(503).json({
             error:
-              "Could not decrypt patient data for this share. Ensure production ENCRYPTION_KEY matches the key used when this patient was saved.",
+              "Could not decrypt patient data for this share. The patient record may be corrupted or was encrypted with an unsupported format.",
             detail: process.env.NODE_ENV === "development" ? message.slice(0, 500) : undefined,
           });
         }
