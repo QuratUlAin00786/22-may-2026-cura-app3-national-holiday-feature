@@ -364,7 +364,7 @@ export interface EnvelopeWithKMS extends AveroxEnvelope {
  * Supports: AES-256-GCM, AES-192-GCM, AES-128-GCM, ChaCha20-Poly1305
  * Also supports: AES-256-CBC, AES-192-CBC, AES-128-CBC, AES-256-CFB, AES-192-CFB, AES-128-CFB, AES-256-CTR
  */
-function getCryptoAlgorithm(algorithmName) {
+function getCryptoAlgorithm(algorithmName: string | undefined) {
   // Normalize algorithm names by lowercasing, converting spaces/underscores to hyphen,
   // then collapsing consecutive hyphens (keeps original hyphens intact).
   const normalized = (algorithmName || '')
@@ -432,18 +432,18 @@ function getCryptoAlgorithm(algorithmName) {
 
 // Main Crypto Class with Vault KMS Integration (supports multiple symmetric algorithms)
 export class AveroxCrypto {
-  // Selected algorithm (e.g., 'aes-256-gcm', 'chacha20-poly1305')
-  // Properties initialized in constructor
-  algorithm;
-  keySize;
-  ivSize;
-  tagSize;
-  masterKey;
-  originalKeyRef; // Reference to original for zeroization
+  algorithm!: string;
+  keySize!: number;
+  ivSize!: number;
+  tagSize!: number;
+  masterKey!: Buffer;
+  originalKeyRef!: Buffer;
   isZeroized = false;
-  backendClient;
-  useEnvelopeEncryption;
-  supportedAlgorithms; // Algorithms configured during SDK generation
+  backendClient!: BackendDataKeyClient;
+  useEnvelopeEncryption!: boolean;
+  supportedAlgorithms!: string[];
+  isAead!: boolean;
+  cipherMode?: string;
   
   /**
    * Get list of algorithms supported by this SDK instance
@@ -563,7 +563,7 @@ export class AveroxCrypto {
       // Step 1: Request DEK from backend
       const { plaintext: dekB64, ciphertext: encryptedDEK } = await this.backendClient.getDataKey();
       let dek = Buffer.from(dekB64, 'base64');
-      dek = alignDekKeyLength(dek, this.keySize, this.algorithm);
+      dek = Buffer.from(alignDekKeyLength(dek, this.keySize, this.algorithm));
       
       // Step 2: Encrypt data with backend-provisioned DEK using selected algorithm
       const iv = crypto.randomBytes(this.ivSize);
@@ -574,7 +574,7 @@ export class AveroxCrypto {
       // Handle AEAD vs non-AEAD modes
       if (this.isAead) {
         // AEAD modes (GCM, ChaCha20-Poly1305) have built-in authentication
-        const cipher = crypto.createCipheriv(this.algorithm, dek, iv);
+        const cipher = crypto.createCipheriv(this.algorithm, dek, iv) as crypto.CipherGCM;
         cipher.setAAD(aadBuffer, { 
           plaintextLength: plaintextBuffer.length 
         });
@@ -584,7 +584,7 @@ export class AveroxCrypto {
         tag = cipher.getAuthTag();
       } else {
         // Non-AEAD modes (CBC, CFB, CTR) require HMAC for authentication
-        const cipher = crypto.createCipheriv(this.algorithm, dek, iv);
+        const cipher = crypto.createCipheriv(this.algorithm, dek, iv) as crypto.CipherGCM;
         
         ciphertext = cipher.update(plaintextBuffer);
         ciphertext = Buffer.concat([ciphertext, cipher.final()]);
@@ -740,7 +740,7 @@ export class AveroxCrypto {
       );
       
       let dek = Buffer.from(dekPlaintext, 'base64');
-      dek = alignDekKeyLength(dek, this.keySize, this.algorithm);
+      dek = Buffer.from(alignDekKeyLength(dek, this.keySize, this.algorithm));
       
       // Step 2: Decrypt data with DEK
       let plaintext: Buffer;
@@ -748,7 +748,7 @@ export class AveroxCrypto {
       // Handle AEAD vs non-AEAD modes
       if (this.isAead) {
         // AEAD modes (GCM, ChaCha20-Poly1305) have built-in authentication
-        const decipher = crypto.createDecipheriv(this.algorithm, dek, iv);
+        const decipher = crypto.createDecipheriv(this.algorithm, dek, iv) as crypto.DecipherGCM;
         decipher.setAuthTag(tag);
         decipher.setAAD(aadBuffer, { 
           plaintextLength: ciphertext.length 
@@ -779,7 +779,7 @@ export class AveroxCrypto {
         }
         
         // HMAC verified, now decrypt
-        const decipher = crypto.createDecipheriv(this.algorithm, dek, iv);
+        const decipher = crypto.createDecipheriv(this.algorithm, dek, iv) as crypto.DecipherGCM;
         plaintext = decipher.update(ciphertext);
         plaintext = Buffer.concat([plaintext, decipher.final()]);
         secureZero(hmacKey);
