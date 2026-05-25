@@ -1,54 +1,20 @@
 /**
- * 🧪 PRODUCTION-READY TEST SUITE FOR CURAEMRENCRYPTION SDK
- * 
- * This test suite validates ALL production-ready capabilities:
- * ✅ Zero-Config Auto-Initialization (from SDK metadata)
- * ✅ Backend-Provisioned Data Encryption Keys (DEK)
- * ✅ Envelope Encryption with Vault KMS
- * ✅ Telemetry Integration
- * ✅ Error Handling & Security
- * ✅ Real-World Usage Scenarios
- * 
- * Backend Required: http://localhost:3000
- * 
- * Run: npx ts-node --project tsconfig.test.json test-sdk.ts
+ * General-purpose integration test suite for Averox envelope encryption SDK.
+ *
+ * Domain-agnostic: validates metadata, single-value encryption, row sessions,
+ * low-level DEK APIs, envelope structure, security, telemetry, and throughput.
+ *
+ * Run: npx ts-node --transpile-only test-sdk.ts
  */
 
-import { AveroxCrypto, getSDKMetadata } from './src/index';
-import * as https from 'https';
-import * as http from 'http';
-
-console.log('='.repeat(80));
-console.log('🧪 PRODUCTION-READY TEST SUITE - CURAEMRENCRYPTION SDK');
-console.log('='.repeat(80));
-console.log('\n📋 This test validates production capabilities:');
-console.log('   • Zero-config auto-initialization from metadata');
-console.log('   • Backend-provisioned Data Encryption Keys (DEK)');
-console.log('   • Envelope encryption with Vault KMS integration');
-console.log('   • Telemetry event tracking');
-console.log('   • Real-world encryption/decryption scenarios');
-console.log('='.repeat(80));
-
-// ============================================================================
-// TEST CONFIGURATION
-// ============================================================================
-
-const BACKEND_URL = 'http://localhost:3000';
-const metadata = getSDKMetadata();
-
-console.log('\n📊 SDK Configuration (Auto-Loaded from Metadata):');
-console.log(`  SDK ID: ${metadata.sdkId}`);
-console.log(`  SDK Name: ${metadata.sdkName}`);
-console.log(`  Version: ${metadata.sdkVersion}`);
-console.log(`  Telemetry Endpoint: ${metadata.telemetryEndpoint}`);
-console.log(`  Vault KEK Name: ${metadata.vaultKekName || 'N/A'}`);
-console.log(`  Vault API Endpoint: ${metadata.vaultApiEndpoint || 'N/A'}`);
-console.log(`  Envelope Encryption: ${metadata.envelopeEncryptionEnabled ? '✅ Enabled' : '❌ Disabled'}`);
-console.log(`  Tenant ID: ${metadata.metadata.tenant || 'N/A'}`);
-
-// Track backend API calls for verification
-const backendCalls: Array<{method: string, url: string, timestamp: Date}> = [];
-const telemetryEvents: Array<{operation: string, success: boolean}> = [];
+import {
+  AveroxCrypto,
+  getSDKMetadata,
+  getSupportedAlgorithms,
+  BadInputError,
+  InvalidTagError,
+  type EnvelopeWithKMS,
+} from './src/index';
 
 // ============================================================================
 // TEST UTILITIES
@@ -58,7 +24,7 @@ let totalTests = 0;
 let passedTests = 0;
 let failedTests = 0;
 
-function logTest(name: string, passed: boolean, details: string = '') {
+function logTest(name: string, passed: boolean, details = ''): void {
   totalTests++;
   if (passed) {
     passedTests++;
@@ -70,424 +36,515 @@ function logTest(name: string, passed: boolean, details: string = '') {
   if (details) console.log(`   ${details}`);
 }
 
-function logSection(title: string) {
+function logSection(title: string): void {
   console.log('\n' + '='.repeat(80));
   console.log(title);
   console.log('='.repeat(80));
 }
 
-async function runTests() {
-  // ============================================================================
-  // TEST 1: ZERO-CONFIG AUTO-INITIALIZATION (Production-Ready Feature)
-  // ============================================================================
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
-  logSection('🚀 Test 1: Zero-Config Auto-Initialization');
+/** Generic AAD for an isolated value (column, attribute, or message). */
+function aadForContext(context: string): string {
+  return `averox:context:${context}:v1`;
+}
 
-  console.log('\n📋 Testing: SDK auto-configures from metadata without manual setup');
-  console.log('   This is the production-ready feature - no config needed!\n');
+/** Generic AAD for a bundled record encrypted under the same row DEK. */
+const RECORD_BUNDLE_AAD = 'averox:record-bundle:v1';
 
-  try {
-    // Test 1.1: Auto-initialize without any config (uses metadata)
-    console.log('🔧 Test 1.1: Creating AveroxCrypto with NO config (auto-config from metadata)...');
-    const cryptoAuto = new AveroxCrypto();
-    logTest('Auto-initialization successful', !!cryptoAuto, 'SDK initialized from metadata');
-    
-    // Verify it's using envelope encryption from metadata
-    const hasEnvelopeConfig = (metadata as any).envelopeEncryptionEnabled && 
-                              (metadata as any).vaultApiEndpoint && 
-                              (metadata as any).vaultKekName;
-    logTest('Envelope encryption auto-configured', hasEnvelopeConfig, 
-      hasEnvelopeConfig ? 'Using backend DEK provisioning' : 'Standard mode (no backend config)');
-    
-    console.log('\n✅ Zero-config initialization: SDK automatically configured from metadata!');
-    console.log('   No manual backend configuration needed - production-ready!\n');
-    
-  } catch (error: any) {
-    logTest('Auto-initialization', false, error.message);
-    console.error('⚠️  Auto-initialization failed:', error);
-  }
+function isValidEnvelope(envelope: EnvelopeWithKMS): boolean {
+  return Boolean(
+    envelope.v === '2.0' &&
+      envelope.alg &&
+      envelope.iv &&
+      envelope.tag &&
+      envelope.ct &&
+      envelope.encryptedDEK &&
+      envelope.encryptedDEK.length > 0,
+  );
+}
 
-  // ============================================================================
-  // TEST 2: SDK METADATA VALIDATION
-  // ============================================================================
+// ============================================================================
+// MAIN
+// ============================================================================
 
-  logSection('📊 Test 2: SDK Metadata Validation');
+async function runTests(): Promise<void> {
+  const metadata = getSDKMetadata() as Record<string, unknown> & {
+    sdkName?: string;
+    sdkVersion?: string;
+    vaultKekName?: string;
+    vaultApiEndpoint?: string;
+    envelopeEncryptionEnabled?: boolean;
+    metadata: { tenant?: string };
+  };
+
+  const sdkName = String(metadata.sdkName ?? 'SDK');
+  const sdkVersion = String(metadata.sdkVersion ?? 'unknown');
+
+  console.log('='.repeat(80));
+  console.log(`🧪 FULL SDK TEST SUITE — ${sdkName}`);
+  console.log('='.repeat(80));
+  console.log('\n📊 Configuration (from embedded metadata):');
+  console.log(`  SDK ID: ${metadata.sdkId}`);
+  console.log(`  Name: ${sdkName}`);
+  console.log(`  Version: ${sdkVersion}`);
+  console.log(`  Algorithms: ${getSupportedAlgorithms().join(', ')}`);
+  console.log(`  Telemetry: ${metadata.telemetryEndpoint}`);
+  console.log(`  Vault API: ${metadata.vaultApiEndpoint ?? 'N/A'}`);
+  console.log(`  KEK: ${metadata.vaultKekName ?? 'N/A'}`);
+  console.log(`  Tenant: ${metadata.metadata?.tenant ?? 'N/A'}`);
+
+  // --------------------------------------------------------------------------
+  // Test 1: Metadata & static helpers
+  // --------------------------------------------------------------------------
+  logSection('📊 Test 1: Metadata & Static Helpers');
 
   logTest('SDK ID present', !!metadata.sdkId, `ID: ${metadata.sdkId}`);
-  logTest('SDK name is CuraEmrEncryption', metadata.sdkName === 'CuraEmrEncryption');
-  logTest('Telemetry endpoint configured', !!metadata.telemetryEndpoint, `Endpoint: ${metadata.telemetryEndpoint}`);
+  logTest('SDK name present', !!metadata.sdkName, `Name: ${sdkName}`);
+  logTest('SDK version present', !!metadata.sdkVersion, `Version: ${sdkVersion}`);
+  logTest('Telemetry endpoint configured', !!metadata.telemetryEndpoint);
   logTest('Telemetry enabled', metadata.telemetryEnabled === true);
-  logTest('Vault KEK name present', !!(metadata as any).vaultKekName, `KEK: ${(metadata as any).vaultKekName}`);
-  logTest('Vault API endpoint present', !!(metadata as any).vaultApiEndpoint, `API: ${(metadata as any).vaultApiEndpoint}`);
-  logTest('Envelope encryption enabled', (metadata as any).envelopeEncryptionEnabled === true);
-  logTest('Correct KEK format', (metadata as any).vaultKekName?.startsWith('kek-'));
-  logTest('Tenant ID present', !!metadata.metadata.tenant, `Tenant: ${metadata.metadata.tenant}`);
-  logTest('Backend URL is localhost:3000', metadata.telemetryEndpoint.includes('localhost:3000'));
+  logTest('Vault KEK name present', !!metadata.vaultKekName);
+  logTest('Vault API endpoint present', !!metadata.vaultApiEndpoint);
+  logTest('Envelope encryption enabled', metadata.envelopeEncryptionEnabled === true);
+  logTest('Tenant ID present', !!metadata.metadata?.tenant);
+  logTest(
+    'Supported algorithms match metadata',
+    getSupportedAlgorithms().length > 0 &&
+      getSupportedAlgorithms().every((alg) =>
+        (metadata.algorithms as string[] | undefined)?.includes(alg),
+      ),
+    getSupportedAlgorithms().join(', '),
+  );
 
-  // ============================================================================
-  // TEST 3: BACKEND-PROVISIONED DEK (Envelope Encryption Flow)
-  // ============================================================================
+  // --------------------------------------------------------------------------
+  // Test 2: Zero-config initialization
+  // --------------------------------------------------------------------------
+  logSection('🚀 Test 2: Zero-Config Auto-Initialization');
 
-  logSection('🔑 Test 3: Backend-Provisioned Data Encryption Key (DEK)');
-
-  console.log('\n📋 Testing: Production envelope encryption with backend DEK provisioning');
-  console.log('   Flow: SDK → Backend → Vault KMS → DEK → Encrypt Data\n');
-
+  let crypto: AveroxCrypto;
   try {
-    // Use auto-config from metadata (zero-config mode)
-    console.log('🔧 Initializing SDK (auto-config from metadata)...');
-    const cryptoEnvelope = new AveroxCrypto();
-    logTest('SDK instance created', !!cryptoEnvelope);
-    
-    // Show what backend endpoints will be called
-    const vaultEndpoint = (metadata as any).vaultApiEndpoint;
-    const kekName = (metadata as any).vaultKekName;
-    
-    console.log('\n📡 Expected Backend API Calls:');
-    console.log(`   1. POST ${vaultEndpoint}/datakey`);
-    console.log(`      Request: { kekName: "${kekName}", context: "${metadata.metadata.tenant}" }`);
-    console.log(`      Response: { plaintext: "<32-byte-DEK>", ciphertext: "<vault-wrapped-DEK>" }`);
-    console.log(`   2. POST ${vaultEndpoint}/decrypt`);
-    console.log(`      Request: { kekName: "${kekName}", ciphertext: "<vault-wrapped-DEK>", context: "${metadata.metadata.tenant}" }`);
-    console.log(`      Response: { plaintext: "<32-byte-DEK>" }`);
-    
-    const plaintext = 'Customer PII: {"email":"customer@example.com","ssn":"***-**-6789"}';
-    const aad = 'customer-session-12345';
-    
-    console.log(`\n🔐 Step 1: Encrypting customer data...`);
-    console.log(`   Plaintext: ${plaintext.substring(0, 50)}...`);
-    console.log(`   AAD (context): "${aad}"`);
-    console.log(`   → SDK will request DEK from backend...`);
-    
-    const startEnc = Date.now();
-    const envelope = await cryptoEnvelope.encrypt(plaintext, aad);
-    const encTime = Date.now() - startEnc;
-    
-    // Verify envelope structure
-    logTest('Encryption successful', !!envelope.ct, `Time: ${encTime}ms (includes backend call)`);
-    logTest('Envelope version', envelope.v === '2.0', 'Version 2.0 format');
-    logTest('Envelope algorithm', envelope.alg === 'AES-256-GCM', 'AES-256-GCM');
-    logTest('IV present (12 bytes)', !!envelope.iv && Buffer.from(envelope.iv, 'base64').length === 12);
-    logTest('Tag present (16 bytes)', !!envelope.tag && Buffer.from(envelope.tag, 'base64').length === 16);
-    logTest('Ciphertext present', !!envelope.ct);
-    logTest('AAD stored in envelope', !!envelope.aad && envelope.aad === aad);
-    
-    // Critical: Verify encrypted DEK is present (proves backend integration worked)
-    const hasEncryptedDEK = !!(envelope as any).encryptedDEK;
-    logTest('🔐 Encrypted DEK present (backend integration)', hasEncryptedDEK, 
-      hasEncryptedDEK ? `DEK: ${(envelope as any).encryptedDEK?.substring(0, 40)}...` : '❌ Backend DEK not found!');
-    
-    if (hasEncryptedDEK) {
-      const isVaultFormat = (envelope as any).encryptedDEK?.startsWith('vault:v1:');
-      logTest('Encrypted DEK is Vault format', isVaultFormat, 
-        isVaultFormat ? 'Vault-wrapped DEK confirmed' : 'DEK format unexpected');
-    }
-    
-    console.log(`\n📦 Generated Envelope Structure:`);
-    console.log(`  Version: ${envelope.v}`);
-    console.log(`  Algorithm: ${envelope.alg}`);
-    console.log(`  IV: ${envelope.iv.substring(0, 20)}... (12 bytes)`);
-    console.log(`  Tag: ${envelope.tag.substring(0, 20)}... (16 bytes)`);
-    console.log(`  Ciphertext: ${envelope.ct.substring(0, 30)}... (${Buffer.from(envelope.ct, 'base64').length} bytes)`);
-    if ((envelope as any).encryptedDEK) {
-      console.log(`  🔐 Encrypted DEK: ${(envelope as any).encryptedDEK.substring(0, 50)}...`);
-      console.log(`     (This DEK was provisioned by backend and wrapped by Vault KMS)`);
-    }
-    
-    console.log(`\n🔓 Step 2: Decrypting customer data...`);
-    console.log(`   → SDK will request DEK unwrap from backend...`);
-    
-    const startDec = Date.now();
-    const decrypted = await cryptoEnvelope.decrypt(envelope, aad);
-    const decTime = Date.now() - startDec;
-    
-    logTest('Decryption successful', !!decrypted, `Time: ${decTime}ms (includes backend call)`);
-    logTest('Data integrity verified', decrypted.toString() === plaintext, 'Original data recovered');
-    
-    console.log(`\n✅ Envelope Encryption Flow Complete!`);
-    console.log(`   Encryption: ${encTime}ms (includes backend DEK request)`);
-    console.log(`   Decryption: ${decTime}ms (includes backend DEK unwrap)`);
-    console.log(`   Total: ${encTime + decTime}ms`);
-    console.log(`\n🎯 Production-Ready Features Verified:`);
-    console.log(`   ✅ Backend-provisioned DEK (no keys in application code)`);
-    console.log(`   ✅ Vault KMS integration (KEK never leaves Vault)`);
-    console.log(`   ✅ Envelope encryption (DEK wrapped by Vault)`);
-    console.log(`   ✅ Data encrypted with fresh DEK per operation`);
-    
-    // Wait for telemetry to be sent
-    console.log('\n⏳ Waiting 3s for telemetry events to be sent...');
-    await new Promise(resolve => setTimeout(resolve, 3000));
-    
-  } catch (error: any) {
-    logTest('Backend DEK provisioning', false, error.message);
-    logTest('Envelope encryption', false, 'Skipped due to DEK failure');
-    console.error('\n❌ Backend Integration Error:');
-    console.error(`   Message: ${error.message}`);
-    console.error(`   Stack: ${error.stack}`);
-    console.error('\n🔍 Troubleshooting:');
-    console.error('   1. Ensure backend is running at http://localhost:3000');
-    console.error(`   2. Check backend endpoint: ${(metadata as any).vaultApiEndpoint}/datakey`);
-    console.error(`   3. Verify KEK exists: ${(metadata as any).vaultKekName}`);
-    console.error('   4. Check backend logs for API requests');
+    crypto = new AveroxCrypto();
+    logTest('AveroxCrypto() without manual config', true);
+    logTest(
+      'Instance reports supported algorithms',
+      crypto.getSupportedAlgorithms().length > 0,
+      crypto.getSupportedAlgorithms().join(', '),
+    );
+    logTest(
+      'Static getSupportedAlgorithms matches instance',
+      JSON.stringify(AveroxCrypto.getSupportedAlgorithms()) ===
+        JSON.stringify(crypto.getSupportedAlgorithms()),
+    );
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    logTest('AveroxCrypto() without manual config', false, message);
+    printSummary(metadata);
+    process.exit(1);
   }
 
-  // ============================================================================
-  // TEST 4: ERROR HANDLING & SECURITY
-  // ============================================================================
+  const expectedAlg = getSupportedAlgorithms()[0]?.toUpperCase() ?? 'AES-128-GCM';
 
-  logSection('🛡️  Test 4: Error Handling & Security Validation');
+  // --------------------------------------------------------------------------
+  // Test 3: Single-value encryptField / decryptField
+  // --------------------------------------------------------------------------
+  logSection('🔐 Test 3: Single-Value encryptField / decryptField');
 
   try {
-    // Use auto-config from metadata
-    const cryptoError = new AveroxCrypto();
-    
-    const plaintext = 'Test data for error handling';
-    const correctAAD = 'correct-aad';
-    const wrongAAD = 'wrong-aad';
-    
-    console.log('\n🔐 Encrypting with correct AAD...');
-    const envelope = await cryptoError.encrypt(plaintext, correctAAD);
-    logTest('Encryption successful', !!envelope.ct);
-    
-    console.log('\n🔓 Attempting decrypt with WRONG AAD...');
+    const plaintext = 'sensitive-value-7f3a9c2b';
+    const aad = aadForContext('attribute-alpha');
+
+    const encStart = Date.now();
+    const envelope = await crypto.encryptField(plaintext, aad);
+    const encMs = Date.now() - encStart;
+
+    logTest('encryptField succeeds', isValidEnvelope(envelope), `${encMs}ms`);
+    logTest('Envelope version 2.0', envelope.v === '2.0');
+    logTest('Envelope algorithm matches SDK', envelope.alg?.toUpperCase() === expectedAlg, envelope.alg);
+    logTest('IV is 12 bytes', Buffer.from(envelope.iv, 'base64url').length === 12);
+    logTest('Tag is 16 bytes', Buffer.from(envelope.tag, 'base64url').length === 16);
+    logTest('AAD stored in envelope', !!envelope.aad);
+    logTest('encryptedDEK present', !!envelope.encryptedDEK);
+
+    const decStart = Date.now();
+    const decrypted = await crypto.decryptField(envelope, aad);
+    const decMs = Date.now() - decStart;
+
+    logTest('decryptField succeeds', decrypted.toString('utf8') === plaintext, `${decMs}ms`);
+    logTest('Single-value round-trip integrity', decrypted.toString('utf8') === plaintext);
+
+    const aliasEnv = await crypto.encrypt('alias-payload', aadForContext('alias'));
+    const aliasDec = await crypto.decrypt(aliasEnv, aadForContext('alias'));
+    logTest('encrypt/decrypt aliases work', aliasDec.toString('utf8') === 'alias-payload');
+  } catch (error) {
+    logTest('Single-value encrypt/decrypt', false, error instanceof Error ? error.message : String(error));
+  }
+
+  // --------------------------------------------------------------------------
+  // Test 4: Row encryption session (one DEK per logical record)
+  // --------------------------------------------------------------------------
+  logSection('🗂️  Test 4: Row Encryption Session (one DEK per record)');
+
+  try {
+    const rowValues = [
+      { key: 'col-a', value: 'value-alpha-001' },
+      { key: 'col-b', value: 'value-beta-002' },
+      { key: 'col-c', value: 'value-gamma-003' },
+      { key: 'col-d', value: 'value-delta-004' },
+    ];
+
+    const rowEnc = await crypto.beginRowEncryption();
+    const rowEnvelopes: EnvelopeWithKMS[] = [];
+
     try {
-      await cryptoError.decrypt(envelope, wrongAAD);
-      logTest('Wrong AAD rejection', false, 'Should have thrown error');
-    } catch (error: any) {
-      logTest('Wrong AAD rejection', true, `Correctly rejected: ${error.message}`);
+      for (const item of rowValues) {
+        rowEnvelopes.push(await rowEnc.encryptField(item.value, aadForContext(item.key)));
+      }
+
+      logTest('beginRowEncryption + encryptField per value', rowEnvelopes.length === rowValues.length);
+
+      const sharedDek = rowEnc.encryptedDEK;
+      logTest('Row session exposes encryptedDEK', !!sharedDek);
+
+      const allSameDek = rowEnvelopes.every((env) => env.encryptedDEK === sharedDek);
+      logTest('All row values share same encryptedDEK', allSameDek);
+
+      const uniqueIvs = new Set(rowEnvelopes.map((env) => env.iv));
+      logTest('Each row value has unique IV', uniqueIvs.size === rowEnvelopes.length);
+
+      const uniqueCts = new Set(rowEnvelopes.map((env) => env.ct));
+      logTest('Each row value has unique ciphertext', uniqueCts.size === rowEnvelopes.length);
+
+      const bundleEnv = await rowEnc.encryptField(
+        JSON.stringify({ colA: 'value-alpha-001', colB: 'value-beta-002' }),
+        RECORD_BUNDLE_AAD,
+      );
+      logTest('Record bundle encrypted with same session DEK', bundleEnv.encryptedDEK === sharedDek);
+
+      rowEnvelopes.push(bundleEnv);
+    } finally {
+      rowEnc.close();
     }
-    
-    console.log('\n🔓 Attempting decrypt with CORRECT AAD...');
-    const decrypted = await cryptoError.decrypt(envelope, correctAAD);
-    logTest('Correct AAD accepted', decrypted.toString() === plaintext);
-    
-    console.log('\n⏳ Waiting 2s for telemetry...');
-    await new Promise(resolve => setTimeout(resolve, 2000));
-    
-  } catch (error: any) {
-    logTest('Error handling test', false, error.message);
-    console.error('Error details:', error);
+
+    logTest('Row encryption session close() succeeds', true);
+
+    let closedSessionRejected = false;
+    try {
+      await rowEnc.encryptField('should-fail', aadForContext('closed'));
+    } catch {
+      closedSessionRejected = true;
+    }
+    logTest('Closed row session rejects encryptField', closedSessionRejected);
+  } catch (error) {
+    logTest('Row encryption session', false, error instanceof Error ? error.message : String(error));
   }
 
-  // ============================================================================
-  // TEST 4.5: MULTIPLE OPERATIONS (Standard Mode)
-  // ============================================================================
-
-  logSection('🔄 Test 4.5: Multiple Operations (Standard Mode)');
+  // --------------------------------------------------------------------------
+  // Test 5: Row decryption session (one unwrap per record)
+  // --------------------------------------------------------------------------
+  logSection('🔓 Test 5: Row Decryption Session (one unwrap per record)');
 
   try {
-    // Use auto-config from metadata
-    const cryptoMulti = new AveroxCrypto();
-    
-    console.log('\n🔄 Running 5 encrypt/decrypt cycles...');
+    const rowEnc = await crypto.beginRowEncryption();
+    const values = [
+      { key: 'item-1', value: 'payload-one' },
+      { key: 'item-2', value: 'payload-two' },
+      { key: 'item-3', value: 'payload-three' },
+    ];
+    const encrypted: EnvelopeWithKMS[] = [];
+
+    try {
+      for (const item of values) {
+        encrypted.push(await rowEnc.encryptField(item.value, aadForContext(item.key)));
+      }
+    } finally {
+      rowEnc.close();
+    }
+
+    const rowDec = await crypto.beginRowDecryptionFromEnvelope(encrypted[0]);
+    try {
+      for (let i = 0; i < values.length; i++) {
+        const plain = await rowDec.decryptField(encrypted[i], aadForContext(values[i].key));
+        logTest(`Row decryptField: ${values[i].key}`, plain.toString('utf8') === values[i].value);
+      }
+
+      const rowDec2 = await crypto.beginRowDecryption(encrypted[0].encryptedDEK!);
+      try {
+        const plain = await rowDec2.decryptField(encrypted[1], aadForContext(values[1].key));
+        logTest('beginRowDecryption(explicit DEK) works', plain.toString('utf8') === values[1].value);
+      } finally {
+        rowDec2.close();
+      }
+    } finally {
+      rowDec.close();
+    }
+
+    let closedDecryptRejected = false;
+    try {
+      await rowDec.decryptField(encrypted[0], aadForContext(values[0].key));
+    } catch {
+      closedDecryptRejected = true;
+    }
+    logTest('Closed row decrypt session rejects decryptField', closedDecryptRejected);
+  } catch (error) {
+    logTest('Row decryption session', false, error instanceof Error ? error.message : String(error));
+  }
+
+  // --------------------------------------------------------------------------
+  // Test 6: Row DEK mismatch detection
+  // --------------------------------------------------------------------------
+  logSection('🛡️  Test 6: Row DEK Mismatch Detection');
+
+  try {
+    const row1 = await crypto.beginRowEncryption();
+    const row2 = await crypto.beginRowEncryption();
+    let env1: EnvelopeWithKMS;
+    let env2: EnvelopeWithKMS;
+
+    try {
+      env1 = await row1.encryptField('record-one', aadForContext('row-1'));
+      env2 = await row2.encryptField('record-two', aadForContext('row-2'));
+    } finally {
+      row1.close();
+      row2.close();
+    }
+
+    const rowDec = await crypto.beginRowDecryptionFromEnvelope(env1!);
+    let mismatchCaught = false;
+    try {
+      await rowDec.decryptField(env2!, aadForContext('row-2'));
+    } catch (error) {
+      mismatchCaught =
+        error instanceof BadInputError &&
+        (error.message.includes('encryptedDEK') || error.message.includes('does not match'));
+    } finally {
+      rowDec.close();
+    }
+    logTest('Row session rejects envelope from different record DEK', mismatchCaught);
+  } catch (error) {
+    logTest('Row DEK mismatch detection', false, error instanceof Error ? error.message : String(error));
+  }
+
+  // --------------------------------------------------------------------------
+  // Test 7: Low-level DEK APIs
+  // --------------------------------------------------------------------------
+  logSection('🔧 Test 7: Low-Level DEK APIs');
+
+  try {
+    const dataKey = await crypto.provisionDataKey();
+    logTest('provisionDataKey returns dek + encryptedDEK', !!dataKey.dek && !!dataKey.encryptedDEK);
+
+    const lowEnv = await crypto.encryptWithDataKey('low-level-value', aadForContext('manual'), dataKey);
+    logTest('encryptWithDataKey succeeds', lowEnv.encryptedDEK === dataKey.encryptedDEK);
+
+    const lowPlain = await crypto.decryptWithDataKey(lowEnv, aadForContext('manual'), dataKey.dek);
+    logTest('decryptWithDataKey round-trip', lowPlain.toString('utf8') === 'low-level-value');
+
+    const unwrapped = await crypto.unwrapDataKey(dataKey.encryptedDEK);
+    logTest('unwrapDataKey returns buffer', Buffer.isBuffer(unwrapped) && unwrapped.length > 0);
+
+    crypto.releaseDataKey(dataKey.dek);
+    crypto.releaseDataKey(unwrapped);
+    logTest('releaseDataKey completes without error', true);
+  } catch (error) {
+    logTest('Low-level DEK APIs', false, error instanceof Error ? error.message : String(error));
+  }
+
+  // --------------------------------------------------------------------------
+  // Test 8: Security & error handling
+  // --------------------------------------------------------------------------
+  logSection('🛡️  Test 8: Security & Error Handling');
+
+  try {
+    const plaintext = 'authenticated-payload';
+    const correctAad = aadForContext('auth-test');
+    const wrongAad = aadForContext('wrong-context');
+    const envelope = await crypto.encryptField(plaintext, correctAad);
+
+    let wrongAadRejected = false;
+    try {
+      await crypto.decryptField(envelope, wrongAad);
+    } catch (error) {
+      wrongAadRejected = error instanceof InvalidTagError || error instanceof BadInputError;
+    }
+    logTest('Wrong AAD rejected on decrypt', wrongAadRejected);
+
+    const recovered = await crypto.decryptField(envelope, correctAad);
+    logTest('Correct AAD accepted on decrypt', recovered.toString('utf8') === plaintext);
+
+    let emptyAadRejected = false;
+    try {
+      await crypto.encryptField('data', '');
+    } catch (error) {
+      emptyAadRejected = error instanceof BadInputError;
+    }
+    logTest('Empty AAD rejected on encrypt', emptyAadRejected);
+  } catch (error) {
+    logTest('Security & error handling', false, error instanceof Error ? error.message : String(error));
+  }
+
+  // --------------------------------------------------------------------------
+  // Test 9: Multiple single-value operations
+  // --------------------------------------------------------------------------
+  logSection('🔄 Test 9: Multiple Single-Value Operations');
+
+  try {
     let allPassed = true;
     const times: number[] = [];
-    
+
     for (let i = 1; i <= 5; i++) {
-      const testData = `Test message #${i} - ${Math.random().toString(36).substring(7)}`;
-      const testAAD = `test-aad-${i}`;
-      
+      const data = `isolated-${i}-${Math.random().toString(36).slice(2, 8)}`;
+      const aad = aadForContext(`cycle-${i}`);
       const start = Date.now();
-      const env = await cryptoMulti.encrypt(testData, testAAD);
-      const dec = await cryptoMulti.decrypt(env, testAAD);
-      const time = Date.now() - start;
-      times.push(time);
-      
-      if (dec.toString() !== testData) {
+      const env = await crypto.encryptField(data, aad);
+      const dec = await crypto.decryptField(env, aad);
+      times.push(Date.now() - start);
+
+      if (dec.toString('utf8') !== data) {
         allPassed = false;
         console.log(`  ❌ Cycle ${i} failed`);
         break;
-      } else {
-        console.log(`  ✅ Cycle ${i} passed (${time}ms)`);
       }
+      console.log(`  ✅ Cycle ${i} passed (${times[times.length - 1]}ms)`);
     }
-    
-    logTest('Multiple operations (5 cycles)', allPassed);
-    
-    if (allPassed) {
-      const avgTime = times.reduce((a, b) => a + b, 0) / times.length;
-      console.log(`\n📊 Performance: Avg ${avgTime.toFixed(1)}ms per cycle`);
+
+    logTest('5 single-value encrypt/decrypt cycles', allPassed);
+    if (allPassed && times.length) {
+      const avg = times.reduce((a, b) => a + b, 0) / times.length;
+      console.log(`   Avg ${avg.toFixed(1)}ms per cycle (1 datakey + 1 unwrap each)`);
     }
-    
-  } catch (error: any) {
-    logTest('Multiple operations', false, error.message);
-    console.error('Error details:', error);
+  } catch (error) {
+    logTest('Multiple single-value operations', false, error instanceof Error ? error.message : String(error));
   }
 
-  // ============================================================================
-  // TEST 5: TELEMETRY VERIFICATION
-  // ============================================================================
-
-  logSection('📊 Test 5: Telemetry Integration Verification');
-
-  console.log('\n📋 Testing: Telemetry events are sent to backend for monitoring');
-  console.log('   Events: encrypt, decrypt operations with performance metrics\n');
+  // --------------------------------------------------------------------------
+  // Test 10: Row session multi-cycle
+  // --------------------------------------------------------------------------
+  logSection('🔄 Test 10: Row Session Multi-Cycle');
 
   try {
-    const cryptoTelemetry = new AveroxCrypto();
-    
-    console.log('🔧 Performing operations to generate telemetry events...');
-    const testData = 'Telemetry test data';
-    const testAAD = 'telemetry-test-aad';
-    
-    // Perform encrypt/decrypt operations
-    console.log('\n📡 Expected Telemetry Events:');
-    console.log(`   1. POST ${metadata.telemetryEndpoint}`);
-    console.log(`      Event: { operation: "encrypt", algorithm: "aes-256-gcm", success: true, ... }`);
-    console.log(`   2. POST ${metadata.telemetryEndpoint}`);
-    console.log(`      Event: { operation: "decrypt", algorithm: "aes-256-gcm", success: true, ... }`);
-    
-    const envelope = await cryptoTelemetry.encrypt(testData, testAAD);
-    logTest('Encrypt operation completed', !!envelope.ct, 'Telemetry event should be sent');
-    
-    const decrypted = await cryptoTelemetry.decrypt(envelope, testAAD);
-    logTest('Decrypt operation completed', decrypted.toString() === testData, 'Telemetry event should be sent');
-    
-    console.log('\n⏳ Waiting 3s for telemetry events to be sent asynchronously...');
-    await new Promise(resolve => setTimeout(resolve, 3000));
-    
+    let allPassed = true;
+
+    for (let cycle = 1; cycle <= 3; cycle++) {
+      const rowEnc = await crypto.beginRowEncryption();
+      const items = [
+        { key: 'segment-a', value: `record-${cycle}-alpha` },
+        { key: 'segment-b', value: `record-${cycle}-beta` },
+        { key: 'segment-c', value: `record-${cycle}-gamma` },
+      ];
+      const envelopes: EnvelopeWithKMS[] = [];
+
+      try {
+        for (const item of items) {
+          envelopes.push(await rowEnc.encryptField(item.value, aadForContext(item.key)));
+        }
+      } finally {
+        rowEnc.close();
+      }
+
+      const rowDec = await crypto.beginRowDecryptionFromEnvelope(envelopes[0]);
+      try {
+        let cycleOk = true;
+        for (let i = 0; i < items.length; i++) {
+          const plain = await rowDec.decryptField(envelopes[i], aadForContext(items[i].key));
+          if (plain.toString('utf8') !== items[i].value) {
+            cycleOk = false;
+          }
+        }
+
+        if (!cycleOk) {
+          allPassed = false;
+          console.log(`  ❌ Row cycle ${cycle} failed`);
+        } else {
+          console.log(
+            `  ✅ Row cycle ${cycle} passed (shared DEK: ${envelopes[0].encryptedDEK!.slice(0, 24)}...)`,
+          );
+        }
+      } finally {
+        rowDec.close();
+      }
+    }
+
+    logTest('3 row encrypt/decrypt cycles', allPassed);
+  } catch (error) {
+    logTest('Row session multi-cycle', false, error instanceof Error ? error.message : String(error));
+  }
+
+  // --------------------------------------------------------------------------
+  // Test 11: Telemetry (async fire-and-forget)
+  // --------------------------------------------------------------------------
+  logSection('📊 Test 11: Telemetry Integration');
+
+  try {
+    const env = await crypto.encryptField('telemetry-payload', aadForContext('telemetry'));
+    const dec = await crypto.decryptField(env, aadForContext('telemetry'));
+    logTest('Operations for telemetry completed', dec.toString('utf8') === 'telemetry-payload');
     logTest('Telemetry enabled in metadata', metadata.telemetryEnabled === true);
     logTest('Telemetry endpoint configured', !!metadata.telemetryEndpoint);
     logTest('SDK ID present for telemetry', !!metadata.sdkId);
-    
-    console.log('\n✅ Telemetry Integration:');
-    console.log(`   • Telemetry endpoint: ${metadata.telemetryEndpoint}`);
-    console.log(`   • SDK ID: ${metadata.sdkId}`);
-    console.log(`   • Events sent: encrypt, decrypt (async, non-blocking)`);
-    console.log(`   • Check dashboard: SDK Management → ${metadata.sdkName} → Telemetry`);
-    
-  } catch (error: any) {
-    logTest('Telemetry verification', false, error.message);
-    console.error('Telemetry test error:', error);
+
+    console.log('\n⏳ Waiting 3s for async telemetry delivery...');
+    await sleep(3000);
+    console.log(`   Telemetry endpoint: ${metadata.telemetryEndpoint}`);
+  } catch (error) {
+    logTest('Telemetry integration', false, error instanceof Error ? error.message : String(error));
   }
 
-  // ============================================================================
-  // TEST 6: ENVELOPE MODE WITH MULTIPLE OPERATIONS
-  // ============================================================================
+  printSummary(metadata);
+  process.exit(failedTests === 0 ? 0 : 1);
+}
 
-  logSection('🔄 Test 6: Multiple Envelope Operations (Production Scenario)');
-
-  try {
-    // Use auto-config from metadata
-    const cryptoEnvMulti = new AveroxCrypto();
-    
-    console.log('\n🔄 Running 3 envelope encrypt/decrypt cycles...');
-    let allPassed = true;
-    
-    for (let i = 1; i <= 3; i++) {
-      const testData = `Envelope test #${i} - ${Math.random().toString(36).substring(7)}`;
-      const testAAD = `envelope-aad-${i}`;
-      
-      console.log(`\n  Cycle ${i}: "${testData}"`);
-      
-      const env: any = await cryptoEnvMulti.encrypt(testData, testAAD);
-      if (!env.encryptedDEK) {
-        console.log(`  ❌ Cycle ${i}: No encrypted DEK`);
-        allPassed = false;
-        break;
-      }
-      
-      const dec = await cryptoEnvMulti.decrypt(env, testAAD);
-      if (dec.toString() !== testData) {
-        console.log(`  ❌ Cycle ${i}: Decryption mismatch`);
-        allPassed = false;
-        break;
-      }
-      
-      console.log(`  ✅ Cycle ${i} passed (DEK: ${env.encryptedDEK.substring(0, 30)}...)`);
-    }
-    
-    logTest('Envelope multiple operations (3 cycles)', allPassed);
-    
-    console.log('\n⏳ Waiting 2s for telemetry...');
-    await new Promise(resolve => setTimeout(resolve, 2000));
-    
-  } catch (error: any) {
-    logTest('Envelope multiple operations', false, error.message);
-    console.error('\n⚠️  Error Details:', error);
-  }
-
-  // ============================================================================
-  // FINAL SUMMARY - PRODUCTION READINESS REPORT
-  // ============================================================================
-
-  logSection('✅ PRODUCTION READINESS TEST COMPLETE!');
+function printSummary(
+  metadata: Record<string, unknown> & {
+    sdkName?: string;
+    vaultApiEndpoint?: string;
+    telemetryEndpoint?: string;
+    vaultKekName?: string;
+    metadata?: { tenant?: string };
+  },
+): void {
+  logSection('✅ SDK TEST SUITE COMPLETE');
 
   const successRate = totalTests > 0 ? ((passedTests / totalTests) * 100).toFixed(1) : '0.0';
-  
-  console.log('\n📊 Test Results Summary:');
-  console.log(`  ✅ Tests Passed: ${passedTests}`);
-  console.log(`  ❌ Tests Failed: ${failedTests}`);
-  console.log(`  📈 Total Tests: ${totalTests}`);
-  console.log(`  🎯 Success Rate: ${successRate}%`);
 
-  console.log('\n🔐 Production-Ready Features Tested:');
-  console.log('  ✅ Zero-Config Auto-Initialization');
-  console.log('     → SDK auto-configures from metadata (no manual setup needed)');
-  console.log('  ✅ Backend-Provisioned Data Encryption Keys (DEK)');
-  console.log('     → Fresh DEK generated per encryption operation');
-  console.log('     → DEK wrapped by Vault KMS (KEK never leaves Vault)');
-  console.log('  ✅ Envelope Encryption');
-  console.log('     → Data encrypted with DEK, DEK encrypted with KEK');
-  console.log('     → Complete envelope structure validated');
-  console.log('  ✅ Telemetry Integration');
-  console.log('     → Operations tracked for monitoring');
-  console.log('     → Performance metrics collected');
-  console.log('  ✅ Error Handling & Security');
-  console.log('     → AAD validation, authentication tag verification');
-  console.log('     → Proper error messages and security checks');
+  console.log('\n📊 Results:');
+  console.log(`  ✅ Passed: ${passedTests}`);
+  console.log(`  ❌ Failed: ${failedTests}`);
+  console.log(`  📈 Total:  ${totalTests}`);
+  console.log(`  🎯 Rate:   ${successRate}%`);
 
-  console.log('\n📡 Backend Integration Status:');
-  console.log(`  Backend URL: ${BACKEND_URL}`);
-  console.log(`  Telemetry Endpoint: ${metadata.telemetryEndpoint}`);
-  console.log(`  Vault API Endpoint: ${(metadata as any).vaultApiEndpoint || 'N/A'}`);
-  console.log(`  KEK Name: ${(metadata as any).vaultKekName || 'N/A'}`);
-  console.log(`  Tenant ID: ${metadata.metadata.tenant || 'N/A'}`);
+  console.log('\n🔐 API coverage:');
+  console.log('  • getSDKMetadata / getSupportedAlgorithms');
+  console.log('  • AveroxCrypto zero-config init');
+  console.log('  • encryptField / decryptField (isolated value, own DEK)');
+  console.log('  • encrypt / decrypt (aliases)');
+  console.log('  • beginRowEncryption → RowEncryptionSession.encryptField → close()');
+  console.log('  • beginRowDecryption / beginRowDecryptionFromEnvelope → decryptField → close()');
+  console.log('  • provisionDataKey / encryptWithDataKey / decryptWithDataKey / unwrapDataKey / releaseDataKey');
+  console.log('  • AAD validation, wrong-AAD rejection, row DEK mismatch');
+  console.log('  • Telemetry (async)');
 
-  console.log('\n🔍 Backend API Calls Made (Check Backend Logs):');
-  if ((metadata as any).vaultApiEndpoint) {
-    console.log(`  ✅ POST ${(metadata as any).vaultApiEndpoint}/datakey`);
-    console.log(`     → DEK generation requests (one per encrypt operation)`);
-    console.log(`  ✅ POST ${(metadata as any).vaultApiEndpoint}/decrypt`);
-    console.log(`     → DEK unwrap requests (one per decrypt operation)`);
+  console.log('\n📡 Backend endpoints used:');
+  if (metadata.vaultApiEndpoint) {
+    console.log(`  POST ${metadata.vaultApiEndpoint}/datakey`);
+    console.log(`  POST ${metadata.vaultApiEndpoint}/decrypt`);
   }
-  console.log(`  ✅ POST ${metadata.telemetryEndpoint}`);
-  console.log(`     → Telemetry events (async, non-blocking)`);
+  console.log(`  POST ${metadata.telemetryEndpoint}`);
 
   if (failedTests === 0) {
-    console.log('\n🎉 ALL TESTS PASSED! SDK IS PRODUCTION-READY! 🎉');
-    console.log('\n✅ Production Capabilities Verified:');
-    console.log('   ✅ Zero-config initialization: Working');
-    console.log('   ✅ Backend DEK provisioning: Working');
-    console.log('   ✅ Envelope encryption: Working');
-    console.log('   ✅ Vault KMS integration: Working');
-    console.log('   ✅ Telemetry tracking: Working');
-    console.log('   ✅ Error handling: Working');
-    console.log('   ✅ Security validation: Working');
-    console.log('\n🚀 This SDK is ready for production deployment!');
-    console.log('\n📖 Next Steps:');
-    console.log('   1. Review the integration manual for usage examples');
-    console.log('   2. Check telemetry dashboard for operation metrics');
-    console.log('   3. Deploy to your application environment');
-    console.log(`   4. Monitor via: SDK Management → ${metadata.sdkName} → Telemetry`);
-    process.exit(0);
+    console.log('\n🎉 ALL TESTS PASSED.');
   } else {
-    console.log(`\n⚠️  ${failedTests} test(s) failed. SDK may not be production-ready.`);
-    console.log('\n🔍 Troubleshooting Steps:');
-    console.log('   1. Review error messages above');
-    console.log('   2. Ensure backend is running at http://localhost:3000');
-    if ((metadata as any).vaultApiEndpoint) {
-      console.log(`   3. Verify backend endpoint: ${(metadata as any).vaultApiEndpoint}/datakey`);
-      console.log(`   4. Check KEK exists in Vault: ${(metadata as any).vaultKekName}`);
-    }
-    console.log('   5. Check backend logs for API request errors');
-    console.log('   6. Verify network connectivity to backend');
-    process.exit(1);
+    console.log(`\n⚠️  ${failedTests} test(s) failed. Review errors above.`);
+    console.log('\n🔍 Troubleshooting:');
+    console.log(`  • Vault API reachable: ${metadata.vaultApiEndpoint ?? 'not configured'}`);
+    console.log(`  • KEK exists: ${metadata.vaultKekName ?? 'not configured'}`);
+    console.log(`  • Tenant context: ${metadata.metadata?.tenant ?? 'not configured'}`);
   }
 }
 
-// Run the tests
-runTests().catch(error => {
+runTests().catch((error) => {
   console.error('Fatal error:', error);
   process.exit(1);
 });
